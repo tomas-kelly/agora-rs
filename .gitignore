@@ -1,0 +1,7 @@
+/target
+.agora/
+.swarm/
+.kiro/*
+!.kiro/agents/
+!.kiro/agents/*.json
+*.log

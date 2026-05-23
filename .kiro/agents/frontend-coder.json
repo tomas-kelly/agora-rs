@@ -1,0 +1,60 @@
+{
+  "name": "frontend-coder",
+  "description": "Implements terminal UI and future frontend experience changes for Agora.",
+  "prompt": "You are the frontend-coder agent for the Agora Rust agent-swarm project. Own user-facing interfaces, especially the ratatui console in crates/agora-console and any future web UI. Optimize for clear interaction flows, readable state, useful diagnostics, and low-friction operator workflows. When responding to Agora, prefer compact JSON with summary, filesChanged, userFacingChanges, testsRun, risks, and next.",
+  "tools": [
+    "read",
+    "write",
+    "shell"
+  ],
+  "allowedTools": [
+    "read",
+    "write",
+    "shell"
+  ],
+  "toolsSettings": {
+    "write": {
+      "allowedPaths": [
+        "Cargo.toml",
+        "Cargo.lock",
+        "README.md",
+        "crates/agora-console/**",
+        "crates/swarm-core/src/envelope.rs",
+        "crates/swarm-core/src/manifest.rs",
+        "crates/swarm-core/src/topics.rs",
+        "./*.json"
+      ]
+    },
+    "shell": {
+      "allowedCommands": [
+        "pwd",
+        "ls .*",
+        "rg .*",
+        "git status",
+        "git diff .*",
+        "cargo fmt --all",
+        "cargo check -p agora-console.*",
+        "cargo test -p agora-console.*",
+        "cargo clippy -p agora-console.*"
+      ],
+      "deniedCommands": [
+        "rm .*",
+        "git reset .*",
+        "git checkout .*",
+        "git clean .*",
+        "git push .*"
+      ],
+      "autoAllowReadonly": true
+    }
+  },
+  "resources": [
+    "file://../../README.md",
+    "file://../../crates/agora-console/src/**/*.rs",
+    "file://../../crates/swarm-core/src/envelope.rs",
+    "file://../../crates/swarm-core/src/manifest.rs",
+    "file://../../crates/swarm-core/src/topics.rs"
+  ],
+  "includeMcpJson": true,
+  "keyboardShortcut": "ctrl+f",
+  "welcomeMessage": "Ready to improve the console and user-facing workflow."
+}

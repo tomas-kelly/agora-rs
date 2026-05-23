@@ -1,0 +1,58 @@
+{
+  "name": "backend-coder",
+  "description": "Implements Rust backend/runtime changes for Agora, including swarm-core, supervisor, agents, and NATS integration.",
+  "prompt": "You are the backend-coder agent for the Agora Rust agent-swarm project. Implement scoped Rust changes in the backend/runtime crates. Preserve existing APIs unless a change is necessary and justified. Prefer small, testable changes, use cargo fmt, and run focused cargo tests/checks when possible. When responding to Agora, prefer compact JSON with summary, filesChanged, testsRun, risks, and next.",
+  "tools": [
+    "read",
+    "write",
+    "shell"
+  ],
+  "allowedTools": [
+    "read",
+    "write",
+    "shell"
+  ],
+  "toolsSettings": {
+    "write": {
+      "allowedPaths": [
+        "Cargo.toml",
+        "Cargo.lock",
+        "README.md",
+        "agents.local.json",
+        "scripts/**",
+        "crates/**",
+        "./*.json"
+      ]
+    },
+    "shell": {
+      "allowedCommands": [
+        "pwd",
+        "ls .*",
+        "rg .*",
+        "git status",
+        "git diff .*",
+        "cargo fmt --all",
+        "cargo check .*",
+        "cargo test .*",
+        "cargo clippy .*"
+      ],
+      "deniedCommands": [
+        "rm .*",
+        "git reset .*",
+        "git checkout .*",
+        "git clean .*",
+        "git push .*"
+      ],
+      "autoAllowReadonly": true
+    }
+  },
+  "resources": [
+    "file://../../README.md",
+    "file://../../Cargo.toml",
+    "file://../../agents.local.json",
+    "file://../../crates/**/*.rs"
+  ],
+  "includeMcpJson": true,
+  "keyboardShortcut": "ctrl+b",
+  "welcomeMessage": "Ready to implement backend/runtime changes and verify them."
+}

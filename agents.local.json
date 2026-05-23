@@ -1,0 +1,229 @@
+{
+  "name": "agora-local",
+  "busUrl": "nats://127.0.0.1:4222",
+  "pidDir": ".agora/pids",
+  "logDir": ".agora/logs",
+  "nats": {
+    "command": "nats-server -js -p 4222",
+    "log_file": ".agora/logs/nats.log"
+  },
+  "telemetry": {
+    "enabled": true,
+    "log_file": ".agora/logs/telemetry.jsonl"
+  },
+  "default_acp": "kiro",
+
+  "agents": [
+    {
+      "name": "product-manager",
+      "port": 4001,
+      "capabilities": ["product", "requirements", "acceptance-criteria", "release-scope"],
+      "kiro_command": "kiro-cli acp --agent product-manager --trust-all-tools",
+      "publishes": [
+        {
+          "topic": "product.requirements.defined",
+          "required_scopes": ["workspace:read", "workspace:write"]
+        },
+        {
+          "topic": "human.interaction.request",
+          "required_scopes": ["workspace:read", "workspace:write"]
+        }
+      ],
+      "subscriptions": [
+        {
+          "topic": "workspace.idea.submitted",
+          "required_scopes": ["workspace:read"],
+          "prompt_template": "Agora session {{session_id}}. You are the product manager. Turn this submitted idea into product intent, target users, non-goals, acceptance criteria, and release scope: {{data}}. Reply only with JSON: {\"summary\": <string>, \"users\": [<string>], \"goals\": [<string>], \"nonGoals\": [<string>], \"acceptanceCriteria\": [<string>], \"releaseScope\": [<string>], \"risks\": [<string>]}.",
+          "emit": {
+            "topic": "product.requirements.defined",
+            "required_scopes": ["workspace:read", "workspace:write"]
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "system-architect",
+      "port": 4002,
+      "capabilities": ["architecture", "design", "contracts", "reliability"],
+      "kiro_command": "kiro-cli acp --agent system-architect --trust-all-tools",
+      "publishes": [
+        {
+          "topic": "workspace.design.finalized",
+          "required_scopes": ["workspace:read", "workspace:write"]
+        },
+        {
+          "topic": "human.interaction.request",
+          "required_scopes": ["workspace:read", "workspace:write"]
+        }
+      ],
+      "subscriptions": [
+        {
+          "topic": "product.requirements.defined",
+          "required_scopes": ["workspace:read"],
+          "prompt_template": "Agora session {{session_id}}. You are the system architect. Convert these product requirements into an implementable architecture, event contracts, data boundaries, failure modes, and rollout plan: {{data}}. Reply only with JSON: {\"summary\": <string>, \"components\": [<string>], \"contracts\": [<string>], \"backendTasks\": [<string>], \"frontendTasks\": [<string>], \"testStrategy\": [<string>], \"securityNotes\": [<string>]}.",
+          "emit": {
+            "topic": "workspace.design.finalized",
+            "required_scopes": ["workspace:read", "workspace:write"]
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "backend-coder",
+      "port": 4003,
+      "capabilities": ["backend", "rust", "implementation", "bugfix"],
+      "kiro_command": "kiro-cli acp --agent backend-coder --trust-all-tools",
+      "publishes": [
+        {
+          "topic": "code.changed",
+          "required_scopes": ["workspace:read", "workspace:write"]
+        },
+        {
+          "topic": "human.interaction.request",
+          "required_scopes": ["workspace:read", "workspace:write"]
+        }
+      ],
+      "subscriptions": [
+        {
+          "topic": "workspace.design.finalized",
+          "required_scopes": ["workspace:read"],
+          "prompt_template": "Agora session {{session_id}}. You are the backend coder. Implement the Rust backend, runtime, daemon, NATS, config, and persistence work from this design. Avoid unrelated frontend changes unless required by backend contracts: {{data}}. Reply only with JSON: {\"summary\": <string>, \"changedFiles\": [<string>], \"testsRun\": [<string>], \"followUps\": [<string>]}.",
+          "emit": {
+            "topic": "code.changed",
+            "required_scopes": ["workspace:read", "workspace:write"]
+          }
+        },
+        {
+          "topic": "test.failed",
+          "required_scopes": ["workspace:read"],
+          "prompt_template": "Agora session {{session_id}}. You are the backend coder. Review this QA failure and repair only backend-relevant issues. If it is not backend-related, explain why without editing: {{data}}. Reply only with JSON: {\"summary\": <string>, \"changedFiles\": [<string>], \"testsRun\": [<string>], \"loopbackResolved\": true}.",
+          "emit": {
+            "topic": "code.changed",
+            "required_scopes": ["workspace:read", "workspace:write"]
+          }
+        },
+        {
+          "topic": "security.alert.found",
+          "required_scopes": ["workspace:read"],
+          "prompt_template": "Agora session {{session_id}}. You are the backend coder. Remediate backend-relevant security findings while preserving behavior and tests. If a finding is outside backend scope, say so in the summary: {{data}}. Reply only with JSON: {\"summary\": <string>, \"changedFiles\": [<string>], \"testsRun\": [<string>], \"loopbackResolved\": true}.",
+          "emit": {
+            "topic": "code.changed",
+            "required_scopes": ["workspace:read", "workspace:write"]
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "frontend-coder",
+      "port": 4004,
+      "capabilities": ["frontend", "tui", "ux", "implementation", "bugfix"],
+      "kiro_command": "kiro-cli acp --agent frontend-coder --trust-all-tools",
+      "publishes": [
+        {
+          "topic": "code.changed",
+          "required_scopes": ["workspace:read", "workspace:write"]
+        },
+        {
+          "topic": "human.interaction.request",
+          "required_scopes": ["workspace:read", "workspace:write"]
+        }
+      ],
+      "subscriptions": [
+        {
+          "topic": "workspace.design.finalized",
+          "required_scopes": ["workspace:read"],
+          "prompt_template": "Agora session {{session_id}}. You are the frontend coder. Implement terminal UI, operator workflow, display, and future frontend-facing work from this design. Avoid backend/runtime changes unless required by UI contracts: {{data}}. Reply only with JSON: {\"summary\": <string>, \"changedFiles\": [<string>], \"testsRun\": [<string>], \"followUps\": [<string>]}.",
+          "emit": {
+            "topic": "code.changed",
+            "required_scopes": ["workspace:read", "workspace:write"]
+          }
+        },
+        {
+          "topic": "test.failed",
+          "required_scopes": ["workspace:read"],
+          "prompt_template": "Agora session {{session_id}}. You are the frontend coder. Review this QA failure and repair only frontend, TUI, or UX-relevant issues. If it is not frontend-related, explain why without editing: {{data}}. Reply only with JSON: {\"summary\": <string>, \"changedFiles\": [<string>], \"testsRun\": [<string>], \"loopbackResolved\": true}.",
+          "emit": {
+            "topic": "code.changed",
+            "required_scopes": ["workspace:read", "workspace:write"]
+          }
+        },
+        {
+          "topic": "security.alert.found",
+          "required_scopes": ["workspace:read"],
+          "prompt_template": "Agora session {{session_id}}. You are the frontend coder. Remediate frontend, TUI, or UX-relevant security findings while preserving behavior and tests. If a finding is outside frontend scope, say so in the summary: {{data}}. Reply only with JSON: {\"summary\": <string>, \"changedFiles\": [<string>], \"testsRun\": [<string>], \"loopbackResolved\": true}.",
+          "emit": {
+            "topic": "code.changed",
+            "required_scopes": ["workspace:read", "workspace:write"]
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "security-engineer",
+      "port": 4005,
+      "capabilities": ["security", "appsec", "threat-modeling", "supply-chain"],
+      "kiro_command": "kiro-cli acp --agent security-engineer --trust-all-tools",
+      "publishes": [
+        {
+          "topic": "security.scan.clean",
+          "required_scopes": ["workspace:read", "workspace:write"]
+        },
+        {
+          "topic": "security.alert.found",
+          "required_scopes": ["workspace:read", "workspace:write"]
+        },
+        {
+          "topic": "human.interaction.request",
+          "required_scopes": ["workspace:read", "workspace:write"]
+        }
+      ],
+      "subscriptions": [
+        {
+          "topic": "code.changed",
+          "required_scopes": ["workspace:read"],
+          "prompt_template": "Agora session {{session_id}}. You are the security engineer. Review this change for auth, authorization scopes, command execution, secrets, supply-chain, and unsafe file/process behavior: {{data}}. If clean, reply only with JSON: {\"_topic\": \"security.scan.clean\", \"_data\": {\"summary\": <string>, \"scannedFiles\": [<string>], \"risksAccepted\": [<string>]}}. If issues are found, reply only with JSON: {\"_topic\": \"security.alert.found\", \"_data\": {\"summary\": <string>, \"alerts\": [<string>], \"recommendedFixes\": [<string>]}}.",
+          "emit": {
+            "topic": "security.scan.clean",
+            "required_scopes": ["workspace:read", "workspace:write"]
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "quality-assurance",
+      "port": 4006,
+      "capabilities": ["qa", "testing", "regression", "validation"],
+      "kiro_command": "kiro-cli acp --agent quality-assurance --trust-all-tools",
+      "publishes": [
+        {
+          "topic": "test.passed",
+          "required_scopes": ["workspace:read", "workspace:write"]
+        },
+        {
+          "topic": "test.failed",
+          "required_scopes": ["workspace:read", "workspace:write"]
+        },
+        {
+          "topic": "human.interaction.request",
+          "required_scopes": ["workspace:read", "workspace:write"]
+        }
+      ],
+      "subscriptions": [
+        {
+          "topic": "code.changed",
+          "required_scopes": ["workspace:read"],
+          "prompt_template": "Agora session {{session_id}}. You are quality assurance. Validate this change with an explicit regression strategy, run or identify the right checks, and report failures precisely: {{data}}. If validation passes, reply only with JSON: {\"_topic\": \"test.passed\", \"_data\": {\"summary\": <string>, \"passedTests\": [<string>], \"notRun\": [<string>]}}. If validation fails, reply only with JSON: {\"_topic\": \"test.failed\", \"_data\": {\"summary\": <string>, \"failedTests\": [<string>], \"reason\": <string>, \"reproSteps\": [<string>]}}.",
+          "emit": {
+            "topic": "test.passed",
+            "required_scopes": ["workspace:read", "workspace:write"]
+          }
+        }
+      ]
+    }
+  ]
+}

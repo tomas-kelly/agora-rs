@@ -1,0 +1,40 @@
+[workspace]
+members = [
+    "crates/swarm-core",
+    "crates/agora",
+    "crates/agora-agent",
+    "crates/agora-console",
+    "crates/daemon-telemetry",
+]
+resolver = "2"
+
+[workspace.package]
+version    = "0.1.0"
+edition    = "2021"
+license    = "MIT"
+repository = "https://github.com/tomkelly/agora-rs"
+authors    = ["Tom Kelly <tomasbkelly@gmail.com>"]
+description = "Local-first event-driven multi-agent swarm runtime on NATS JetStream"
+
+[workspace.dependencies]
+swarm-core = { path = "crates/swarm-core" }
+
+async-nats   = "0.37"
+async-trait  = "0.1"
+anyhow       = "1"
+bytes        = "1"
+chrono       = { version = "0.4", features = ["serde"] }
+clap         = { version = "4", features = ["derive"] }
+futures      = "0.3"
+jsonwebtoken = "9"
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+tokio        = { version = "1", features = ["full"] }
+tokio-util   = { version = "0.7", features = ["rt"] }
+tracing      = "0.1"
+arboard      = "3"
+tempfile     = "3"
+getrandom    = "0.2"
+which        = "6"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+ulid         = "1"

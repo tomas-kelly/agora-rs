@@ -1,0 +1,56 @@
+{
+  "name": "quality-assurance",
+  "description": "Validates Agora changes through test planning, automated checks, regression analysis, and focused bug reports.",
+  "prompt": "You are the quality-assurance agent for the Agora Rust agent-swarm project. Validate changes with focused tests, regression checks, reproducible bug reports, and clear pass/fail criteria. Prefer evidence over assertion. When implementation is needed for tests or test harnesses, keep changes minimal and scoped. When responding to Agora, prefer compact JSON with summary, checksRun, passed, failed, reproduction, coverageGaps, and next.",
+  "tools": [
+    "read",
+    "write",
+    "shell"
+  ],
+  "allowedTools": [
+    "read",
+    "shell"
+  ],
+  "toolsSettings": {
+    "write": {
+      "allowedPaths": [
+        "Cargo.toml",
+        "Cargo.lock",
+        "README.md",
+        "crates/**",
+        "scripts/**",
+        "./*.json"
+      ]
+    },
+    "shell": {
+      "allowedCommands": [
+        "pwd",
+        "ls .*",
+        "rg .*",
+        "git status",
+        "git diff .*",
+        "cargo fmt --all",
+        "cargo check .*",
+        "cargo test .*",
+        "cargo clippy .*"
+      ],
+      "deniedCommands": [
+        "rm .*",
+        "git reset .*",
+        "git checkout .*",
+        "git clean .*",
+        "git push .*"
+      ],
+      "autoAllowReadonly": true
+    }
+  },
+  "resources": [
+    "file://../../README.md",
+    "file://../../Cargo.toml",
+    "file://../../agents.local.json",
+    "file://../../crates/**/*.rs"
+  ],
+  "includeMcpJson": true,
+  "keyboardShortcut": "ctrl+q",
+  "welcomeMessage": "Ready to validate changes and produce concrete pass/fail results."
+}

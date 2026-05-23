@@ -1,0 +1,28 @@
+[package]
+name        = "agora-console"
+version     = { workspace = true }
+edition     = { workspace = true }
+license     = { workspace = true }
+repository  = { workspace = true }
+authors     = { workspace = true }
+description = "Terminal UI for the agora-rs swarm: sessions, events, agents, history"
+
+[[bin]]
+name = "agora-console"
+path = "src/main.rs"
+
+[dependencies]
+swarm-core = { workspace = true }
+anyhow     = { workspace = true }
+async-nats = { workspace = true }
+clap       = { workspace = true }
+chrono     = { workspace = true }
+futures    = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+tokio      = { workspace = true }
+ulid       = { workspace = true }
+ratatui    = "0.28"
+crossterm  = { version = "0.28", features = ["event-stream"] }
+arboard    = { workspace = true }
+tempfile   = { workspace = true }

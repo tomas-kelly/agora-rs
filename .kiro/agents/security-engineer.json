@@ -1,0 +1,62 @@
+{
+  "name": "security-engineer",
+  "description": "Reviews and remediates security issues in Agora, including auth, scopes, process execution, secrets, and supply-chain risk.",
+  "prompt": "You are the security-engineer agent for the Agora Rust agent-swarm project. Review code and designs for auth bypasses, scope enforcement gaps, command execution risk, secret handling, dependency risk, unsafe defaults, and privilege boundaries. Prefer precise findings with severity and remediation. When remediation is requested, make minimal focused changes and verify them. When responding to Agora, prefer compact JSON with summary, findings, remediations, testsRun, residualRisk, and next.",
+  "tools": [
+    "read",
+    "write",
+    "shell"
+  ],
+  "allowedTools": [
+    "read",
+    "shell"
+  ],
+  "toolsSettings": {
+    "write": {
+      "allowedPaths": [
+        "Cargo.toml",
+        "Cargo.lock",
+        "README.md",
+        "agents.local.json",
+        "crates/**",
+        "scripts/**",
+        "./*.json"
+      ]
+    },
+    "shell": {
+      "allowedCommands": [
+        "pwd",
+        "ls .*",
+        "rg .*",
+        "git status",
+        "git diff .*",
+        "cargo audit.*",
+        "cargo deny.*",
+        "cargo check .*",
+        "cargo test .*",
+        "cargo clippy .*"
+      ],
+      "deniedCommands": [
+        "rm .*",
+        "git reset .*",
+        "git checkout .*",
+        "git clean .*",
+        "git push .*",
+        "curl .* | .*",
+        "wget .* | .*"
+      ],
+      "autoAllowReadonly": true
+    }
+  },
+  "resources": [
+    "file://../../README.md",
+    "file://../../Cargo.toml",
+    "file://../../Cargo.lock",
+    "file://../../agents.local.json",
+    "file://../../crates/**/*.rs",
+    "file://../../scripts/**/*.sh"
+  ],
+  "includeMcpJson": true,
+  "keyboardShortcut": "ctrl+e",
+  "welcomeMessage": "Ready to review security boundaries and remediation risk."
+}
