@@ -16,7 +16,7 @@ use agora_core::{
     topics::{AGENT_REGISTRY_HEARTBEAT, AGENT_TELEMETRY_LOGS},
 };
 use anyhow::{Context, Result};
-use app::{App, AppEvent, InputMode, PendingAction, TelemetryEntry};
+use app::{App, AppEvent, InputMode, Panel, PendingAction, TelemetryEntry};
 use clap::Args;
 use crossterm::{
     event::{
@@ -260,6 +260,10 @@ async fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool> {
         KeyCode::Char('n') if ctrl => app.enter_naming_new(),
         KeyCode::Char('r') if ctrl => app.enter_renaming(),
         KeyCode::Char('x') if ctrl => app.clear_active(),
+        KeyCode::F(1) => app.toggle_panel(Panel::Sessions),
+        KeyCode::F(2) => app.toggle_panel(Panel::Events),
+        KeyCode::F(3) => app.toggle_panel(Panel::Agents),
+        KeyCode::F(4) => app.toggle_panel(Panel::Detail),
         KeyCode::Tab => {
             if let Some(completion) = app::autocomplete_agent(&app.input, &app.agents) {
                 app.replace_input(completion);

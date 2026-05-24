@@ -9,7 +9,7 @@ echo "==> Bootstrapping signing key..."
 
 echo ""
 echo "Done. Run the swarm with:"
-echo "  cargo run -p agora -- run agents.local.json"
+echo "  cargo run -p agora -- start --config agents.local.json"
 echo ""
 echo "Submit an idea:"
 echo "  cargo run -p agora -- submit 'Build a REST API for user management'"

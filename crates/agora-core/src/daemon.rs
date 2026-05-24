@@ -31,6 +31,19 @@ impl Publisher {
         data: serde_json::Value,
         affected_files: Option<Vec<String>>,
     ) -> Result<Envelope> {
+        // Security: code.changed events MUST declare at least one affected file.
+        // Empty changesets bypass security review and are rejected at publish time.
+        if topic == crate::topics::CODE_CHANGED {
+            let files = affected_files.as_deref().unwrap_or(&[]);
+            if files.is_empty() {
+                anyhow::bail!(
+                    "{} attempted to publish code.changed with no affected files — \
+                     empty changesets bypass security review",
+                    self.agent_name
+                );
+            }
+        }
+
         let scopes = self.published_topics.get(topic).ok_or_else(|| {
             anyhow::anyhow!(
                 "{} attempted to publish undeclared topic: {topic}",

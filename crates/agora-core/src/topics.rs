@@ -18,6 +18,7 @@ pub const HUMAN_INTERACTION_REQUEST: &str = "human.interaction.request";
 
 // Session metadata
 pub const SESSION_NAMED: &str = "session.named";
+pub const SESSION_DELETED: &str = "session.deleted";
 
 // JetStream
 pub const EVENT_STREAM: &str = "AGORA_EVENTS";

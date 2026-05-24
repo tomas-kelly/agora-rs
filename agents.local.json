@@ -20,24 +20,15 @@
       "capabilities": ["product", "requirements", "acceptance-criteria", "release-scope"],
       "kiro_command": "kiro-cli acp --agent product-manager --trust-all-tools",
       "publishes": [
-        {
-          "topic": "product.requirements.defined",
-          "required_scopes": ["workspace:read", "workspace:write"]
-        },
-        {
-          "topic": "human.interaction.request",
-          "required_scopes": ["workspace:read", "workspace:write"]
-        }
+        { "topic": "product.requirements.defined", "required_scopes": ["workspace:read", "workspace:write"] },
+        { "topic": "human.interaction.request",    "required_scopes": ["workspace:read", "workspace:write"] }
       ],
       "subscriptions": [
         {
           "topic": "workspace.idea.submitted",
           "required_scopes": ["workspace:read"],
-          "prompt_template": "Agora session {{session_id}}. You are the product manager. Turn this submitted idea into product intent, target users, non-goals, acceptance criteria, and release scope: {{data}}. Reply only with JSON: {\"summary\": <string>, \"users\": [<string>], \"goals\": [<string>], \"nonGoals\": [<string>], \"acceptanceCriteria\": [<string>], \"releaseScope\": [<string>], \"risks\": [<string>]}.",
-          "emit": {
-            "topic": "product.requirements.defined",
-            "required_scopes": ["workspace:read", "workspace:write"]
-          }
+          "prompt_template": "Agora session {{session_id}}. You are the product manager for the Agora project.\n\nIdea: {{data}}\n\nProcess:\n1. Use the `read` tool on relevant repo files (README.md, CHANGELOG.md, agents.local.json) to ground your requirements in what already exists.\n2. Decide product intent, target users, non-goals, acceptance criteria, release scope, and risks.\n\nOutput contract: emit EXACTLY ONE JSON object on the FINAL LINE of your reply. No markdown fences. No prose after it. Shape:\n{\"summary\": <one-line string>, \"users\": [<string>], \"goals\": [<string>], \"nonGoals\": [<string>], \"acceptanceCriteria\": [<string>], \"releaseScope\": [<string>], \"risks\": [<string>]}\n\nThis JSON is consumed by an automated downstream agent. Anything you say before it can be reasoning or notes; only the last line is parsed. Keep fields concrete and actionable.",
+          "emit": { "topic": "product.requirements.defined", "required_scopes": ["workspace:read", "workspace:write"] }
         }
       ]
     },
@@ -48,24 +39,15 @@
       "capabilities": ["architecture", "design", "contracts", "reliability"],
       "kiro_command": "kiro-cli acp --agent system-architect --trust-all-tools",
       "publishes": [
-        {
-          "topic": "workspace.design.finalized",
-          "required_scopes": ["workspace:read", "workspace:write"]
-        },
-        {
-          "topic": "human.interaction.request",
-          "required_scopes": ["workspace:read", "workspace:write"]
-        }
+        { "topic": "workspace.design.finalized", "required_scopes": ["workspace:read", "workspace:write"] },
+        { "topic": "human.interaction.request", "required_scopes": ["workspace:read", "workspace:write"] }
       ],
       "subscriptions": [
         {
           "topic": "product.requirements.defined",
           "required_scopes": ["workspace:read"],
-          "prompt_template": "Agora session {{session_id}}. You are the system architect. Convert these product requirements into an implementable architecture, event contracts, data boundaries, failure modes, and rollout plan: {{data}}. Reply only with JSON: {\"summary\": <string>, \"components\": [<string>], \"contracts\": [<string>], \"backendTasks\": [<string>], \"frontendTasks\": [<string>], \"testStrategy\": [<string>], \"securityNotes\": [<string>]}.",
-          "emit": {
-            "topic": "workspace.design.finalized",
-            "required_scopes": ["workspace:read", "workspace:write"]
-          }
+          "prompt_template": "Agora session {{session_id}}. You are the system architect for the Agora Rust workspace.\n\nRequirements: {{data}}\n\nProcess:\n1. Use the `read` tool on the affected crates (crates/agora-core/src/*.rs, crates/agora/src/*.rs, crates/agora-agent/src/*.rs, crates/agora-console/src/*.rs) to understand the current architecture before proposing changes.\n2. Decide which crates and modules change, what event contracts or struct shapes shift, where failure modes live, and how to roll out incrementally.\n3. Split work between backend (agora-core, agora, agora-agent, daemon-telemetry) and frontend (agora-console). Backend and frontend coders run in parallel — make their task lists independent.\n\nOutput contract: emit EXACTLY ONE JSON object on the FINAL LINE. No markdown fences. No prose after. Shape:\n{\"summary\": <one-line string>, \"components\": [<crate or module name>], \"contracts\": [<envelope or struct change>], \"backendTasks\": [<concrete task — `cargo check -p agora` must pass after>], \"frontendTasks\": [<concrete task in agora-console>], \"testStrategy\": [<string>], \"securityNotes\": [<string>]}\n\n`backendTasks` and `frontendTasks` directly drive coder agents — be specific (file paths, function names, expected behavior). Vague tasks produce phantom changes downstream.",
+          "emit": { "topic": "workspace.design.finalized", "required_scopes": ["workspace:read", "workspace:write"] }
         }
       ]
     },
@@ -76,42 +58,27 @@
       "capabilities": ["backend", "rust", "implementation", "bugfix"],
       "kiro_command": "kiro-cli acp --agent backend-coder --trust-all-tools",
       "publishes": [
-        {
-          "topic": "code.changed",
-          "required_scopes": ["workspace:read", "workspace:write"]
-        },
-        {
-          "topic": "human.interaction.request",
-          "required_scopes": ["workspace:read", "workspace:write"]
-        }
+        { "topic": "code.changed",              "required_scopes": ["workspace:read", "workspace:write"] },
+        { "topic": "human.interaction.request", "required_scopes": ["workspace:read", "workspace:write"] }
       ],
       "subscriptions": [
         {
           "topic": "workspace.design.finalized",
           "required_scopes": ["workspace:read"],
-          "prompt_template": "Agora session {{session_id}}. You are the backend coder. Implement the Rust backend, runtime, daemon, NATS, config, and persistence work from this design. Avoid unrelated frontend changes unless required by backend contracts: {{data}}. Reply only with JSON: {\"summary\": <string>, \"changedFiles\": [<string>], \"testsRun\": [<string>], \"followUps\": [<string>]}.",
-          "emit": {
-            "topic": "code.changed",
-            "required_scopes": ["workspace:read", "workspace:write"]
-          }
+          "prompt_template": "Agora session {{session_id}}. You are the backend coder for the Agora Rust workspace.\n\nYour job is to IMPLEMENT the backend work in this design by actually editing source files using your tools. Describing changes without making them is a failure.\n\nDesign: {{data}}\n\nIn-scope crates: agora-core, agora, agora-agent, daemon-telemetry. Out-of-scope: agora-console (frontend) — unless backend contracts force a matching update there.\n\nMandatory process:\n1. Use the `read` tool on the relevant existing source files.\n2. Use the `fs/write_text_file` tool (or `shell` with heredoc / sed) to actually save your edits.\n3. Use the `shell` tool to run `cargo check -p <crate>` and `cargo test -p <crate>` for the crates you touched. If anything doesn't compile, fix it before producing output.\n4. Only emit the JSON summary AFTER the disk changes are saved and `cargo check` passes.\n\nOutput contract: emit EXACTLY ONE JSON object on the FINAL LINE. No markdown fences. No prose after. Shape:\n{\"summary\": <one-line string of what you actually did>, \"changedFiles\": [<real path you wrote, e.g. \"crates/agora/src/main.rs\">], \"testsRun\": [<command and actual outcome, e.g. \"cargo test -p agora — 6 passed; 0 failed\">], \"followUps\": [<string>]}\n\n`changedFiles` MUST match what `git status` would show. `testsRun` MUST contain real shell output, not invented results. If you cannot actually do the work, emit a JSON with empty `changedFiles` and the reason in `summary`.",
+          "emit": { "topic": "code.changed", "required_scopes": ["workspace:read", "workspace:write"] }
         },
         {
           "topic": "test.failed",
           "required_scopes": ["workspace:read"],
-          "prompt_template": "Agora session {{session_id}}. You are the backend coder. Review this QA failure and repair only backend-relevant issues. If it is not backend-related, explain why without editing: {{data}}. Reply only with JSON: {\"summary\": <string>, \"changedFiles\": [<string>], \"testsRun\": [<string>], \"loopbackResolved\": true}.",
-          "emit": {
-            "topic": "code.changed",
-            "required_scopes": ["workspace:read", "workspace:write"]
-          }
+          "prompt_template": "Agora session {{session_id}}. You are the backend coder. QA reported a test failure. Fix the actual backend code that caused it, using your tools.\n\nFailure report: {{data}}\n\nIf the failure is not in backend scope (agora-core, agora, agora-agent, daemon-telemetry), explain that in the summary and emit empty `changedFiles`. Otherwise:\n1. `read` the failing test and the code under test.\n2. `fs/write_text_file` or `shell` to apply the fix.\n3. `shell` → `cargo test -p <crate>` and confirm the test is now green.\n\nOutput on the FINAL LINE — no markdown fences, no prose after:\n{\"summary\": <one-line string>, \"changedFiles\": [<real path you wrote>], \"testsRun\": [<command and actual outcome>], \"loopbackResolved\": <true if the failing test now passes, false otherwise>}",
+          "emit": { "topic": "code.changed", "required_scopes": ["workspace:read", "workspace:write"] }
         },
         {
           "topic": "security.alert.found",
           "required_scopes": ["workspace:read"],
-          "prompt_template": "Agora session {{session_id}}. You are the backend coder. Remediate backend-relevant security findings while preserving behavior and tests. If a finding is outside backend scope, say so in the summary: {{data}}. Reply only with JSON: {\"summary\": <string>, \"changedFiles\": [<string>], \"testsRun\": [<string>], \"loopbackResolved\": true}.",
-          "emit": {
-            "topic": "code.changed",
-            "required_scopes": ["workspace:read", "workspace:write"]
-          }
+          "prompt_template": "Agora session {{session_id}}. You are the backend coder. Security flagged an issue. Remediate the actual backend code using your tools.\n\nAlert: {{data}}\n\nIf the alert is not in backend scope, explain why and emit empty `changedFiles`. Otherwise:\n1. `read` the flagged files plus call sites.\n2. Apply the remediation via `fs/write_text_file` / `shell`.\n3. `shell` → `cargo test -p <crate>` to confirm behavior is preserved.\n\nOutput on the FINAL LINE — no markdown fences, no prose after:\n{\"summary\": <one-line string>, \"changedFiles\": [<real path>], \"testsRun\": [<command and actual outcome>], \"loopbackResolved\": <true | false>}",
+          "emit": { "topic": "code.changed", "required_scopes": ["workspace:read", "workspace:write"] }
         }
       ]
     },
@@ -122,42 +89,27 @@
       "capabilities": ["frontend", "tui", "ux", "implementation", "bugfix"],
       "kiro_command": "kiro-cli acp --agent frontend-coder --trust-all-tools",
       "publishes": [
-        {
-          "topic": "code.changed",
-          "required_scopes": ["workspace:read", "workspace:write"]
-        },
-        {
-          "topic": "human.interaction.request",
-          "required_scopes": ["workspace:read", "workspace:write"]
-        }
+        { "topic": "code.changed",              "required_scopes": ["workspace:read", "workspace:write"] },
+        { "topic": "human.interaction.request", "required_scopes": ["workspace:read", "workspace:write"] }
       ],
       "subscriptions": [
         {
           "topic": "workspace.design.finalized",
           "required_scopes": ["workspace:read"],
-          "prompt_template": "Agora session {{session_id}}. You are the frontend coder. Implement terminal UI, operator workflow, display, and future frontend-facing work from this design. Avoid backend/runtime changes unless required by UI contracts: {{data}}. Reply only with JSON: {\"summary\": <string>, \"changedFiles\": [<string>], \"testsRun\": [<string>], \"followUps\": [<string>]}.",
-          "emit": {
-            "topic": "code.changed",
-            "required_scopes": ["workspace:read", "workspace:write"]
-          }
+          "prompt_template": "Agora session {{session_id}}. You are the frontend coder for the Agora Rust workspace.\n\nYour job is to IMPLEMENT the frontend / terminal-UI work in this design by actually editing source files using your tools. Describing changes without making them is a failure.\n\nDesign: {{data}}\n\nIn-scope: crates/agora-console (ratatui TUI + commands + UI layout) plus any operator-workflow help text in README.md. Out-of-scope: backend runtime crates — unless UI contracts force a matching update there. If the design has only backend tasks, that's fine: emit a JSON with empty `changedFiles` and `\"summary\": \"no frontend work required\"`.\n\nMandatory process when there IS frontend work:\n1. `read` the existing files in crates/agora-console/src/ (main.rs, app.rs, ui.rs).\n2. `fs/write_text_file` (or `shell`) to actually save your edits.\n3. `shell` → `cargo check -p agora-console` and `cargo test -p agora-console`. Fix anything that doesn't compile before producing output.\n\nOutput on the FINAL LINE — no markdown fences, no prose after:\n{\"summary\": <one-line string of what you actually did, or 'no frontend work required'>, \"changedFiles\": [<real path>], \"testsRun\": [<command and actual outcome>], \"followUps\": [<string>]}\n\n`changedFiles` MUST match what `git status` would show. Do not invent paths.",
+          "emit": { "topic": "code.changed", "required_scopes": ["workspace:read", "workspace:write"] }
         },
         {
           "topic": "test.failed",
           "required_scopes": ["workspace:read"],
-          "prompt_template": "Agora session {{session_id}}. You are the frontend coder. Review this QA failure and repair only frontend, TUI, or UX-relevant issues. If it is not frontend-related, explain why without editing: {{data}}. Reply only with JSON: {\"summary\": <string>, \"changedFiles\": [<string>], \"testsRun\": [<string>], \"loopbackResolved\": true}.",
-          "emit": {
-            "topic": "code.changed",
-            "required_scopes": ["workspace:read", "workspace:write"]
-          }
+          "prompt_template": "Agora session {{session_id}}. You are the frontend coder. QA reported a test failure. If it's frontend-scope, fix it using your tools.\n\nFailure report: {{data}}\n\nIf the failure isn't in agora-console / TUI scope, emit empty `changedFiles` and explain in summary. Otherwise: `read`, `fs/write_text_file`, then `shell` → `cargo test -p agora-console` to confirm green.\n\nOutput on the FINAL LINE — no markdown fences, no prose after:\n{\"summary\": <one-line string>, \"changedFiles\": [<real path>], \"testsRun\": [<command and actual outcome>], \"loopbackResolved\": <true | false>}",
+          "emit": { "topic": "code.changed", "required_scopes": ["workspace:read", "workspace:write"] }
         },
         {
           "topic": "security.alert.found",
           "required_scopes": ["workspace:read"],
-          "prompt_template": "Agora session {{session_id}}. You are the frontend coder. Remediate frontend, TUI, or UX-relevant security findings while preserving behavior and tests. If a finding is outside frontend scope, say so in the summary: {{data}}. Reply only with JSON: {\"summary\": <string>, \"changedFiles\": [<string>], \"testsRun\": [<string>], \"loopbackResolved\": true}.",
-          "emit": {
-            "topic": "code.changed",
-            "required_scopes": ["workspace:read", "workspace:write"]
-          }
+          "prompt_template": "Agora session {{session_id}}. You are the frontend coder. Security flagged an issue. If it's in agora-console scope, remediate using your tools.\n\nAlert: {{data}}\n\nIf out of scope, emit empty `changedFiles` and explain in summary. Otherwise: `read`, `fs/write_text_file`, then `shell` → `cargo test -p agora-console` to confirm.\n\nOutput on the FINAL LINE — no markdown fences, no prose after:\n{\"summary\": <one-line string>, \"changedFiles\": [<real path>], \"testsRun\": [<command and actual outcome>], \"loopbackResolved\": <true | false>}",
+          "emit": { "topic": "code.changed", "required_scopes": ["workspace:read", "workspace:write"] }
         }
       ]
     },
@@ -168,28 +120,16 @@
       "capabilities": ["security", "appsec", "threat-modeling", "supply-chain"],
       "kiro_command": "kiro-cli acp --agent security-engineer --trust-all-tools",
       "publishes": [
-        {
-          "topic": "security.scan.clean",
-          "required_scopes": ["workspace:read", "workspace:write"]
-        },
-        {
-          "topic": "security.alert.found",
-          "required_scopes": ["workspace:read", "workspace:write"]
-        },
-        {
-          "topic": "human.interaction.request",
-          "required_scopes": ["workspace:read", "workspace:write"]
-        }
+        { "topic": "security.scan.clean",       "required_scopes": ["workspace:read", "workspace:write"] },
+        { "topic": "security.alert.found",      "required_scopes": ["workspace:read", "workspace:write"] },
+        { "topic": "human.interaction.request", "required_scopes": ["workspace:read", "workspace:write"] }
       ],
       "subscriptions": [
         {
           "topic": "code.changed",
           "required_scopes": ["workspace:read"],
-          "prompt_template": "Agora session {{session_id}}. You are the security engineer. Review this change for auth, authorization scopes, command execution, secrets, supply-chain, and unsafe file/process behavior: {{data}}. If clean, reply only with JSON: {\"_topic\": \"security.scan.clean\", \"_data\": {\"summary\": <string>, \"scannedFiles\": [<string>], \"risksAccepted\": [<string>]}}. If issues are found, reply only with JSON: {\"_topic\": \"security.alert.found\", \"_data\": {\"summary\": <string>, \"alerts\": [<string>], \"recommendedFixes\": [<string>]}}.",
-          "emit": {
-            "topic": "security.scan.clean",
-            "required_scopes": ["workspace:read", "workspace:write"]
-          }
+          "prompt_template": "Agora session {{session_id}}. You are the security engineer. Audit the code change for REAL vulnerabilities — not theoretical ones.\n\nCode change: {{data}}\n\nMandatory process:\n1. Use the `read` tool on each file in `changedFiles` and its callers/surrounding context.\n2. Look for: auth/scope bypass, command injection, secret handling, supply-chain risk, unsafe defaults, panics on attacker input.\n3. Only report findings you can cite a specific line for. False positives waste the cascade.\n4. If `changedFiles` is empty or describes work that wasn't actually done, that itself is a finding — emit `security.alert.found` noting the discrepancy.\n\nOutput on the FINAL LINE — no markdown fences, no prose after.\n\nIf the change is clean (you actually read it and found no real issue):\n{\"_topic\": \"security.scan.clean\", \"_data\": {\"summary\": <one-line string>, \"scannedFiles\": [<actual path you read>], \"risksAccepted\": [<low-severity item with rationale>]}}\n\nIf there are real issues a coder must fix:\n{\"_topic\": \"security.alert.found\", \"_data\": {\"summary\": <one-line string>, \"alerts\": [<\"path:line — issue description\">], \"recommendedFixes\": [<concrete remediation>]}}",
+          "emit": { "topic": "security.scan.clean", "required_scopes": ["workspace:read", "workspace:write"] }
         }
       ]
     },
@@ -200,28 +140,16 @@
       "capabilities": ["qa", "testing", "regression", "validation"],
       "kiro_command": "kiro-cli acp --agent quality-assurance --trust-all-tools",
       "publishes": [
-        {
-          "topic": "test.passed",
-          "required_scopes": ["workspace:read", "workspace:write"]
-        },
-        {
-          "topic": "test.failed",
-          "required_scopes": ["workspace:read", "workspace:write"]
-        },
-        {
-          "topic": "human.interaction.request",
-          "required_scopes": ["workspace:read", "workspace:write"]
-        }
+        { "topic": "test.passed",               "required_scopes": ["workspace:read", "workspace:write"] },
+        { "topic": "test.failed",               "required_scopes": ["workspace:read", "workspace:write"] },
+        { "topic": "human.interaction.request", "required_scopes": ["workspace:read", "workspace:write"] }
       ],
       "subscriptions": [
         {
           "topic": "code.changed",
           "required_scopes": ["workspace:read"],
-          "prompt_template": "Agora session {{session_id}}. You are quality assurance. Validate this change with an explicit regression strategy, run or identify the right checks, and report failures precisely: {{data}}. If validation passes, reply only with JSON: {\"_topic\": \"test.passed\", \"_data\": {\"summary\": <string>, \"passedTests\": [<string>], \"notRun\": [<string>]}}. If validation fails, reply only with JSON: {\"_topic\": \"test.failed\", \"_data\": {\"summary\": <string>, \"failedTests\": [<string>], \"reason\": <string>, \"reproSteps\": [<string>]}}.",
-          "emit": {
-            "topic": "test.passed",
-            "required_scopes": ["workspace:read", "workspace:write"]
-          }
+          "prompt_template": "Agora session {{session_id}}. You are quality assurance. Validate the code change by RUNNING real checks and reporting HONEST results.\n\nCode change: {{data}}\n\nMandatory process:\n1. Use the `read` tool on each file listed in `changedFiles` to understand what changed.\n2. Use the `shell` tool to actually run:\n   - `cargo build -p <affected-crate>`\n   - `cargo test -p <affected-crate>`\n   - `cargo clippy -p <affected-crate> -- -D warnings` (if relevant)\n3. Capture the actual stdout/stderr. Do not invent test names or counts. If `changedFiles` is empty or the change was clearly not made, emit `test.failed` with `reason: \"no actionable changes to validate\"`.\n\nOutput on the FINAL LINE — no markdown fences, no prose after.\n\nIf every check you ran passed:\n{\"_topic\": \"test.passed\", \"_data\": {\"summary\": <one-line string>, \"passedTests\": [<\"<command> — <actual count> passed; <count> failed\">], \"notRun\": [<string with reason>]}}\n\nIf any check failed:\n{\"_topic\": \"test.failed\", \"_data\": {\"summary\": <one-line string>, \"failedTests\": [<actual test name from stdout>], \"reason\": <quoted excerpt from stderr/stdout>, \"reproSteps\": [<exact shell commands to reproduce>]}}",
+          "emit": { "topic": "test.passed", "required_scopes": ["workspace:read", "workspace:write"] }
         }
       ]
     }

@@ -194,7 +194,10 @@ impl TopologyConfig {
             }
         }
         for topic in &all_topics {
-            if !stream_subjects.iter().any(|filter| subject_matches(filter, topic)) {
+            if !stream_subjects
+                .iter()
+                .any(|filter| subject_matches(filter, topic))
+            {
                 bail!(
                     "topic `{topic}` is referenced by the topology but not covered by any JetStream \
                      subject filter ({stream_subjects:?}). Add a matching pattern to \

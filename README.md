@@ -27,7 +27,7 @@ crates/
 Three steps, in order. Step 0 runs **once per checkout**; steps 1 and 2 are
 the everyday loop.
 
-### Step 0 — Bootstrap (required, once)
+### Step 0 — Bootstrap (recommended, once)
 
 ```bash
 ./scripts/bootstrap.sh
@@ -45,19 +45,31 @@ are healthy. Non-zero exit on any failure, so it's safe to chain into scripts.
 
 This builds the workspace and mints `.kiro/session_token`, the HS256 secret
 that signs every actor token on the bus. **Every publish path needs it** —
-the supervisor's `submit` CLI, the TUI console, and every `agora-agent`
-process. Skipping bootstrap will let `agora run` boot NATS, but the first
-idea you submit will fail with a "Signing key not found at .kiro/session_token"
-error.
+the `submit` CLI, the TUI console, and every `agora-agent` process. `agora start`
+also creates the default key if it is missing, but running bootstrap up front
+keeps `doctor`, `submit`, and `console` happy before the supervisor starts.
 
 ### Step 1 — Start the swarm (Terminal 1, long-running)
 
 ```bash
-cargo run -p agora -- run agents.local.json
+cargo run -p agora -- start --config agents.local.json
 ```
 
 Boots NATS + all six Kiro-backed agent processes from the topology. Leave
 this terminal running; `Ctrl-C` stops the whole swarm.
+
+To run it in the background:
+
+```bash
+cargo run -p agora -- start --config agents.local.json --detach
+cargo run -p agora -- stop
+```
+
+Detached runtimes are identified by the topology's `pidDir`, especially
+`.agora/pids/agora.pid` by default. `agora stop` targets `agents.local.json`;
+use `agora stop --config path/to/topology.json` when you started a different
+topology. `agora run <config>` remains as a compatibility command for the old
+startup syntax.
 
 ### Step 2 — Open the console (Terminal 2)
 
@@ -95,7 +107,7 @@ JetStream until the full loopback completes:
 The Agora session ID from each event is passed through to ACP so all agent
 activity stays attached to the same Agora session.
 
-### Operate the swarm from the CLI
+## CLI reference
 
 The top-level commands mirror the Docker-style workflow for local operations:
 
@@ -110,6 +122,29 @@ cargo run -p agora -- info
 cargo run -p agora -- version
 ```
 
+Core commands:
+
+| Command | Use |
+|---|---|
+| `agora start --config agents.local.json` | Start NATS, telemetry, and all agents from the topology. Add `--detach` to run in the background. |
+| `agora console` | Open the TUI against the running swarm. |
+| `agora submit "idea"` | Publish `workspace.idea.submitted` without opening the TUI. |
+| `agora ps` | Show supervisor, service, and agent process status from pid files. |
+| `agora logs [target]` | List log targets, or tail one target. |
+| `agora events` | Dump or follow the `AGORA_EVENTS` stream. |
+| `agora inspect <target>` | Inspect an agent, session id, service/process, or runtime object. |
+| `agora stats [target]` | Show local process CPU/memory for the runtime or one target. |
+| `agora top <target>` | Show the local process tree for an agent or service. |
+| `agora info` | Summarize topology, bus, stream, registry, sessions, and process state. |
+| `agora stop [target]` | Stop the whole runtime or one managed process. |
+| `agora restart <agent>` | Restart one agent while `agora start` owns the swarm. |
+| `agora status <agent>` | Print one agent manifest and optional session activity. |
+| `agora history <agent> --session-id <id>` | Show one agent's event and telemetry timeline in a session. |
+| `agora message <agent> <text...>` | Send a steering or queue message to an agent inbox. |
+| `agora bootstrap` | Mint the local signing key at `.kiro/session_token`. |
+| `agora doctor` | Run environment, topology, key, process, bus, and registry checks. |
+| `agora version` | Print CLI version metadata. |
+
 Object-scoped aliases are available when that reads better:
 
 ```bash
@@ -120,6 +155,85 @@ cargo run -p agora -- session ls
 cargo run -p agora -- session inspect sess_<id>
 cargo run -p agora -- system info
 cargo run -p agora -- system events --follow
+```
+
+### Logs
+
+Log targets are derived from the topology. Run `logs` without a target to list
+them:
+
+```bash
+cargo run -p agora -- logs
+cargo run -p agora -- logs backend-coder --tail 200
+cargo run -p agora -- logs backend-coder --follow
+cargo run -p agora -- logs backend-coder --since 10m --timestamps
+cargo run -p agora -- logs telemetry-jsonl --tail 50
+```
+
+Targets include `agora`, `nats`, `daemon-telemetry`, every configured agent
+name, and `telemetry-jsonl`. `--lines` is accepted as an alias for `--tail`.
+`--since` accepts RFC3339 timestamps or durations like `10m`, `2h`, or `1d`,
+and applies to log lines with parseable timestamps.
+
+### Events and sessions
+
+`events` reads the JetStream backlog and can also subscribe live:
+
+```bash
+cargo run -p agora -- events
+cargo run -p agora -- events --session-id sess_<id>
+cargo run -p agora -- events --agent backend-coder
+cargo run -p agora -- events --topic 'code.>'
+cargo run -p agora -- events --json
+cargo run -p agora -- events --follow
+```
+
+Session helpers operate on the same event stream:
+
+```bash
+cargo run -p agora -- sessions
+cargo run -p agora -- session ls
+cargo run -p agora -- session new "Task manager"
+cargo run -p agora -- session rename sess_<id> "Task manager"
+cargo run -p agora -- session delete sess_<id>
+cargo run -p agora -- session ls --include-deleted
+cargo run -p agora -- session inspect sess_<id> --json
+cargo run -p agora -- session history sess_<id>
+```
+
+`session delete` publishes a `session.deleted` tombstone. It hides the session
+from default session lists and the console, but keeps the event history
+available for `session history`, `session inspect`, and audit workflows.
+
+`agora replay` remains as a compatibility command for the older event dump.
+
+### Agents and runtime
+
+Agent helpers are aliases over the top-level commands, scoped to one agent:
+
+```bash
+cargo run -p agora -- agents
+cargo run -p agora -- agent ls
+cargo run -p agora -- agent inspect backend-coder --json
+cargo run -p agora -- agent status backend-coder --session-id sess_<id>
+cargo run -p agora -- agent history backend-coder --session-id sess_<id>
+cargo run -p agora -- agent message backend-coder "focus on the failing test"
+cargo run -p agora -- agent message backend-coder "queue this after current work" --message-type queue
+cargo run -p agora -- agent restart backend-coder
+cargo run -p agora -- agent stop backend-coder
+```
+
+Runtime helpers work from `.agora/pids`, `.agora/logs`, the topology, and the
+NATS registry:
+
+```bash
+cargo run -p agora -- info --json
+cargo run -p agora -- inspect runtime --json
+cargo run -p agora -- inspect nats
+cargo run -p agora -- stats backend-coder
+cargo run -p agora -- top backend-coder
+cargo run -p agora -- system ps
+cargo run -p agora -- system stats
 ```
 
 ### What it looks like
@@ -146,20 +260,26 @@ cargo run -p agora -- system events --follow
 │ from:    quality-assurance                                                                                 │
 │ data:    { "summary": "All tests passing", "passedTests": ["api", "ui_render", "task_crud"] }              │
 ├─ Compose · active: Task manager ───────────────────────────────────────────────────────────────────────────┤
-│ ›  !history backend-coder                                                                                  │
+│ ›  Build a collaborative editor with offline support, conflict resolution,                                 │
+│    audit logging, and a minimal admin view.                                                                │
+│                                                                                                            │
+│    Prioritize the event model, storage boundaries, and the first regression                                │
+│    tests we should run.                                                                                   │
 └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 > Topic colors in a real terminal: `workspace.*` cyan, `code.*` yellow,
 > `test.passed` green, `test.failed` red, `security.*` green/red by outcome,
-> `human.*` magenta, `agent.*` blue.  Agent status icons: `●` ready,
-> `◐` busy, `◌` starting, `○` down.
+> `human.*` magenta, `agent.*` blue. Agent status icons: `●` ready,
+> `◐` busy, `◌` starting/stale, `◑` draining, `○` down.
 
-`!history backend-coder` would replace the **Latest event** pane with a
-scrollable conversation timeline — inbound events the agent received,
-prompts sent to Kiro, responses received, and outbound events published —
-all interleaved by timestamp. PgUp/PgDn or mouse-wheel to scroll, `!page`
-to dump into `$PAGER`, `!copy` to drop the whole thing on the clipboard.
+The composer is intentionally large enough for multi-line prompts. Long drafts
+scroll with PgUp/PgDn or with the mouse wheel over the composer. `!history
+backend-coder` replaces the **Latest event** pane with a scrollable conversation
+timeline — inbound events the agent received, prompts sent to Kiro, responses
+received, and outbound events published — all interleaved by timestamp.
+PgUp/PgDn or mouse-wheel scroll the output, `!page` dumps it into `$PAGER`,
+and `!copy` puts it on the clipboard.
 
 ### Console keys
 
@@ -170,9 +290,11 @@ to dump into `$PAGER`, `!copy` to drop the whole thing on the clipboard.
 | `!help` | Show the commands panel |
 | `!new [name]` | Create a new session (prompts if name omitted), make it active |
 | `!rename [name]` | Rename the active session (prompts if name omitted) |
+| `!delete [session]` | Hide the active session, or a named/id session, without erasing history |
 | `!agents` | List agents seen in the active session (with status + event counts) |
 | `!status <agent>` | Manifest + per-session activity for that agent |
 | `!history <agent>` | Full conversation timeline for that agent in the active session: events received, prompts sent to ACP, responses received, events published |
+| `!panel <name>` | Toggle `sessions`, `events`, `agents`, `detail`, or `all` panels |
 | `!copy` | Copy command output (or latest event detail) to system clipboard |
 | `!editor` | Compose input in `$EDITOR` — drops the TUI, opens your editor with current input, returns when you save and quit |
 | `!page` | Open the command output panel in `$PAGER` (e.g. `less`) — useful for long `!history` results |
@@ -194,6 +316,7 @@ to dump into `$PAGER`, `!copy` to drop the whole thing on the clipboard.
 | Key | Action |
 |---|---|
 | `Ctrl-N` / `Ctrl-R` / `Ctrl-X` | Same as `!new` / `!rename` / clear active session |
+| `F1` / `F2` / `F3` / `F4` | Toggle sessions / events / agents / detail panels |
 | `Tab` | If input starts with `@<prefix>`, autocomplete the agent name; otherwise cycle which session is active |
 | `Shift-Tab` | Cycle active session backwards |
 | `Shift+Enter` / `Alt+Enter` / `Ctrl+J` | Insert a newline (the input box grows) |
@@ -233,11 +356,14 @@ runtime emits on every event it processes (`agent.telemetry.logs` →
 telemetry channel live; restart the console with the swarm running to
 catch new flows.
 
-Session names are broadcast as `session.named` events on the bus, so any
-other console connected to the same swarm sees them immediately and any
-console started later picks them up via the JetStream replay.
+Session metadata is event sourced. Names are broadcast as `session.named`;
+deletions are broadcast as `session.deleted` tombstones, so any other console
+connected to the same swarm sees the change immediately and any console started
+later picks it up via the JetStream replay.
 
-The complete loopback cycle fires automatically:
+The loopback cycle is event driven. QA and security both react to
+`code.changed`; repair work is triggered only when QA publishes `test.failed`
+or security publishes `security.alert.found`:
 
 ```
 workspace.idea.submitted
@@ -250,20 +376,62 @@ workspace.idea.submitted
           → [backend-coder] / [frontend-coder] → code.changed  (repair loop)
 ```
 
-## Inspect events
+## Troubleshooting
+
+Start with:
 
 ```bash
-# All events
-cargo run -p agora -- events
-
-# Specific session
-cargo run -p agora -- events --session-id sess_<id>
-
-# Live stream
-cargo run -p agora -- events --follow
+cargo run -p agora -- doctor
+cargo run -p agora -- info
+cargo run -p agora -- ps
 ```
 
-`agora replay` remains as a compatibility command for the older event dump.
+If the console says it cannot connect to NATS, make sure `agora start --config
+agents.local.json` is still running. `agora ps` should show the supervisor,
+`nats`, `daemon-telemetry`, and each agent as `running`.
+
+If agents show as `stale` or `down`, inspect the process and registry state:
+
+```bash
+cargo run -p agora -- ps
+cargo run -p agora -- agents
+cargo run -p agora -- inspect backend-coder
+cargo run -p agora -- logs backend-coder --tail 200
+```
+
+Stale pid files are removed by stopping the affected target or the whole
+runtime:
+
+```bash
+cargo run -p agora -- stop backend-coder
+cargo run -p agora -- stop
+```
+
+If old Python publishers or legacy processes are still writing registry keys,
+stop them before pruning:
+
+```bash
+cargo run -p agora -- stop --legacy
+cargo run -p agora -- registry prune
+cargo run -p agora -- registry prune --apply
+```
+
+`registry prune` is a dry run by default. `--apply` purges stale, malformed, or
+out-of-topology keys from `AGORA_AGENT_REGISTRY`.
+
+Runtime files live under `.agora/`:
+
+| Path | Contents |
+|---|---|
+| `.agora/pids/` | Supervisor, service, and agent pid files used by `ps`, `stop`, and `restart`. |
+| `.agora/logs/*.log` | Process logs for the supervisor, NATS, telemetry, and each agent. |
+| `.agora/logs/telemetry.jsonl` | Raw agent telemetry, including prompts and ACP responses. |
+
+If submit or console publish paths fail with a missing key error, rerun:
+
+```bash
+cargo run -p agora -- bootstrap
+```
 
 ## Architecture
 

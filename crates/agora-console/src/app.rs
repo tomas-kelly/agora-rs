@@ -3,7 +3,7 @@ use agora_core::{
     envelope::Envelope,
     manifest::AgentManifest,
     tokens::mint_actor_token,
-    topics::{direct_inbox_topic, SESSION_NAMED, WORKSPACE_IDEA_SUBMITTED},
+    topics::{direct_inbox_topic, SESSION_DELETED, SESSION_NAMED, WORKSPACE_IDEA_SUBMITTED},
 };
 use anyhow::Result;
 use serde::Deserialize;
@@ -57,6 +57,83 @@ pub struct SessionInfo {
     pub started_at: String,
     pub last_topic: String,
     pub event_count: usize,
+    pub deleted: bool,
+    pub deleted_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Panel {
+    Sessions,
+    Events,
+    Agents,
+    Detail,
+}
+
+impl Panel {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "session" | "sessions" => Some(Self::Sessions),
+            "event" | "events" => Some(Self::Events),
+            "agent" | "agents" => Some(Self::Agents),
+            "detail" | "details" | "latest" => Some(Self::Detail),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Sessions => "sessions",
+            Self::Events => "events",
+            Self::Agents => "agents",
+            Self::Detail => "detail",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PanelVisibility {
+    pub sessions: bool,
+    pub events: bool,
+    pub agents: bool,
+    pub detail: bool,
+}
+
+impl Default for PanelVisibility {
+    fn default() -> Self {
+        Self {
+            sessions: true,
+            events: true,
+            agents: true,
+            detail: true,
+        }
+    }
+}
+
+impl PanelVisibility {
+    pub fn is_visible(&self, panel: Panel) -> bool {
+        match panel {
+            Panel::Sessions => self.sessions,
+            Panel::Events => self.events,
+            Panel::Agents => self.agents,
+            Panel::Detail => self.detail,
+        }
+    }
+
+    pub fn set(&mut self, panel: Panel, visible: bool) {
+        match panel {
+            Panel::Sessions => self.sessions = visible,
+            Panel::Events => self.events = visible,
+            Panel::Agents => self.agents = visible,
+            Panel::Detail => self.detail = visible,
+        }
+    }
+
+    pub fn set_all(&mut self, visible: bool) {
+        self.sessions = visible;
+        self.events = visible;
+        self.agents = visible;
+        self.detail = visible;
+    }
 }
 
 pub struct App {
@@ -87,7 +164,12 @@ pub struct App {
     pub input_area_bottom: u16,
 
     pub events_scroll: u16,
+    /// Last-known height of the events pane (lines visible at once). Updated
+    /// by the renderer on every frame so `scroll_up` can cap correctly even
+    /// after a terminal resize.
+    pub events_view_height: u16,
     pub auto_scroll: bool,
+    pub panels: PanelVisibility,
 
     pub pending_action: Option<PendingAction>,
 }
@@ -118,9 +200,18 @@ impl App {
             input_area_top: 0,
             input_area_bottom: 0,
             events_scroll: 0,
+            events_view_height: 1,
             auto_scroll: true,
+            panels: PanelVisibility::default(),
             pending_action: None,
         }
+    }
+
+    /// Maximum scroll offset such that the events pane stays full of content.
+    /// Anything beyond this would leave blank space at the top.
+    pub fn max_events_scroll(&self) -> u16 {
+        let len = self.events.len() as u16;
+        len.saturating_sub(self.events_view_height)
     }
 
     pub fn take_pending_action(&mut self) -> Option<PendingAction> {
@@ -211,6 +302,16 @@ impl App {
             .unwrap_or_else(|| short_id(session_id, 18))
     }
 
+    pub fn resolve_session(&self, value: &str) -> Option<String> {
+        if self.sessions.contains_key(value) {
+            return Some(value.to_string());
+        }
+        self.session_names
+            .iter()
+            .find(|(_, name)| name.as_str() == value)
+            .map(|(session_id, _)| session_id.clone())
+    }
+
     pub fn handle_app_event(&mut self, ev: AppEvent) {
         match ev {
             AppEvent::Envelope(env) => self.handle_envelope(env),
@@ -244,7 +345,30 @@ impl App {
                         started_at: env.timestamp.clone(),
                         last_topic: String::new(),
                         event_count: 0,
+                        deleted: false,
+                        deleted_at: None,
                     });
+            }
+            return;
+        }
+
+        if env.topic == SESSION_DELETED {
+            let sid = env.context.session_id.clone();
+            let session = self
+                .sessions
+                .entry(sid.clone())
+                .or_insert_with(|| SessionInfo {
+                    session_id: sid.clone(),
+                    started_at: env.timestamp.clone(),
+                    last_topic: String::new(),
+                    event_count: 0,
+                    deleted: false,
+                    deleted_at: None,
+                });
+            session.deleted = true;
+            session.deleted_at = Some(env.timestamp.clone());
+            if self.active_session.as_deref() == Some(sid.as_str()) {
+                self.active_session = None;
             }
             return;
         }
@@ -259,6 +383,8 @@ impl App {
                 started_at: env.timestamp.clone(),
                 last_topic: topic.clone(),
                 event_count: 0,
+                deleted: false,
+                deleted_at: None,
             });
         session.last_topic = topic;
         session.event_count += 1;
@@ -344,6 +470,8 @@ impl App {
                 started_at: now,
                 last_topic: String::new(),
                 event_count: 0,
+                deleted: false,
+                deleted_at: None,
             },
         );
         self.session_names
@@ -373,10 +501,31 @@ impl App {
         }
     }
 
+    async fn delete_session(&mut self, sid: &str) {
+        let label = self.display_name(sid);
+        if let Some(session) = self.sessions.get_mut(sid) {
+            session.deleted = true;
+            session.deleted_at = Some(chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());
+        }
+        if self.active_session.as_deref() == Some(sid) {
+            self.active_session = None;
+        }
+        if let Err(e) = self.publish_session_deleted(sid).await {
+            self.status_msg = Some(format!("Deleted locally; broadcast failed: {e}"));
+        } else {
+            self.status_msg = Some(format!("Deleted session {label} (history retained)"));
+        }
+    }
+
     // -------------------------------------------- session switching
 
     pub fn cycle_session(&mut self, forward: bool) {
-        let mut ids: Vec<String> = self.sessions.keys().cloned().collect();
+        let mut ids: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| !session.deleted)
+            .map(|(id, _)| id.clone())
+            .collect();
         ids.sort_by(|a, b| {
             self.sessions[a]
                 .started_at
@@ -419,8 +568,17 @@ impl App {
     }
 
     pub fn scroll_up(&mut self) {
+        let max = self.max_events_scroll();
+        if self.events_scroll >= max {
+            // Already showing the oldest event at the top — nothing further
+            // back to scroll to. Keep auto_scroll false (user is reviewing
+            // history) but don't push the view off the top.
+            self.events_scroll = max;
+            self.auto_scroll = max == 0;
+            return;
+        }
         self.auto_scroll = false;
-        self.events_scroll = self.events_scroll.saturating_add(1);
+        self.events_scroll = (self.events_scroll + 1).min(max);
     }
 
     pub fn scroll_down(&mut self) {
@@ -433,6 +591,16 @@ impl App {
     pub fn end_scroll(&mut self) {
         self.events_scroll = 0;
         self.auto_scroll = true;
+    }
+
+    pub fn toggle_panel(&mut self, panel: Panel) {
+        let visible = !self.panels.is_visible(panel);
+        self.panels.set(panel, visible);
+        self.status_msg = Some(format!(
+            "{} panel {}",
+            panel.label(),
+            if visible { "shown" } else { "hidden" }
+        ));
     }
 
     // -------------------------------------------- publishing
@@ -476,9 +644,11 @@ impl App {
             "help" | "h" | "?" => self.cmd_help(),
             "new" => self.cmd_new(rest).await,
             "rename" => self.cmd_rename(rest).await,
+            "delete" | "del" => self.cmd_delete(rest).await,
             "agents" => self.cmd_agents(),
             "status" => self.cmd_status(rest),
             "history" => self.cmd_history(rest),
+            "panel" | "panels" | "toggle" => self.cmd_panel(rest),
             "clear" => {
                 self.command_output = None;
                 self.output_scroll = 0;
@@ -542,6 +712,7 @@ impl App {
     }
 
     fn set_output(&mut self, text: String) {
+        self.panels.detail = true;
         self.command_output = Some(text);
         self.output_scroll = 0;
     }
@@ -551,9 +722,11 @@ impl App {
              \x20\x20!help                  This panel\n\
              \x20\x20!new [name]            Create new session (prompts if name omitted)\n\
              \x20\x20!rename [name]         Rename active session\n\
+             \x20\x20!delete [session]      Hide a session from lists; history is retained\n\
              \x20\x20!agents                Agents seen in active session\n\
              \x20\x20!status <agent>        Agent's manifest + activity in active session\n\
              \x20\x20!history <agent>       Full conversation: received · prompts · responses · published\n\
+             \x20\x20!panel <name>          Toggle sessions, events, agents, detail, or all\n\
              \x20\x20!copy                  Copy command output (or latest event) to clipboard\n\
              \x20\x20!editor                Compose input in $EDITOR (for long ideas / multi-line)\n\
              \x20\x20!page                  Open command output in $PAGER (for long !history)\n\
@@ -568,11 +741,38 @@ impl App {
              \n\
              Plain text is published as workspace.idea.submitted.\n\
              \n\
-             KEYS:  Ctrl-N/R/X · Tab/Shift-Tab · ↑/↓/End for events\n\
+             KEYS:  Ctrl-N/R/X · F1/F2/F3/F4 panels · Tab/Shift-Tab · ↑/↓/End for events\n\
              \x20\x20\x20\x20\x20\x20Shift+Enter or Alt+Enter inserts a newline\n\
              \x20\x20\x20\x20\x20\x20PgUp/PgDn scroll long drafts or this panel · wheel over the composer scrolls it · Esc to dismiss"
             .to_string();
         self.set_output(text);
+    }
+
+    fn cmd_panel(&mut self, rest: &str) {
+        let arg = rest.trim().to_ascii_lowercase();
+        match arg.as_str() {
+            "" => {
+                self.status_msg =
+                    Some("Panel toggles: !panel sessions|events|agents|detail|all".into());
+            }
+            "all" | "show" | "show-all" => {
+                self.panels.set_all(true);
+                self.status_msg = Some("All panels shown".into());
+            }
+            "none" | "hide-all" => {
+                self.panels.set_all(false);
+                self.status_msg = Some("Context panels hidden; composer remains available".into());
+            }
+            other => {
+                if let Some(panel) = Panel::parse(other) {
+                    self.toggle_panel(panel);
+                } else {
+                    self.status_msg = Some(format!(
+                        "Unknown panel `{other}`. Use sessions, events, agents, detail, or all."
+                    ));
+                }
+            }
+        }
     }
 
     async fn cmd_new(&mut self, name: &str) {
@@ -593,6 +793,28 @@ impl App {
             return;
         }
         self.rename_session(&sid, name).await;
+    }
+
+    async fn cmd_delete(&mut self, session: &str) {
+        let sid = if session.is_empty() {
+            match self.active_session.clone() {
+                Some(sid) => sid,
+                None => {
+                    self.status_msg =
+                        Some("No active session. Use !delete <session-id-or-name>.".into());
+                    return;
+                }
+            }
+        } else {
+            match self.resolve_session(session) {
+                Some(sid) => sid,
+                None => {
+                    self.status_msg = Some(format!("Session not found: {session}"));
+                    return;
+                }
+            }
+        };
+        self.delete_session(&sid).await;
     }
 
     fn cmd_agents(&mut self) {
@@ -903,6 +1125,27 @@ impl App {
             token,
             session_id,
             serde_json::json!({ "name": name }),
+            None,
+            vec![],
+        );
+        self.bus.publish(&env).await
+    }
+
+    async fn publish_session_deleted(&self, session_id: &str) -> Result<()> {
+        let token = mint_actor_token(
+            "console-user",
+            &["workspace:read", "workspace:write"],
+            session_id,
+            &self.signing_key,
+            900,
+        )?;
+        let env = Envelope::build(
+            SESSION_DELETED,
+            "agora-console",
+            0,
+            token,
+            session_id,
+            serde_json::json!({ "sessionId": session_id, "deletedBy": "agora-console" }),
             None,
             vec![],
         );

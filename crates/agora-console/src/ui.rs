@@ -4,7 +4,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
 };
 
-use crate::app::{App, InputMode};
+use crate::app::{App, InputMode, Panel};
 
 const COMPOSER_MIN_HEIGHT: u16 = 7;
 const COMPOSER_MAX_HEIGHT: u16 = 18;
@@ -12,7 +12,10 @@ const COMPOSER_MAX_HEIGHT: u16 = 18;
 pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
-    let detail_height = if app.command_output.is_some() {
+    let main_visible = app.panels.sessions || app.panels.events || app.panels.agents;
+    let detail_height = if !app.panels.detail {
+        0
+    } else if app.command_output.is_some() {
         (area.height / 3).clamp(10, 16)
     } else {
         8
@@ -26,8 +29,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),             // status bar
-            Constraint::Min(6),                // main 3-column area
+            Constraint::Length(1), // status bar
+            if main_visible {
+                Constraint::Min(6)
+            } else {
+                Constraint::Length(0)
+            },
             Constraint::Length(detail_height), // detail / command output
             Constraint::Length(input_height),  // input (grows for multi-line)
         ])
@@ -35,20 +42,11 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     render_status(f, app, outer[0]);
 
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(34),
-            Constraint::Min(40),
-            Constraint::Length(34),
-        ])
-        .split(outer[1]);
+    render_main_panels(f, app, outer[1]);
 
-    render_sessions(f, app, cols[0]);
-    render_events(f, app, cols[1]);
-    render_agents(f, app, cols[2]);
-
-    render_detail(f, app, outer[2]);
+    if app.panels.detail {
+        render_detail(f, app, outer[2]);
+    }
     render_input(f, app, outer[3]);
 }
 
@@ -83,8 +81,62 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(para, area);
 }
 
+fn render_main_panels(f: &mut Frame, app: &mut App, area: Rect) {
+    let mut panels = Vec::new();
+    if app.panels.sessions {
+        panels.push(Panel::Sessions);
+    }
+    if app.panels.events {
+        panels.push(Panel::Events);
+    }
+    if app.panels.agents {
+        panels.push(Panel::Agents);
+    }
+
+    if panels.is_empty() || area.height == 0 || area.width == 0 {
+        app.events_view_height = 1;
+        return;
+    }
+
+    let constraints = main_panel_constraints(&panels);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(constraints)
+        .split(area);
+
+    for (idx, panel) in panels.into_iter().enumerate() {
+        match panel {
+            Panel::Sessions => render_sessions(f, app, cols[idx]),
+            Panel::Events => render_events(f, app, cols[idx]),
+            Panel::Agents => render_agents(f, app, cols[idx]),
+            Panel::Detail => {}
+        }
+    }
+}
+
+fn main_panel_constraints(panels: &[Panel]) -> Vec<Constraint> {
+    if panels.len() == 1 {
+        return vec![Constraint::Min(1)];
+    }
+
+    let events_visible = panels.contains(&Panel::Events);
+    panels
+        .iter()
+        .map(|panel| match (panel, events_visible) {
+            (Panel::Events, _) => Constraint::Min(40),
+            (Panel::Sessions | Panel::Agents, true) => Constraint::Length(34),
+            (Panel::Sessions | Panel::Agents, false) => Constraint::Ratio(1, panels.len() as u32),
+            (Panel::Detail, _) => Constraint::Length(0),
+        })
+        .collect()
+}
+
 fn render_sessions(f: &mut Frame, app: &App, area: Rect) {
-    let mut sessions: Vec<&crate::app::SessionInfo> = app.sessions.values().collect();
+    let mut sessions: Vec<&crate::app::SessionInfo> = app
+        .sessions
+        .values()
+        .filter(|session| !session.deleted)
+        .collect();
     sessions.sort_by(|a, b| b.started_at.cmp(&a.started_at));
 
     let items: Vec<ListItem> = sessions
@@ -122,13 +174,13 @@ fn render_sessions(f: &mut Frame, app: &App, area: Rect) {
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(format!(" Sessions ({}) ", app.sessions.len()))
+            .title(format!(" Sessions ({}) ", sessions.len()))
             .border_style(Style::default().fg(Color::DarkGray)),
     );
     f.render_widget(list, area);
 }
 
-fn render_events(f: &mut Frame, app: &App, area: Rect) {
+fn render_events(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Events ")
@@ -136,7 +188,18 @@ fn render_events(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    // Record viewport height so `scroll_up` in app.rs can cap correctly
+    // (terminal resize may have changed it since last frame).
+    app.events_view_height = inner.height;
+
     let height = inner.height as usize;
+    // Clamp scroll so the pane never goes blank when scrolled past the
+    // oldest event. Belt + braces against any path that bumped
+    // events_scroll without going through scroll_up.
+    let max_scroll = app.events.len().saturating_sub(height);
+    if (app.events_scroll as usize) > max_scroll {
+        app.events_scroll = max_scroll as u16;
+    }
     let scroll = app.events_scroll as usize;
 
     // The newest events sit at the end; auto-scroll keeps the bottom in view.
@@ -160,6 +223,7 @@ fn format_event_line(e: &agora_core::envelope::Envelope) -> Line<'static> {
     };
     let session = short_id(&e.context.session_id, 12);
     let color = topic_color(&e.topic);
+
     Line::from(vec![
         Span::styled(ts, Style::default().fg(Color::DarkGray)),
         Span::raw("  "),

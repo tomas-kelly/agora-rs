@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agora"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agora-console",
  "agora-core",
@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "agora-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agora-core",
  "anyhow",
@@ -48,7 +48,7 @@ dependencies = [
 
 [[package]]
 name = "agora-console"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agora-core",
  "anyhow",
@@ -68,7 +68,7 @@ dependencies = [
 
 [[package]]
 name = "agora-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -514,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-telemetry"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agora-core",
  "anyhow",

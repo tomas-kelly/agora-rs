@@ -8,6 +8,8 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -19,7 +21,7 @@ use agora_core::{
     tokens::{default_key_path, load_signing_key, mint_actor_token},
     topics::{
         direct_inbox_topic, AGENT_TELEMETRY_LOGS, EVENT_STREAM, EVENT_STREAM_SUBJECTS,
-        SESSION_NAMED, WORKSPACE_IDEA_SUBMITTED,
+        SESSION_DELETED, SESSION_NAMED, WORKSPACE_IDEA_SUBMITTED,
     },
 };
 use config::TopologyConfig;
@@ -41,7 +43,20 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Start the full swarm from a topology config
-    Run { config: std::path::PathBuf },
+    Start {
+        #[arg(long, default_value = "agents.local.json")]
+        config: std::path::PathBuf,
+        /// Start the supervisor in the background and write logs to the runtime log directory
+        #[arg(short = 'd', long)]
+        detach: bool,
+    },
+    /// Legacy alias for `start --config <CONFIG>`
+    #[command(hide = true)]
+    Run {
+        config: std::path::PathBuf,
+        #[arg(short = 'd', long)]
+        detach: bool,
+    },
     /// Open the terminal console for the running swarm
     Console(agora_console::ConsoleArgs),
     /// Submit an idea to a running swarm (fires workspace.idea.submitted)
@@ -57,6 +72,8 @@ enum Cmd {
     },
     /// List sessions seen in the event stream
     Sessions {
+        #[arg(long)]
+        include_deleted: bool,
         #[arg(long, default_value = "nats://127.0.0.1:4222")]
         bus_url: String,
     },
@@ -147,7 +164,7 @@ enum Cmd {
         #[arg(long)]
         legacy: bool,
     },
-    /// Restart one agent managed by `agora run`
+    /// Restart one agent managed by `agora start`
     Restart {
         agent: String,
         #[arg(long, default_value = "agents.local.json")]
@@ -189,6 +206,8 @@ enum Cmd {
     Replay {
         #[arg(long)]
         session_id: Option<String>,
+        #[arg(long)]
+        json: bool,
         #[arg(long, default_value = "nats://127.0.0.1:4222")]
         bus_url: String,
     },
@@ -245,6 +264,8 @@ enum RegistryCmd {
 enum SessionCmd {
     /// List sessions seen in the event stream
     Ls {
+        #[arg(long)]
+        include_deleted: bool,
         #[arg(long, default_value = "nats://127.0.0.1:4222")]
         bus_url: String,
     },
@@ -260,6 +281,14 @@ enum SessionCmd {
     Rename {
         session_id: String,
         name: String,
+        #[arg(long, default_value = "nats://127.0.0.1:4222")]
+        bus_url: String,
+        #[arg(long, default_value = ".kiro/session_token")]
+        key_path: String,
+    },
+    /// Hide a session from default lists without erasing its events
+    Delete {
+        session_id: String,
         #[arg(long, default_value = "nats://127.0.0.1:4222")]
         bus_url: String,
         #[arg(long, default_value = ".kiro/session_token")]
@@ -416,6 +445,8 @@ struct SessionSummary {
     started_at: String,
     last_topic: String,
     event_count: usize,
+    deleted: bool,
+    deleted_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -435,7 +466,7 @@ struct TelemetryEntry {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let default_log_filter = if matches!(&cli.command, Cmd::Run { .. }) {
+    let default_log_filter = if matches!(&cli.command, Cmd::Start { .. } | Cmd::Run { .. }) {
         "info"
     } else {
         "warn"
@@ -448,7 +479,20 @@ async fn main() -> Result<()> {
         .init();
 
     match cli.command {
-        Cmd::Run { config } => run_swarm(config).await,
+        Cmd::Start { config, detach } => {
+            if detach {
+                start_detached(config)
+            } else {
+                run_swarm(config).await
+            }
+        }
+        Cmd::Run { config, detach } => {
+            if detach {
+                start_detached(config)
+            } else {
+                run_swarm(config).await
+            }
+        }
         Cmd::Console(args) => agora_console::run(args).await,
         Cmd::Submit {
             idea,
@@ -456,9 +500,15 @@ async fn main() -> Result<()> {
             bus_url,
             key_path,
         } => submit_idea(&idea, session_id.as_deref(), &bus_url, &key_path).await,
-        Cmd::Sessions { bus_url } => list_sessions(&bus_url).await,
+        Cmd::Sessions {
+            include_deleted,
+            bus_url,
+        } => list_sessions(&bus_url, include_deleted).await,
         Cmd::Session { command } => match command {
-            SessionCmd::Ls { bus_url } => list_sessions(&bus_url).await,
+            SessionCmd::Ls {
+                include_deleted,
+                bus_url,
+            } => list_sessions(&bus_url, include_deleted).await,
             SessionCmd::New {
                 name,
                 bus_url,
@@ -470,6 +520,11 @@ async fn main() -> Result<()> {
                 bus_url,
                 key_path,
             } => rename_session(&session_id, &name, &bus_url, &key_path).await,
+            SessionCmd::Delete {
+                session_id,
+                bus_url,
+                key_path,
+            } => delete_session(&session_id, &bus_url, &key_path).await,
             SessionCmd::Inspect {
                 session_id,
                 json,
@@ -685,8 +740,9 @@ async fn main() -> Result<()> {
         }
         Cmd::Replay {
             session_id,
+            json,
             bus_url,
-        } => replay(&session_id, &bus_url).await,
+        } => replay(&session_id, &bus_url, json).await,
         Cmd::Bootstrap { key_path } => bootstrap(&key_path),
         Cmd::Registry { command } => match command {
             RegistryCmd::Prune {
@@ -842,7 +898,7 @@ async fn doctor(config_path: &std::path::Path, key_path: &str) -> Result<()> {
             _ => {
                 warn(
                     "agora supervisor",
-                    "not running. Use `agora run agents.local.json` to own the swarm lifecycle",
+                    "not running. Use `agora start --config agents.local.json` to own the swarm lifecycle",
                 );
                 warnings += 1;
             }
@@ -1159,6 +1215,86 @@ async fn run_swarm(config_path: std::path::PathBuf) -> Result<()> {
     Ok(())
 }
 
+fn start_detached(config_path: std::path::PathBuf) -> Result<()> {
+    let cfg = TopologyConfig::load(&config_path)?;
+    std::fs::create_dir_all(&cfg.log_dir)?;
+    std::fs::create_dir_all(&cfg.pid_dir)?;
+    ensure_signing_key(&default_key_path())?;
+
+    let supervisor = process_for_target(&cfg, "agora")?;
+    let status = status_for(supervisor.clone());
+    if status.state == ProcessState::Running {
+        let pid = status
+            .pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        bail!(
+            "agora supervisor is already running as pid {pid}; stop it with `agora stop --config {}`",
+            config_path.display()
+        );
+    }
+
+    let log_path = Path::new(&cfg.log_dir).join("agora.log");
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("open {}", log_path.display()))?;
+    let stderr = log
+        .try_clone()
+        .with_context(|| format!("clone {}", log_path.display()))?;
+
+    let exe = std::env::current_exe().context("resolve current agora executable")?;
+    let mut command = Command::new(exe);
+    command
+        .arg("start")
+        .arg("--config")
+        .arg(&config_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("start detached supervisor for {}", config_path.display()))?;
+    let child_pid = child.id();
+    let deadline = Instant::now() + Duration::from_secs(5);
+
+    while Instant::now() < deadline {
+        if let Some(exit) = child.try_wait()? {
+            bail!(
+                "detached supervisor exited early with {exit}; see {}",
+                log_path.display()
+            );
+        }
+
+        let started = status_for(supervisor.clone());
+        if started.state == ProcessState::Running && started.pid == Some(child_pid) {
+            println!(
+                "Started agora supervisor detached for {} (pid {child_pid})",
+                config_path.display()
+            );
+            println!("Logs: {}", log_path.display());
+            println!("Stop: agora stop --config {}", config_path.display());
+            return Ok(());
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    bail!(
+        "detached supervisor did not write {} within 5s; see {}",
+        supervisor.pid_file.display(),
+        log_path.display()
+    )
+}
+
 struct PidFileGuard {
     path: std::path::PathBuf,
 }
@@ -1224,6 +1360,12 @@ async fn rename_session(session_id: &str, name: &str, bus_url: &str, key_path: &
     Ok(())
 }
 
+async fn delete_session(session_id: &str, bus_url: &str, key_path: &str) -> Result<()> {
+    publish_session_deleted(session_id, bus_url, key_path).await?;
+    println!("Deleted session {session_id} (history retained)");
+    Ok(())
+}
+
 async fn publish_session_named(
     session_id: &str,
     name: &str,
@@ -1252,16 +1394,43 @@ async fn publish_session_named(
     bus.publish(&env).await
 }
 
-async fn list_sessions(bus_url: &str) -> Result<()> {
+async fn publish_session_deleted(session_id: &str, bus_url: &str, key_path: &str) -> Result<()> {
+    let signing_key = load_signing_key(key_path)?;
+    let token = mint_actor_token(
+        "cli-user",
+        &["workspace:read", "workspace:write"],
+        session_id,
+        &signing_key,
+        900,
+    )?;
+    let bus = Bus::connect(bus_url).await?;
+    let env = Envelope::build(
+        SESSION_DELETED,
+        "agora-cli",
+        0,
+        token,
+        session_id,
+        serde_json::json!({ "sessionId": session_id, "deletedBy": "agora-cli" }),
+        None,
+        vec![],
+    );
+    bus.publish(&env).await
+}
+
+async fn list_sessions(bus_url: &str, include_deleted: bool) -> Result<()> {
     let bus = Bus::connect(bus_url).await?;
     let sessions = load_sessions(&bus).await?;
 
-    if sessions.is_empty() {
+    let mut rows: Vec<_> = sessions
+        .values()
+        .filter(|session| include_deleted || !session.deleted)
+        .collect();
+
+    if rows.is_empty() {
         println!("No sessions found.");
         return Ok(());
     }
 
-    let mut rows: Vec<_> = sessions.values().collect();
     rows.sort_by(|a, b| {
         b.started_at
             .cmp(&a.started_at)
@@ -1269,15 +1438,16 @@ async fn list_sessions(bus_url: &str) -> Result<()> {
     });
 
     println!(
-        "{:<32} {:<24} {:>6}  {:<22} LAST TOPIC",
-        "SESSION", "NAME", "EVENTS", "STARTED"
+        "{:<32} {:<24} {:>6}  {:<9} {:<22} LAST TOPIC",
+        "SESSION", "NAME", "EVENTS", "STATE", "STARTED"
     );
     for session in rows {
         println!(
-            "{:<32} {:<24} {:>6}  {:<22} {}",
+            "{:<32} {:<24} {:>6}  {:<9} {:<22} {}",
             session.session_id,
             session.name.as_deref().unwrap_or("-"),
             session.event_count,
+            if session.deleted { "deleted" } else { "active" },
             session.started_at,
             if session.last_topic.is_empty() {
                 "-"
@@ -1518,7 +1688,7 @@ async fn send_message(
     Ok(())
 }
 
-async fn replay(session_id: &Option<String>, bus_url: &str) -> Result<()> {
+async fn replay(session_id: &Option<String>, bus_url: &str, json: bool) -> Result<()> {
     let bus = Bus::connect(bus_url).await?;
     let events = bus.read_all_events().await?;
 
@@ -1531,15 +1701,11 @@ async fn replay(session_id: &Option<String>, bus_url: &str) -> Result<()> {
         })
         .collect();
 
-    println!("Found {} events", filtered.len());
+    if !json {
+        println!("Found {} events", filtered.len());
+    }
     for e in filtered {
-        println!(
-            "[{}] {} | {} | session={}",
-            e.timestamp, e.event_id, e.topic, e.context.session_id
-        );
-        if !e.data.is_null() {
-            println!("  data: {}", serde_json::to_string(&e.data)?);
-        }
+        print_event(e, json)?;
     }
     Ok(())
 }
@@ -1962,6 +2128,8 @@ fn build_sessions(events: &[Envelope]) -> BTreeMap<String, SessionSummary> {
                 started_at: event.timestamp.clone(),
                 last_topic: String::new(),
                 event_count: 0,
+                deleted: false,
+                deleted_at: None,
             });
 
         if event.timestamp < entry.started_at {
@@ -1972,6 +2140,11 @@ fn build_sessions(events: &[Envelope]) -> BTreeMap<String, SessionSummary> {
             if let Some(name) = event.data.get("name").and_then(|v| v.as_str()) {
                 entry.name = Some(name.to_string());
             }
+            continue;
+        }
+        if event.topic == SESSION_DELETED {
+            entry.deleted = true;
+            entry.deleted_at = Some(event.timestamp.clone());
             continue;
         }
 
@@ -2087,6 +2260,13 @@ fn print_session_summary(summary: &SessionSummary) {
         summary.name.as_deref().unwrap_or("-")
     );
     println!("  started:       {}", summary.started_at);
+    println!(
+        "  state:         {}",
+        if summary.deleted { "deleted" } else { "active" }
+    );
+    if let Some(deleted_at) = &summary.deleted_at {
+        println!("  deleted:       {deleted_at}");
+    }
     println!("  events:        {}", summary.event_count);
     println!(
         "  last topic:    {}",
@@ -2204,4 +2384,42 @@ fn write_new_signing_key(path: &std::path::Path) -> Result<()> {
     let mut f = options.open(path)?;
     writeln!(f, "{hex}")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(topic: &str, session_id: &str, data: serde_json::Value) -> Envelope {
+        Envelope::build(topic, "test", 0, "tok", session_id, data, None, vec![])
+    }
+
+    #[test]
+    fn session_deleted_marks_summary_without_erasing_history() {
+        let events = vec![
+            event(
+                SESSION_NAMED,
+                "sess_delete",
+                serde_json::json!({ "name": "Delete me" }),
+            ),
+            event(
+                WORKSPACE_IDEA_SUBMITTED,
+                "sess_delete",
+                serde_json::json!({ "idea": "keep history" }),
+            ),
+            event(
+                SESSION_DELETED,
+                "sess_delete",
+                serde_json::json!({ "sessionId": "sess_delete" }),
+            ),
+        ];
+
+        let sessions = build_sessions(&events);
+        let summary = sessions.get("sess_delete").expect("session summary");
+        assert_eq!(summary.name.as_deref(), Some("Delete me"));
+        assert_eq!(summary.event_count, 1);
+        assert_eq!(summary.last_topic, WORKSPACE_IDEA_SUBMITTED);
+        assert!(summary.deleted);
+        assert!(summary.deleted_at.is_some());
+    }
 }

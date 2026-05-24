@@ -4,3 +4,4 @@
 !.kiro/agents/
 !.kiro/agents/*.json
 *.log
+.swarm/

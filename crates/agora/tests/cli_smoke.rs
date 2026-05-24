@@ -124,6 +124,59 @@ fn cli_mutating_commands_work_against_isolated_nats() {
     ]);
     let session_history = String::from_utf8(session_history.stdout).unwrap();
     assert!(session_history.contains("workspace.idea.submitted"));
+
+    run_ok([
+        "session",
+        "delete",
+        &session_id,
+        "--bus-url",
+        &bus_url,
+        "--key-path",
+        key_path.to_str().unwrap(),
+    ]);
+    let session_ls = run_ok(["session", "ls", "--bus-url", &bus_url]);
+    let session_ls = String::from_utf8(session_ls.stdout).unwrap();
+    assert!(
+        !session_ls.contains("Renamed Smoke"),
+        "deleted session leaked into default list"
+    );
+    let session_ls_deleted = run_ok(["session", "ls", "--include-deleted", "--bus-url", &bus_url]);
+    let session_ls_deleted = String::from_utf8(session_ls_deleted.stdout).unwrap();
+    assert!(session_ls_deleted.contains("Renamed Smoke"));
+    assert!(session_ls_deleted.contains("deleted"));
+
+    // --json replay: NDJSON output with camelCase keys
+    let replay_json = run_ok([
+        "replay",
+        "--json",
+        "--session-id",
+        &session_id,
+        "--bus-url",
+        &bus_url,
+    ]);
+    let replay_json = String::from_utf8(replay_json.stdout).unwrap();
+    let lines: Vec<&str> = replay_json.lines().filter(|l| !l.is_empty()).collect();
+    assert!(
+        lines.len() >= 2,
+        "expected at least 2 NDJSON lines, got {}",
+        lines.len()
+    );
+    assert!(
+        !lines[0].starts_with("Found"),
+        "header leaked into --json output"
+    );
+    for line in &lines {
+        let v: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("invalid JSON line: {e}\nline: {line}"));
+        assert!(v.get("eventId").is_some(), "missing eventId in: {line}");
+        assert!(v.get("topic").is_some(), "missing topic in: {line}");
+    }
+    let idea_line = lines
+        .iter()
+        .find(|l| l.contains("workspace.idea.submitted"))
+        .expect("no workspace.idea.submitted line in --json replay");
+    let idea: serde_json::Value = serde_json::from_str(idea_line).unwrap();
+    assert_eq!(idea["data"]["idea"], "Build smoke path");
 }
 
 fn run_ok<const N: usize>(args: [&str; N]) -> Output {

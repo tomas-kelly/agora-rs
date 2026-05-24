@@ -83,7 +83,7 @@ pub fn expected_processes(cfg: &TopologyConfig) -> Vec<RuntimeProcess> {
         name: "agora".to_string(),
         kind: "supervisor",
         pid_file: pid_dir.join("agora.pid"),
-        log_file: None,
+        log_file: Some(log_dir.join("agora.log")),
     });
     processes.push(RuntimeProcess {
         name: "nats".to_string(),
@@ -387,7 +387,7 @@ pub fn restart_agent(cfg: &TopologyConfig, agent: &str, force: bool) -> Result<(
         .context("missing supervisor process spec")?;
     let supervisor_status = status_for(supervisor);
     if supervisor_status.state != ProcessState::Running {
-        bail!("agora supervisor is not running; start it with `agora run agents.local.json`");
+        bail!("agora supervisor is not running; start it with `agora start --config agents.local.json`");
     }
 
     let process = processes
@@ -396,7 +396,7 @@ pub fn restart_agent(cfg: &TopologyConfig, agent: &str, force: bool) -> Result<(
         .context("missing agent process spec")?;
     let before = status_for(process.clone());
     let Some(old_pid) = before.pid else {
-        bail!("agent `{agent}` has no pid file; wait for `agora run` to start it");
+        bail!("agent `{agent}` has no pid file; wait for `agora start` to start it");
     };
     if before.state != ProcessState::Running {
         bail!(
@@ -541,6 +541,9 @@ fn wait_for_pid_change(path: &Path, old_pid: u32, timeout: Duration) -> Result<(
 }
 
 pub fn log_path_for_target(cfg: &TopologyConfig, target: &str) -> Option<PathBuf> {
+    if target == "agora" {
+        return Some(Path::new(&cfg.log_dir).join("agora.log"));
+    }
     if target == "nats" {
         return Some(PathBuf::from(&cfg.nats.log_file));
     }
@@ -720,12 +723,21 @@ fn read_pid_file(path: &Path) -> Result<u32> {
 }
 
 fn pid_alive(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
+    match Command::new("kill").args(["-0", &pid.to_string()]).output() {
+        Ok(output) if output.status.success() => return true,
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+            if stderr.contains("operation not permitted") || stderr.contains("permission denied") {
+                return true;
+            }
+        }
+        Err(_) => {}
+    }
+
+    Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "pid="])
+        .output()
+        .map(|output| output.status.success() && !output.stdout.is_empty())
         .unwrap_or(false)
 }
 
