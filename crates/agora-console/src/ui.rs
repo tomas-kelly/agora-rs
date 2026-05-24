@@ -1,17 +1,28 @@
+use agora_core::manifest::AgentStatus;
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
 };
-use swarm_core::manifest::AgentStatus;
 
 use crate::app::{App, InputMode};
 
-pub fn render(f: &mut Frame, app: &App) {
+const COMPOSER_MIN_HEIGHT: u16 = 7;
+const COMPOSER_MAX_HEIGHT: u16 = 18;
+
+pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
-    let detail_height = if app.command_output.is_some() { 16 } else { 8 };
-    let input_lines = 1 + app.input.chars().filter(|c| *c == '\n').count();
-    let input_height = (input_lines as u16 + 2).clamp(3, 10);
+    let detail_height = if app.command_output.is_some() {
+        (area.height / 3).clamp(10, 16)
+    } else {
+        8
+    };
+    let content_width = area.width.saturating_sub(4).max(1);
+    let input_lines = visual_line_count(&app.input, content_width);
+    let max_for_terminal = ((area.height * 2) / 5).clamp(COMPOSER_MIN_HEIGHT, COMPOSER_MAX_HEIGHT);
+    let input_height = (input_lines + 3)
+        .clamp(COMPOSER_MIN_HEIGHT, COMPOSER_MAX_HEIGHT)
+        .min(max_for_terminal);
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -43,7 +54,7 @@ pub fn render(f: &mut Frame, app: &App) {
 
 fn render_status(f: &mut Frame, app: &App, area: Rect) {
     let left = format!(
-        " agora-console │ {} │ events:{} telemetry:{} sessions:{} agents:{} ",
+        " agora console │ {} │ events:{} telemetry:{} sessions:{} agents:{} ",
         app.bus_url,
         app.events.len(),
         app.telemetry.len(),
@@ -141,7 +152,7 @@ fn render_events(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(list, inner);
 }
 
-fn format_event_line(e: &swarm_core::envelope::Envelope) -> Line<'static> {
+fn format_event_line(e: &agora_core::envelope::Envelope) -> Line<'static> {
     let ts = if e.timestamp.len() >= 19 {
         e.timestamp[11..19].to_string()
     } else {
@@ -188,9 +199,10 @@ fn render_agents(f: &mut Frame, app: &App, area: Rect) {
         .agents
         .values()
         .map(|a| {
-            let (icon, color) = match a.status {
+            let (icon, color) = match a.observed_status() {
                 AgentStatus::Ready => ("●", Color::Green),
                 AgentStatus::Busy => ("◐", Color::Yellow),
+                AgentStatus::Stale => ("◌", Color::Yellow),
                 AgentStatus::Starting => ("◌", Color::Gray),
                 AgentStatus::Draining => ("◑", Color::Yellow),
                 AgentStatus::Down => ("○", Color::Red),
@@ -269,8 +281,8 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(para, area);
 }
 
-fn render_input(f: &mut Frame, app: &App, area: Rect) {
-    let (title, prompt_char, border) = match app.mode {
+fn render_input(f: &mut Frame, app: &mut App, area: Rect) {
+    let (base_title, prompt_char, border) = match app.mode {
         InputMode::Normal => {
             let scope = match &app.active_session {
                 Some(sid) => format!("active: {}", app.display_name(sid)),
@@ -297,11 +309,31 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
         }
     };
 
+    let inner = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2).max(1),
+    };
+    let content_width = inner.width.saturating_sub(2).max(1);
+    let total_lines = visual_line_count(&app.input, content_width);
+    app.set_input_viewport(inner.y, inner.height, content_width, total_lines);
+    let max_scroll = total_lines.saturating_sub(inner.height);
+    let bottom_offset = app.input_scroll.min(max_scroll);
+    let scroll = max_scroll.saturating_sub(bottom_offset);
+    let title = if total_lines > inner.height {
+        format!(
+            "{base_title}[line {}/{total_lines} · PgUp/PgDn or wheel] ",
+            scroll + 1
+        )
+    } else {
+        base_title
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
         .border_style(Style::default().fg(border));
-    let inner = block.inner(area);
     f.render_widget(block, area);
 
     // Render as multi-line, with the prompt prefix on line 0 only.
@@ -323,15 +355,53 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
     } else {
         lines.push(Line::from(vec![prompt_span]));
     }
-    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let para = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
     f.render_widget(para, inner);
 
-    // Cursor lands at the end of the last logical line.
-    let last_line = app.input.rsplit('\n').next().unwrap_or("");
-    let line_idx = app.input.chars().filter(|c| *c == '\n').count() as u16;
-    let cursor_x = inner.x + 2 + last_line.chars().count() as u16;
-    let cursor_y = inner.y + line_idx;
-    f.set_cursor_position((cursor_x, cursor_y));
+    // The cursor follows the append point. When the draft is scrolled up,
+    // keep the cursor out of the way so the user can read the older text.
+    if app.input_scroll == 0 {
+        let (cursor_row, cursor_col) = input_end_position(&app.input, content_width);
+        let cursor_y = inner.y + cursor_row.saturating_sub(scroll);
+        if cursor_y < inner.y.saturating_add(inner.height) {
+            let cursor_x = inner.x + cursor_col.min(inner.width.saturating_sub(1));
+            f.set_cursor_position((cursor_x, cursor_y));
+        }
+    }
+}
+
+fn visual_line_count(input: &str, content_width: u16) -> u16 {
+    let width = content_width.max(1) as usize;
+    input
+        .split('\n')
+        .map(|line| {
+            let chars = line.chars().count();
+            chars.max(1).div_ceil(width) as u16
+        })
+        .sum::<u16>()
+        .max(1)
+}
+
+fn input_end_position(input: &str, content_width: u16) -> (u16, u16) {
+    let width = content_width.max(1) as usize;
+    let mut row = 0u16;
+    let mut col = 2u16;
+    let lines: Vec<&str> = input.split('\n').collect();
+    for (idx, line) in lines.iter().enumerate() {
+        let effective_width = width.max(1);
+        let chars = line.chars().count();
+        let wrapped_rows = chars / effective_width;
+        let wrapped_col = chars % effective_width;
+        if idx + 1 == lines.len() {
+            row = row.saturating_add(wrapped_rows as u16);
+            col = 2 + wrapped_col as u16;
+        } else {
+            row = row.saturating_add(wrapped_rows as u16 + 1);
+        }
+    }
+    (row, col)
 }
 
 fn short_id(id: &str, n: usize) -> String {

@@ -19,9 +19,9 @@
         "Cargo.lock",
         "README.md",
         "crates/agora-console/**",
-        "crates/swarm-core/src/envelope.rs",
-        "crates/swarm-core/src/manifest.rs",
-        "crates/swarm-core/src/topics.rs",
+        "crates/agora-core/src/envelope.rs",
+        "crates/agora-core/src/manifest.rs",
+        "crates/agora-core/src/topics.rs",
         "./*.json"
       ]
     },
@@ -50,9 +50,9 @@
   "resources": [
     "file://../../README.md",
     "file://../../crates/agora-console/src/**/*.rs",
-    "file://../../crates/swarm-core/src/envelope.rs",
-    "file://../../crates/swarm-core/src/manifest.rs",
-    "file://../../crates/swarm-core/src/topics.rs"
+    "file://../../crates/agora-core/src/envelope.rs",
+    "file://../../crates/agora-core/src/manifest.rs",
+    "file://../../crates/agora-core/src/topics.rs"
   ],
   "includeMcpJson": true,
   "keyboardShortcut": "ctrl+f",

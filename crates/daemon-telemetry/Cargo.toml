@@ -12,7 +12,7 @@ name = "daemon-telemetry"
 path = "src/main.rs"
 
 [dependencies]
-swarm-core  = { workspace = true }
+agora-core  = { workspace = true }
 anyhow      = { workspace = true }
 clap        = { workspace = true }
 futures     = { workspace = true }

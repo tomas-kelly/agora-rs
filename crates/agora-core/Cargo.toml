@@ -1,11 +1,11 @@
 [package]
-name        = "swarm-core"
+name        = "agora-core"
 version     = { workspace = true }
 edition     = { workspace = true }
 license     = { workspace = true }
 repository  = { workspace = true }
 authors     = { workspace = true }
-description = "Shared library for the agora-rs swarm: envelope, bus, daemon runtime, ACP, tokens"
+description = "Shared library for the agora swarm: envelope, bus, daemon runtime, ACP, tokens"
 
 [dependencies]
 async-nats   = { workspace = true }

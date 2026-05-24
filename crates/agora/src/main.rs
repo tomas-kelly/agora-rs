@@ -1,22 +1,35 @@
 mod config;
+mod lifecycle;
 mod supervisor;
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
-use serde::Deserialize;
-use std::collections::BTreeMap;
+use clap::{Args, Parser, Subcommand};
+use futures::StreamExt;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
-use config::TopologyConfig;
-use supervisor::Supervisor;
-use swarm_core::{
-    bus::Bus,
+use agora_core::{
+    bus::{AgentRegistryRecord, Bus},
     envelope::Envelope,
-    manifest::AgentManifest,
+    manifest::{AgentManifest, AgentStatus},
     tokens::{default_key_path, load_signing_key, mint_actor_token},
-    topics::{direct_inbox_topic, AGENT_TELEMETRY_LOGS, SESSION_NAMED, WORKSPACE_IDEA_SUBMITTED},
+    topics::{
+        direct_inbox_topic, AGENT_TELEMETRY_LOGS, EVENT_STREAM, EVENT_STREAM_SUBJECTS,
+        SESSION_NAMED, WORKSPACE_IDEA_SUBMITTED,
+    },
 };
+use config::TopologyConfig;
+use lifecycle::{
+    expected_processes, legacy_swarm_processes, log_path_for_target, print_logs,
+    print_process_stats, print_process_table, print_process_top, process_for_target,
+    process_metrics, restart_agent, runtime_statuses, status_for, stop_legacy_swarm_processes,
+    stop_runtime, write_pid, LogOptions, ProcessState, RuntimeProcessStatus,
+};
+use supervisor::Supervisor;
 
 #[derive(Parser)]
 #[command(name = "agora", about = "Rust event-driven agent swarm on NATS")]
@@ -29,6 +42,8 @@ struct Cli {
 enum Cmd {
     /// Start the full swarm from a topology config
     Run { config: std::path::PathBuf },
+    /// Open the terminal console for the running swarm
+    Console(agora_console::ConsoleArgs),
     /// Submit an idea to a running swarm (fires workspace.idea.submitted)
     Submit {
         /// The idea text
@@ -45,15 +60,100 @@ enum Cmd {
         #[arg(long, default_value = "nats://127.0.0.1:4222")]
         bus_url: String,
     },
-    /// Create or rename session metadata
+    /// Manage session metadata and history
     Session {
         #[command(subcommand)]
         command: SessionCmd,
+    },
+    /// Manage agents
+    Agent {
+        #[command(subcommand)]
+        command: AgentCmd,
     },
     /// List agents currently registered in the swarm
     Agents {
         #[arg(long, default_value = "nats://127.0.0.1:4222")]
         bus_url: String,
+    },
+    /// Inspect and maintain the local runtime
+    System {
+        #[command(subcommand)]
+        command: SystemCmd,
+    },
+    /// Show local supervisor, service, and agent process status
+    Ps {
+        #[arg(long, default_value = "agents.local.json")]
+        config: std::path::PathBuf,
+    },
+    /// Print log targets or tail a process/agent log
+    Logs {
+        target: Option<String>,
+        #[arg(long = "tail", visible_alias = "lines", default_value_t = 80)]
+        tail: usize,
+        #[arg(short = 'f', long)]
+        follow: bool,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(short = 't', long)]
+        timestamps: bool,
+        #[arg(long, default_value = "agents.local.json")]
+        config: std::path::PathBuf,
+    },
+    /// Show events from the swarm event stream
+    Events(EventArgs),
+    /// Inspect an agent, session, process, or runtime object
+    Inspect {
+        target: String,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value = "agents.local.json")]
+        config: std::path::PathBuf,
+        #[arg(long)]
+        bus_url: Option<String>,
+    },
+    /// Show local process resource usage
+    Stats {
+        target: Option<String>,
+        #[arg(long, default_value = "agents.local.json")]
+        config: std::path::PathBuf,
+    },
+    /// Show the local process tree for an agent or service
+    Top {
+        target: String,
+        #[arg(long, default_value = "agents.local.json")]
+        config: std::path::PathBuf,
+    },
+    /// Show runtime, bus, registry, and topology information
+    Info {
+        #[arg(long, default_value = "agents.local.json")]
+        config: std::path::PathBuf,
+        #[arg(long)]
+        bus_url: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print CLI version information
+    Version {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop the running swarm, a single process, or legacy Python publishers
+    Stop {
+        target: Option<String>,
+        #[arg(long, default_value = "agents.local.json")]
+        config: std::path::PathBuf,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        legacy: bool,
+    },
+    /// Restart one agent managed by `agora run`
+    Restart {
+        agent: String,
+        #[arg(long, default_value = "agents.local.json")]
+        config: std::path::PathBuf,
+        #[arg(long)]
+        force: bool,
     },
     /// Show an agent manifest and optional session activity
     Status {
@@ -74,7 +174,7 @@ enum Cmd {
     /// Send a direct steering or queue message to an agent
     Message {
         agent: String,
-        #[arg(required = true, trailing_var_arg = true)]
+        #[arg(required = true, num_args = 1..)]
         message: Vec<String>,
         #[arg(long)]
         session_id: Option<String>,
@@ -97,6 +197,11 @@ enum Cmd {
         #[arg(long, default_value = ".kiro/session_token")]
         key_path: String,
     },
+    /// Inspect and clean the agent registry
+    Registry {
+        #[command(subcommand)]
+        command: RegistryCmd,
+    },
     /// Check that everything the swarm needs is in place
     Doctor {
         #[arg(long, default_value = "agents.local.json")]
@@ -106,8 +211,43 @@ enum Cmd {
     },
 }
 
+#[derive(Debug, Clone, Args)]
+struct EventArgs {
+    #[arg(long)]
+    session_id: Option<String>,
+    #[arg(long)]
+    agent: Option<String>,
+    #[arg(long)]
+    topic: Option<String>,
+    #[arg(short = 'f', long)]
+    follow: bool,
+    #[arg(long)]
+    json: bool,
+    #[arg(long, default_value = "nats://127.0.0.1:4222")]
+    bus_url: String,
+}
+
+#[derive(Subcommand)]
+enum RegistryCmd {
+    /// Prune stale or malformed registry entries outside the topology
+    Prune {
+        #[arg(long, default_value = "agents.local.json")]
+        config: std::path::PathBuf,
+        #[arg(long)]
+        bus_url: Option<String>,
+        /// Actually purge entries. Without this, the command is a dry run.
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum SessionCmd {
+    /// List sessions seen in the event stream
+    Ls {
+        #[arg(long, default_value = "nats://127.0.0.1:4222")]
+        bus_url: String,
+    },
     /// Create a named session without submitting work
     New {
         name: String,
@@ -125,9 +265,151 @@ enum SessionCmd {
         #[arg(long, default_value = ".kiro/session_token")]
         key_path: String,
     },
+    /// Inspect a session
+    Inspect {
+        session_id: String,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value = "nats://127.0.0.1:4222")]
+        bus_url: String,
+    },
+    /// Show all events in a session
+    History {
+        session_id: String,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value = "nats://127.0.0.1:4222")]
+        bus_url: String,
+    },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Subcommand)]
+enum AgentCmd {
+    /// List registered agents
+    Ls {
+        #[arg(long, default_value = "nats://127.0.0.1:4222")]
+        bus_url: String,
+    },
+    /// Inspect one agent
+    Inspect {
+        agent: String,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value = "agents.local.json")]
+        config: std::path::PathBuf,
+        #[arg(long)]
+        bus_url: Option<String>,
+    },
+    /// Show one agent's logs
+    Logs {
+        agent: String,
+        #[arg(long = "tail", visible_alias = "lines", default_value_t = 80)]
+        tail: usize,
+        #[arg(short = 'f', long)]
+        follow: bool,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(short = 't', long)]
+        timestamps: bool,
+        #[arg(long, default_value = "agents.local.json")]
+        config: std::path::PathBuf,
+    },
+    /// Show one agent's manifest and optional session activity
+    Status {
+        agent: String,
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long, default_value = "nats://127.0.0.1:4222")]
+        bus_url: String,
+    },
+    /// Show one agent's event and telemetry history in one session
+    History {
+        agent: String,
+        #[arg(long)]
+        session_id: String,
+        #[arg(long, default_value = "nats://127.0.0.1:4222")]
+        bus_url: String,
+    },
+    /// Show one agent's local resource usage
+    Stats {
+        agent: String,
+        #[arg(long, default_value = "agents.local.json")]
+        config: std::path::PathBuf,
+    },
+    /// Show one agent's local process tree
+    Top {
+        agent: String,
+        #[arg(long, default_value = "agents.local.json")]
+        config: std::path::PathBuf,
+    },
+    /// Restart one agent
+    Restart {
+        agent: String,
+        #[arg(long, default_value = "agents.local.json")]
+        config: std::path::PathBuf,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Stop one agent
+    Stop {
+        agent: String,
+        #[arg(long, default_value = "agents.local.json")]
+        config: std::path::PathBuf,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Send a direct steering or queue message
+    Message {
+        agent: String,
+        #[arg(required = true, num_args = 1..)]
+        message: Vec<String>,
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long, default_value = "steer")]
+        message_type: String,
+        #[arg(long, default_value = "nats://127.0.0.1:4222")]
+        bus_url: String,
+        #[arg(long, default_value = ".kiro/session_token")]
+        key_path: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SystemCmd {
+    /// Show runtime, bus, registry, and topology information
+    Info {
+        #[arg(long, default_value = "agents.local.json")]
+        config: std::path::PathBuf,
+        #[arg(long)]
+        bus_url: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show events from the swarm event stream
+    Events(EventArgs),
+    /// Show local supervisor, service, and agent process status
+    Ps {
+        #[arg(long, default_value = "agents.local.json")]
+        config: std::path::PathBuf,
+    },
+    /// Show local process resource usage
+    Stats {
+        target: Option<String>,
+        #[arg(long, default_value = "agents.local.json")]
+        config: std::path::PathBuf,
+    },
+    /// Prune stale or malformed registry entries outside the topology
+    Prune {
+        #[arg(long, default_value = "agents.local.json")]
+        config: std::path::PathBuf,
+        #[arg(long)]
+        bus_url: Option<String>,
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct SessionSummary {
     session_id: String,
     name: Option<String>,
@@ -167,6 +449,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Cmd::Run { config } => run_swarm(config).await,
+        Cmd::Console(args) => agora_console::run(args).await,
         Cmd::Submit {
             idea,
             session_id,
@@ -175,6 +458,7 @@ async fn main() -> Result<()> {
         } => submit_idea(&idea, session_id.as_deref(), &bus_url, &key_path).await,
         Cmd::Sessions { bus_url } => list_sessions(&bus_url).await,
         Cmd::Session { command } => match command {
+            SessionCmd::Ls { bus_url } => list_sessions(&bus_url).await,
             SessionCmd::New {
                 name,
                 bus_url,
@@ -186,8 +470,191 @@ async fn main() -> Result<()> {
                 bus_url,
                 key_path,
             } => rename_session(&session_id, &name, &bus_url, &key_path).await,
+            SessionCmd::Inspect {
+                session_id,
+                json,
+                bus_url,
+            } => inspect_session(&session_id, &bus_url, json).await,
+            SessionCmd::History {
+                session_id,
+                json,
+                bus_url,
+            } => show_session_history(&session_id, &bus_url, json).await,
+        },
+        Cmd::Agent { command } => match command {
+            AgentCmd::Ls { bus_url } => list_agents(&bus_url).await,
+            AgentCmd::Inspect {
+                agent,
+                json,
+                config,
+                bus_url,
+            } => inspect_target(&agent, &config, bus_url.as_deref(), json).await,
+            AgentCmd::Logs {
+                agent,
+                tail,
+                follow,
+                since,
+                timestamps,
+                config,
+            } => {
+                let cfg = TopologyConfig::load(config)?;
+                print_logs(
+                    &cfg,
+                    Some(&agent),
+                    &LogOptions {
+                        tail,
+                        follow,
+                        since,
+                        timestamps,
+                    },
+                )
+            }
+            AgentCmd::Status {
+                agent,
+                session_id,
+                bus_url,
+            } => show_status(&agent, session_id.as_deref(), &bus_url).await,
+            AgentCmd::History {
+                agent,
+                session_id,
+                bus_url,
+            } => show_history(&agent, &session_id, &bus_url).await,
+            AgentCmd::Stats { agent, config } => {
+                let cfg = TopologyConfig::load(config)?;
+                print_process_stats(&cfg, Some(&agent))
+            }
+            AgentCmd::Top { agent, config } => {
+                let cfg = TopologyConfig::load(config)?;
+                print_process_top(&cfg, &agent)
+            }
+            AgentCmd::Restart {
+                agent,
+                config,
+                force,
+            } => {
+                let cfg = TopologyConfig::load(config)?;
+                restart_agent(&cfg, &agent, force)
+            }
+            AgentCmd::Stop {
+                agent,
+                config,
+                force,
+            } => {
+                let cfg = TopologyConfig::load(config)?;
+                stop_runtime(&cfg, Some(&agent), force)
+            }
+            AgentCmd::Message {
+                agent,
+                message,
+                session_id,
+                message_type,
+                bus_url,
+                key_path,
+            } => {
+                send_message(
+                    &agent,
+                    &message.join(" "),
+                    session_id.as_deref(),
+                    &message_type,
+                    &bus_url,
+                    &key_path,
+                )
+                .await
+            }
         },
         Cmd::Agents { bus_url } => list_agents(&bus_url).await,
+        Cmd::System { command } => match command {
+            SystemCmd::Info {
+                config,
+                bus_url,
+                json,
+            } => show_info(&config, bus_url.as_deref(), json).await,
+            SystemCmd::Events(args) => show_events(&args).await,
+            SystemCmd::Ps { config } => {
+                let cfg = TopologyConfig::load(config)?;
+                print_process_table(&cfg);
+                Ok(())
+            }
+            SystemCmd::Stats { target, config } => {
+                let cfg = TopologyConfig::load(config)?;
+                print_process_stats(&cfg, target.as_deref())
+            }
+            SystemCmd::Prune {
+                config,
+                bus_url,
+                apply,
+            } => prune_registry(&config, bus_url.as_deref(), apply).await,
+        },
+        Cmd::Ps { config } => {
+            let cfg = TopologyConfig::load(config)?;
+            print_process_table(&cfg);
+            Ok(())
+        }
+        Cmd::Logs {
+            target,
+            tail,
+            follow,
+            since,
+            timestamps,
+            config,
+        } => {
+            let cfg = TopologyConfig::load(config)?;
+            print_logs(
+                &cfg,
+                target.as_deref(),
+                &LogOptions {
+                    tail,
+                    follow,
+                    since,
+                    timestamps,
+                },
+            )
+        }
+        Cmd::Events(args) => show_events(&args).await,
+        Cmd::Inspect {
+            target,
+            json,
+            config,
+            bus_url,
+        } => inspect_target(&target, &config, bus_url.as_deref(), json).await,
+        Cmd::Stats { target, config } => {
+            let cfg = TopologyConfig::load(config)?;
+            print_process_stats(&cfg, target.as_deref())
+        }
+        Cmd::Top { target, config } => {
+            let cfg = TopologyConfig::load(config)?;
+            print_process_top(&cfg, &target)
+        }
+        Cmd::Info {
+            config,
+            bus_url,
+            json,
+        } => show_info(&config, bus_url.as_deref(), json).await,
+        Cmd::Version { json } => {
+            print_version(json)?;
+            Ok(())
+        }
+        Cmd::Stop {
+            target,
+            config,
+            force,
+            legacy,
+        } => {
+            if legacy {
+                stop_legacy_swarm_processes(force)
+            } else {
+                let cfg = TopologyConfig::load(config)?;
+                stop_runtime(&cfg, target.as_deref(), force)
+            }
+        }
+        Cmd::Restart {
+            agent,
+            config,
+            force,
+        } => {
+            let cfg = TopologyConfig::load(config)?;
+            restart_agent(&cfg, &agent, force)
+        }
         Cmd::Status {
             agent,
             session_id,
@@ -221,6 +688,13 @@ async fn main() -> Result<()> {
             bus_url,
         } => replay(&session_id, &bus_url).await,
         Cmd::Bootstrap { key_path } => bootstrap(&key_path),
+        Cmd::Registry { command } => match command {
+            RegistryCmd::Prune {
+                config,
+                bus_url,
+                apply,
+            } => prune_registry(&config, bus_url.as_deref(), apply).await,
+        },
         Cmd::Doctor { config, key_path } => doctor(&config, &key_path).await,
     }
 }
@@ -310,6 +784,26 @@ async fn doctor(config_path: &std::path::Path, key_path: &str) -> Result<()> {
         ok("kiro-cli", "not required (topology uses mock ACP)");
     }
 
+    let legacy_publishers = legacy_swarm_processes();
+    if !legacy_publishers.is_empty() {
+        warn(
+            "legacy publishers",
+            &format!(
+                "{} old Python swarm process{} detected; these can repopulate stale registry keys",
+                legacy_publishers.len(),
+                if legacy_publishers.len() == 1 {
+                    ""
+                } else {
+                    "es"
+                }
+            ),
+        );
+        for process in legacy_publishers.iter().take(4) {
+            println!("      {} {}", process.pid, process.command);
+        }
+        warnings += 1;
+    }
+
     // 4. Signing key exists + non-empty
     let key_p = std::path::Path::new(key_path);
     match std::fs::metadata(key_p) {
@@ -338,11 +832,27 @@ async fn doctor(config_path: &std::path::Path, key_path: &str) -> Result<()> {
 
     // 5. NATS reachable + JetStream stream healthy
     if let Some(topology) = &topology {
+        let processes = expected_processes(topology);
+        let supervisor = processes.iter().find(|process| process.name == "agora");
+        match supervisor.map(|process| status_for(process.clone())) {
+            Some(status) if status.state == ProcessState::Running => ok(
+                "agora supervisor",
+                &format!("running as pid {}", status.pid.unwrap_or_default()),
+            ),
+            _ => {
+                warn(
+                    "agora supervisor",
+                    "not running. Use `agora run agents.local.json` to own the swarm lifecycle",
+                );
+                warnings += 1;
+            }
+        }
+
         let bus_url = &topology.bus_url;
         match Bus::connect(bus_url).await {
             Ok(bus) => {
                 ok("NATS bus", &format!("reachable at {bus_url}"));
-                match bus.js.get_stream(swarm_core::topics::EVENT_STREAM).await {
+                match bus.js.get_stream(agora_core::topics::EVENT_STREAM).await {
                     Ok(stream) => {
                         let info = stream.cached_info();
                         ok(
@@ -362,6 +872,44 @@ async fn doctor(config_path: &std::path::Path, key_path: &str) -> Result<()> {
                                 "could not load stream info: {e}. Will be recreated next startup"
                             ),
                         );
+                        warnings += 1;
+                    }
+                }
+
+                match bus.read_agent_registry_records().await {
+                    Ok(records) => {
+                        let current = current_registry_count(&records, topology);
+                        let stale = registry_prune_candidates(&records, topology);
+                        let unhealthy = unhealthy_registry_count(&records, topology);
+                        let missing = topology.agents.len().saturating_sub(current);
+                        if missing == 0 && stale.is_empty() && unhealthy == 0 {
+                            ok(
+                                "agent registry",
+                                &format!(
+                                    "{current}/{} topology agents registered; no stale entries",
+                                    topology.agents.len()
+                                ),
+                            );
+                        } else {
+                            warn(
+                                "agent registry",
+                                &format!(
+                                    "{current}/{} topology agents registered; {missing} missing; {unhealthy} stale/down; {} stale/malformed entr{}",
+                                    topology.agents.len(),
+                                    stale.len(),
+                                    if stale.len() == 1 { "y" } else { "ies" }
+                                ),
+                            );
+                            if !stale.is_empty() {
+                                println!(
+                                    "      run `agora registry prune --apply` after stopping stale publishers"
+                                );
+                            }
+                            warnings += 1;
+                        }
+                    }
+                    Err(e) => {
+                        warn("agent registry", &format!("could not read registry: {e}"));
                         warnings += 1;
                     }
                 }
@@ -397,6 +945,175 @@ async fn doctor(config_path: &std::path::Path, key_path: &str) -> Result<()> {
     }
 }
 
+#[derive(Debug, Clone)]
+struct RegistryPruneCandidate {
+    key: String,
+    agent_name: Option<String>,
+    reason: String,
+}
+
+async fn prune_registry(
+    config_path: &std::path::Path,
+    bus_url: Option<&str>,
+    apply: bool,
+) -> Result<()> {
+    let topology = TopologyConfig::load(config_path)?;
+    let bus_url = bus_url.unwrap_or(&topology.bus_url);
+    let bus = Bus::connect(bus_url).await?;
+    let records = bus.read_agent_registry_records().await?;
+    let candidates = registry_prune_candidates(&records, &topology);
+    let current = current_registry_count(&records, &topology);
+
+    println!(
+        "Registry at {bus_url}: {} entr{}",
+        records.len(),
+        if records.len() == 1 { "y" } else { "ies" }
+    );
+    println!(
+        "Topology {}: {current}/{} current agents registered",
+        topology.name,
+        topology.agents.len()
+    );
+
+    if candidates.is_empty() {
+        println!("No stale or malformed registry entries found.");
+        return Ok(());
+    }
+
+    println!();
+    println!(
+        "{} prune candidate{}:",
+        candidates.len(),
+        if candidates.len() == 1 { "" } else { "s" }
+    );
+    for candidate in &candidates {
+        match &candidate.agent_name {
+            Some(agent) => println!(
+                "  {:<36} agent={:<30} {}",
+                candidate.key, agent, candidate.reason
+            ),
+            None => println!("  {:<36} {}", candidate.key, candidate.reason),
+        }
+    }
+
+    if !apply {
+        println!();
+        println!("Dry run only. Re-run with `--apply` to purge these registry keys.");
+        return Ok(());
+    }
+
+    println!();
+    for candidate in candidates {
+        bus.purge_agent_registry_key(&candidate.key).await?;
+        println!("purged {}", candidate.key);
+    }
+
+    let records = bus.read_agent_registry_records().await?;
+    let remaining = registry_prune_candidates(&records, &topology);
+    if remaining.is_empty() {
+        println!("Registry is clean.");
+    } else {
+        println!();
+        println!(
+            "{} prune candidate{} remain after purge.",
+            remaining.len(),
+            if remaining.len() == 1 { "" } else { "s" }
+        );
+        println!("If they reappear immediately, stop the process that is republishing them and rerun this command.");
+    }
+
+    Ok(())
+}
+
+fn current_registry_count(records: &[AgentRegistryRecord], topology: &TopologyConfig) -> usize {
+    let expected = topology_agent_names(topology);
+    records
+        .iter()
+        .filter(|record| {
+            record.manifest.as_ref().is_some_and(|manifest| {
+                expected.contains(manifest.agent_name.as_str())
+                    && record.key.as_str() == manifest.agent_name.as_str()
+            })
+        })
+        .count()
+}
+
+fn unhealthy_registry_count(records: &[AgentRegistryRecord], topology: &TopologyConfig) -> usize {
+    let expected = topology_agent_names(topology);
+    records
+        .iter()
+        .filter_map(|record| {
+            record.manifest.as_ref().filter(|manifest| {
+                expected.contains(manifest.agent_name.as_str())
+                    && record.key.as_str() == manifest.agent_name.as_str()
+            })
+        })
+        .filter(|manifest| {
+            matches!(
+                manifest.observed_status(),
+                AgentStatus::Stale | AgentStatus::Down
+            )
+        })
+        .count()
+}
+
+fn registry_prune_candidates(
+    records: &[AgentRegistryRecord],
+    topology: &TopologyConfig,
+) -> Vec<RegistryPruneCandidate> {
+    let expected = topology_agent_names(topology);
+    let mut candidates = Vec::new();
+
+    for record in records {
+        match &record.manifest {
+            Some(manifest)
+                if expected.contains(manifest.agent_name.as_str())
+                    && record.key.as_str() == manifest.agent_name.as_str() =>
+            {
+                continue;
+            }
+            Some(manifest) => {
+                let reason = if expected.contains(manifest.agent_name.as_str()) {
+                    format!(
+                        "key does not match manifest agent `{}`",
+                        manifest.agent_name
+                    )
+                } else {
+                    format!("agent is not in topology `{}`", topology.name)
+                };
+                candidates.push(RegistryPruneCandidate {
+                    key: record.key.clone(),
+                    agent_name: Some(manifest.agent_name.clone()),
+                    reason,
+                });
+            }
+            None => {
+                let reason = record
+                    .error
+                    .as_deref()
+                    .map(|e| format!("malformed registry entry: {e}"))
+                    .unwrap_or_else(|| "empty registry entry".to_string());
+                candidates.push(RegistryPruneCandidate {
+                    key: record.key.clone(),
+                    agent_name: None,
+                    reason,
+                });
+            }
+        }
+    }
+
+    candidates.sort_by(|a, b| a.key.cmp(&b.key));
+    candidates
+}
+
+fn topology_agent_names(topology: &TopologyConfig) -> BTreeSet<&str> {
+    topology
+        .agents
+        .iter()
+        .map(|agent| agent.name.as_str())
+        .collect()
+}
+
 async fn run_swarm(config_path: std::path::PathBuf) -> Result<()> {
     let cfg = TopologyConfig::load(&config_path)?;
     info!(name = %cfg.name, agents = cfg.agents.len(), "starting swarm");
@@ -404,6 +1121,8 @@ async fn run_swarm(config_path: std::path::PathBuf) -> Result<()> {
     std::fs::create_dir_all(&cfg.log_dir)?;
     std::fs::create_dir_all(&cfg.pid_dir)?;
     ensure_signing_key(&default_key_path())?;
+    let supervisor_pid = std::path::Path::new(&cfg.pid_dir).join("agora.pid");
+    let _pid_guard = PidFileGuard::write(supervisor_pid)?;
 
     let shutdown = CancellationToken::new();
     let mut sup = Supervisor::new(shutdown.clone());
@@ -420,9 +1139,41 @@ async fn run_swarm(config_path: std::path::PathBuf) -> Result<()> {
         sd.cancel();
     });
 
+    #[cfg(unix)]
+    {
+        let sd = shutdown.clone();
+        tokio::spawn(async move {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut sigterm) => {
+                    sigterm.recv().await;
+                    info!("SIGTERM received — shutting down");
+                    sd.cancel();
+                }
+                Err(e) => warn!("Failed to install SIGTERM handler: {e}"),
+            }
+        });
+    }
+
     info!("Swarm running. Press Ctrl-C to stop.");
     sup.wait_for_shutdown().await;
     Ok(())
+}
+
+struct PidFileGuard {
+    path: std::path::PathBuf,
+}
+
+impl PidFileGuard {
+    fn write(path: std::path::PathBuf) -> Result<Self> {
+        write_pid(&path, std::process::id())?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for PidFileGuard {
+    fn drop(&mut self) {
+        std::fs::remove_file(&self.path).ok();
+    }
 }
 
 async fn submit_idea(
@@ -556,7 +1307,7 @@ async fn list_agents(bus_url: &str) -> Result<()> {
         println!(
             "{:<30} {:<10} {:>5}  {:<22} {}",
             agent.agent_name,
-            format!("{:?}", agent.status).to_lowercase(),
+            format!("{:?}", agent.observed_status()).to_lowercase(),
             agent.port,
             agent.last_seen,
             agent.capabilities.join(",")
@@ -793,6 +1544,406 @@ async fn replay(session_id: &Option<String>, bus_url: &str) -> Result<()> {
     Ok(())
 }
 
+async fn show_events(args: &EventArgs) -> Result<()> {
+    let bus = Bus::connect(&args.bus_url).await?;
+    let events = bus.read_all_events().await?;
+
+    for event in events.iter().filter(|event| event_matches(event, args)) {
+        print_event(event, args.json)?;
+    }
+
+    if args.follow {
+        follow_events(&bus, args.clone()).await?;
+    }
+
+    Ok(())
+}
+
+async fn follow_events(bus: &Bus, args: EventArgs) -> Result<()> {
+    let (tx, mut rx) = mpsc::channel::<Envelope>(256);
+
+    for subject in EVENT_STREAM_SUBJECTS {
+        let mut sub = bus
+            .client
+            .subscribe((*subject).to_string())
+            .await
+            .with_context(|| format!("subscribe {subject}"))?;
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = sub.next().await {
+                if let Ok(env) = Envelope::from_bytes(&msg.payload) {
+                    if tx.send(env).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+    }
+    drop(tx);
+
+    while let Some(event) = rx.recv().await {
+        if event_matches(&event, &args) {
+            print_event(&event, args.json)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn event_matches(event: &Envelope, args: &EventArgs) -> bool {
+    if args
+        .session_id
+        .as_deref()
+        .is_some_and(|session_id| event.context.session_id != session_id)
+    {
+        return false;
+    }
+    if args
+        .agent
+        .as_deref()
+        .is_some_and(|agent| event.sender.agent_name != agent)
+    {
+        return false;
+    }
+    if let Some(topic) = args.topic.as_deref() {
+        if topic.contains('*') || topic.contains('>') {
+            return topic_matches(topic, &event.topic);
+        }
+        return event.topic == topic;
+    }
+    true
+}
+
+fn print_event(event: &Envelope, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(event)?);
+        return Ok(());
+    }
+
+    println!(
+        "[{}] {} | {} | {} | session={}",
+        event.timestamp,
+        event.event_id,
+        event.topic,
+        event.sender.agent_name,
+        event.context.session_id
+    );
+    if !event.data.is_null() {
+        println!("  data: {}", serde_json::to_string(&event.data)?);
+    }
+    Ok(())
+}
+
+async fn inspect_target(
+    target: &str,
+    config_path: &Path,
+    bus_url: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let cfg = TopologyConfig::load(config_path)?;
+    let bus_url = bus_url.unwrap_or(&cfg.bus_url);
+
+    if matches!(target, "runtime" | "system" | "topology") {
+        return show_info(config_path, Some(bus_url), json).await;
+    }
+
+    if cfg.agents.iter().any(|agent| agent.name == target) {
+        return inspect_agent(target, &cfg, bus_url, json).await;
+    }
+
+    if process_for_target(&cfg, target).is_ok() {
+        return inspect_process(target, &cfg, json);
+    }
+
+    if target.starts_with("sess_") {
+        return inspect_session(target, bus_url, json).await;
+    }
+
+    if let Ok(bus) = Bus::connect(bus_url).await {
+        let sessions = load_sessions(&bus).await?;
+        if let Some((session_id, _)) = sessions
+            .iter()
+            .find(|(_, session)| session.name.as_deref() == Some(target))
+        {
+            return inspect_session(session_id, bus_url, json).await;
+        }
+    }
+
+    bail!("unknown inspect target `{target}`")
+}
+
+async fn inspect_agent(
+    agent_name: &str,
+    cfg: &TopologyConfig,
+    bus_url: &str,
+    json: bool,
+) -> Result<()> {
+    let spec = cfg.agents.iter().find(|agent| agent.name == agent_name);
+    let process = process_for_target(cfg, agent_name)
+        .ok()
+        .map(status_for)
+        .map(|status| process_status_json(&status));
+    let log_file = log_path_for_target(cfg, agent_name).map(|path| path.display().to_string());
+
+    let (manifest, bus_error) = match Bus::connect(bus_url).await {
+        Ok(bus) => {
+            let manifests = bus.read_agent_registry().await?;
+            (
+                manifests
+                    .into_iter()
+                    .find(|manifest| manifest.agent_name == agent_name),
+                None,
+            )
+        }
+        Err(e) => (None, Some(e.to_string())),
+    };
+
+    if json {
+        let value = serde_json::json!({
+            "kind": "agent",
+            "name": agent_name,
+            "topology": spec,
+            "manifest": manifest,
+            "process": process,
+            "logFile": log_file,
+            "busUrl": bus_url,
+            "busError": bus_error,
+        });
+        print_json(&value)?;
+        return Ok(());
+    }
+
+    print_agent_manifest(agent_name, manifest.as_ref());
+    if let Some(process) = process {
+        println!();
+        print_process_json_human(&process);
+    }
+    if let Some(log_file) = log_file {
+        println!("  log:           {log_file}");
+    }
+    if let Some(error) = bus_error {
+        println!("  bus:           unavailable ({error})");
+    }
+    Ok(())
+}
+
+fn inspect_process(target: &str, cfg: &TopologyConfig, json: bool) -> Result<()> {
+    let status = status_for(process_for_target(cfg, target)?);
+    let value = process_status_json(&status);
+    if json {
+        print_json(&value)
+    } else {
+        print_process_json_human(&value);
+        Ok(())
+    }
+}
+
+async fn inspect_session(session_id: &str, bus_url: &str, json: bool) -> Result<()> {
+    let bus = Bus::connect(bus_url).await?;
+    let events = bus.read_all_events().await?;
+    let sessions = build_sessions(&events);
+    let Some(summary) = sessions.get(session_id) else {
+        bail!("session `{session_id}` not found");
+    };
+    let session_events: Vec<_> = events
+        .iter()
+        .filter(|event| event.context.session_id == session_id)
+        .collect();
+
+    if json {
+        let value = serde_json::json!({
+            "kind": "session",
+            "summary": summary,
+            "events": session_events,
+        });
+        print_json(&value)?;
+        return Ok(());
+    }
+
+    print_session_summary(summary);
+    println!();
+    println!("Recent events:");
+    for event in session_events.iter().rev().take(10).rev() {
+        println!(
+            "  {}  {:<32} {:<22} {}",
+            time_only(&event.timestamp),
+            event.topic,
+            event.sender.agent_name,
+            short(&event.event_id, 18)
+        );
+    }
+    Ok(())
+}
+
+async fn show_session_history(session_id: &str, bus_url: &str, json: bool) -> Result<()> {
+    let bus = Bus::connect(bus_url).await?;
+    let events = bus.read_all_events().await?;
+    let session_events: Vec<_> = events
+        .iter()
+        .filter(|event| event.context.session_id == session_id)
+        .collect();
+
+    if json {
+        print_json(&serde_json::json!({
+            "kind": "sessionHistory",
+            "sessionId": session_id,
+            "events": session_events,
+        }))?;
+        return Ok(());
+    }
+
+    if session_events.is_empty() {
+        println!("No events found for session {session_id}.");
+        return Ok(());
+    }
+
+    println!("Session {session_id}");
+    println!("{:<10} {:<34} {:<24} EVENT", "TIME", "TOPIC", "SENDER");
+    for event in session_events {
+        println!(
+            "{:<10} {:<34} {:<24} {}",
+            time_only(&event.timestamp),
+            event.topic,
+            event.sender.agent_name,
+            short(&event.event_id, 18)
+        );
+    }
+    Ok(())
+}
+
+async fn show_info(config_path: &Path, bus_url: Option<&str>, json: bool) -> Result<()> {
+    let cfg = TopologyConfig::load(config_path)?;
+    let bus_url = bus_url.unwrap_or(&cfg.bus_url);
+    let statuses = runtime_statuses(&cfg);
+    let running = statuses
+        .iter()
+        .filter(|status| status.state == ProcessState::Running)
+        .count();
+    let stale_pid = statuses
+        .iter()
+        .filter(|status| status.state == ProcessState::StalePid)
+        .count();
+
+    let mut bus_state = serde_json::json!({
+        "url": bus_url,
+        "reachable": false,
+    });
+    let mut registry_state = serde_json::json!(null);
+    let mut stream_state = serde_json::json!(null);
+    let mut session_count = None;
+
+    if let Ok(bus) = Bus::connect(bus_url).await {
+        bus_state["reachable"] = serde_json::json!(true);
+        if let Ok(stream) = bus.js.get_stream(EVENT_STREAM).await {
+            let info = stream.cached_info();
+            stream_state = serde_json::json!({
+                "name": info.config.name,
+                "subjects": info.config.subjects,
+                "messages": info.state.messages,
+                "bytes": info.state.bytes,
+            });
+        }
+        if let Ok(records) = bus.read_agent_registry_records().await {
+            registry_state = serde_json::json!({
+                "entries": records.len(),
+                "current": current_registry_count(&records, &cfg),
+                "unhealthy": unhealthy_registry_count(&records, &cfg),
+                "pruneCandidates": registry_prune_candidates(&records, &cfg).len(),
+            });
+        }
+        if let Ok(sessions) = load_sessions(&bus).await {
+            session_count = Some(sessions.len());
+        }
+    }
+
+    let value = serde_json::json!({
+        "name": "agora",
+        "version": env!("CARGO_PKG_VERSION"),
+        "topology": {
+            "name": &cfg.name,
+            "config": config_path.display().to_string(),
+            "busUrl": &cfg.bus_url,
+            "pidDir": &cfg.pid_dir,
+            "logDir": &cfg.log_dir,
+            "agents": cfg.agents.len(),
+            "defaultAcp": &cfg.default_acp,
+        },
+        "bus": bus_state,
+        "stream": stream_state,
+        "registry": registry_state,
+        "sessions": session_count,
+        "processes": {
+            "total": statuses.len(),
+            "running": running,
+            "stalePid": stale_pid,
+            "stopped": statuses.len().saturating_sub(running + stale_pid),
+        },
+    });
+
+    if json {
+        print_json(&value)?;
+        return Ok(());
+    }
+
+    println!("agora {}", env!("CARGO_PKG_VERSION"));
+    println!("topology:  {} ({})", cfg.name, config_path.display());
+    println!("bus:       {bus_url}");
+    println!("pid dir:   {}", cfg.pid_dir);
+    println!("log dir:   {}", cfg.log_dir);
+    println!(
+        "agents:    {} configured, default ACP {}",
+        cfg.agents.len(),
+        cfg.default_acp
+    );
+    println!(
+        "processes: {running}/{} running, {stale_pid} stale pid",
+        statuses.len()
+    );
+    println!(
+        "nats:      {}",
+        if value["bus"]["reachable"].as_bool().unwrap_or(false) {
+            "reachable"
+        } else {
+            "unreachable"
+        }
+    );
+    if let Some(messages) = value["stream"]["messages"].as_u64() {
+        println!("stream:    {EVENT_STREAM} ({messages} messages)");
+    }
+    if let Some(entries) = value["registry"]["entries"].as_u64() {
+        println!(
+            "registry:  {entries} entries, {} current, {} unhealthy, {} prune candidates",
+            value["registry"]["current"].as_u64().unwrap_or(0),
+            value["registry"]["unhealthy"].as_u64().unwrap_or(0),
+            value["registry"]["pruneCandidates"].as_u64().unwrap_or(0)
+        );
+    }
+    if let Some(sessions) = session_count {
+        println!("sessions:  {sessions}");
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VersionInfo {
+    name: &'static str,
+    version: &'static str,
+}
+
+fn print_version(json: bool) -> Result<()> {
+    let info = VersionInfo {
+        name: "agora",
+        version: env!("CARGO_PKG_VERSION"),
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&info)?);
+    } else {
+        println!("agora {}", env!("CARGO_PKG_VERSION"));
+    }
+    Ok(())
+}
+
 async fn load_sessions(bus: &Bus) -> Result<BTreeMap<String, SessionSummary>> {
     let events = bus.read_all_events().await?;
     Ok(build_sessions(&events))
@@ -864,12 +2015,92 @@ fn print_agent_manifest(agent_name: &str, manifest: Option<&AgentManifest>) {
     };
 
     println!("  status:        {:?}", manifest.status);
+    let observed = manifest.observed_status();
+    if observed != manifest.status {
+        println!("  observed:      {:?}", observed);
+    }
     println!("  port:          {}", manifest.port);
     println!("  endpoint:      {}", manifest.endpoint);
     println!("  last seen:     {}", manifest.last_seen);
     println!("  capabilities:  {}", manifest.capabilities.join(", "));
     println!("  subscribes:    {}", manifest.subscribes_to.join(", "));
     println!("  publishes:     {}", manifest.publishes.join(", "));
+}
+
+fn process_status_json(status: &RuntimeProcessStatus) -> serde_json::Value {
+    let metrics = status.pid.and_then(process_metrics);
+    serde_json::json!({
+        "kind": status.process.kind,
+        "name": &status.process.name,
+        "state": status.state.as_str(),
+        "pid": status.pid,
+        "age": status.elapsed.as_deref(),
+        "command": status.command.as_deref(),
+        "pidFile": status.process.pid_file.display().to_string(),
+        "logFile": status.process.log_file.as_ref().map(|path| path.display().to_string()),
+        "metrics": {
+            "cpuPercent": metrics.as_ref().and_then(|metric| metric.cpu_percent.clone()),
+            "memPercent": metrics.as_ref().and_then(|metric| metric.mem_percent.clone()),
+            "rssKb": metrics.as_ref().and_then(|metric| metric.rss_kb),
+        }
+    })
+}
+
+fn print_process_json_human(value: &serde_json::Value) {
+    println!("{}", value["name"].as_str().unwrap_or("process"));
+    println!("  kind:          {}", value["kind"].as_str().unwrap_or("-"));
+    println!(
+        "  state:         {}",
+        value["state"].as_str().unwrap_or("-")
+    );
+    println!(
+        "  pid:           {}",
+        value["pid"]
+            .as_u64()
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    );
+    println!("  age:           {}", value["age"].as_str().unwrap_or("-"));
+    println!(
+        "  cpu/mem:       {}/{}",
+        value["metrics"]["cpuPercent"].as_str().unwrap_or("-"),
+        value["metrics"]["memPercent"].as_str().unwrap_or("-")
+    );
+    println!(
+        "  pid file:      {}",
+        value["pidFile"].as_str().unwrap_or("-")
+    );
+    println!(
+        "  log file:      {}",
+        value["logFile"].as_str().unwrap_or("-")
+    );
+    println!(
+        "  command:       {}",
+        value["command"].as_str().unwrap_or("-")
+    );
+}
+
+fn print_session_summary(summary: &SessionSummary) {
+    println!("{}", summary.session_id);
+    println!(
+        "  name:          {}",
+        summary.name.as_deref().unwrap_or("-")
+    );
+    println!("  started:       {}", summary.started_at);
+    println!("  events:        {}", summary.event_count);
+    println!(
+        "  last topic:    {}",
+        if summary.last_topic.is_empty() {
+            "-"
+        } else {
+            &summary.last_topic
+        }
+    );
+}
+
+fn print_json(value: &serde_json::Value) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
 }
 
 fn print_indented_json(value: &serde_json::Value, indent: &str) -> Result<()> {

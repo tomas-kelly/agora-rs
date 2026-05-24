@@ -11,6 +11,13 @@ use crate::{
     topics::{consumer_name, EVENT_STREAM, EVENT_STREAM_SUBJECTS, KV_AGENT_REGISTRY},
 };
 
+#[derive(Debug, Clone)]
+pub struct AgentRegistryRecord {
+    pub key: String,
+    pub manifest: Option<AgentManifest>,
+    pub error: Option<String>,
+}
+
 pub struct Bus {
     pub client: async_nats::Client,
     pub js: jetstream::Context,
@@ -114,6 +121,12 @@ impl Bus {
                     durable_name: Some(name.clone()),
                     filter_subject: topic.to_string(),
                     ack_policy: jetstream::consumer::AckPolicy::Explicit,
+                    // Start at "new" so first-time agents don't replay the
+                    // entire backlog. Durable consumers persist their ack
+                    // position across restarts, so this only affects the
+                    // initial creation — once acked, the consumer resumes
+                    // from its stored position regardless of this setting.
+                    deliver_policy: jetstream::consumer::DeliverPolicy::New,
                     max_deliver: 5,
                     ack_wait: Duration::from_secs(30),
                     ..Default::default()
@@ -237,12 +250,21 @@ impl Bus {
     }
 
     pub async fn read_agent_registry(&self) -> Result<Vec<AgentManifest>> {
+        Ok(self
+            .read_agent_registry_records()
+            .await?
+            .into_iter()
+            .filter_map(|record| record.manifest)
+            .collect())
+    }
+
+    pub async fn read_agent_registry_records(&self) -> Result<Vec<AgentRegistryRecord>> {
         let kv = self.get_or_create_kv().await?;
         let mut keys = kv
             .keys()
             .await
             .context("Failed to list agent registry keys")?;
-        let mut manifests = Vec::new();
+        let mut records = Vec::new();
 
         while let Some(result) = keys.next().await {
             let key = match result {
@@ -255,14 +277,39 @@ impl Bus {
 
             match kv.get(key.clone()).await {
                 Ok(Some(bytes)) => match serde_json::from_slice::<AgentManifest>(&bytes) {
-                    Ok(manifest) => manifests.push(manifest),
-                    Err(e) => debug!(key = %key, "Ignoring malformed agent registry entry: {e}"),
+                    Ok(manifest) => records.push(AgentRegistryRecord {
+                        key,
+                        manifest: Some(manifest),
+                        error: None,
+                    }),
+                    Err(e) => {
+                        debug!(key = %key, "Ignoring malformed agent registry entry: {e}");
+                        records.push(AgentRegistryRecord {
+                            key,
+                            manifest: None,
+                            error: Some(e.to_string()),
+                        });
+                    }
                 },
                 Ok(None) => {}
-                Err(e) => warn!(key = %key, "Failed to read agent registry entry: {e}"),
+                Err(e) => {
+                    warn!(key = %key, "Failed to read agent registry entry: {e}");
+                    records.push(AgentRegistryRecord {
+                        key,
+                        manifest: None,
+                        error: Some(e.to_string()),
+                    });
+                }
             }
         }
 
-        Ok(manifests)
+        Ok(records)
+    }
+
+    pub async fn purge_agent_registry_key(&self, key: &str) -> Result<()> {
+        let kv = self.get_or_create_kv().await?;
+        kv.purge(key)
+            .await
+            .with_context(|| format!("Failed to purge agent registry key {key}"))
     }
 }

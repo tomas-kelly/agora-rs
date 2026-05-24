@@ -15,7 +15,7 @@ NATS JetStream, with Kiro CLI providing the LLM reasoning for each agent.
 
 #### Runtime
 
-- Workspace of five crates: `swarm-core` (shared envelope/bus/daemon/ACP),
+- Workspace of five crates: `agora-core` (shared envelope/bus/daemon/ACP),
   `agora` (supervisor + CLI), `agora-agent` (generic config-driven agent
   process), `agora-console` (ratatui TUI), `daemon-telemetry` (JSONL log
   appender).
@@ -25,7 +25,7 @@ NATS JetStream, with Kiro CLI providing the LLM reasoning for each agent.
 - Generic `DaemonRunner<A: Agent>` runtime: one durable consumer per
   declared subscription, fan-in via `mpsc`, single sequential processing
   loop, `Publisher` handle for emitting child events, 5-second heartbeats
-  to the `SWARM_AGENT_REGISTRY` KV bucket.
+  to the `AGORA_AGENT_REGISTRY` KV bucket.
 - Two ACP backends: `MockAcpClient` for local testing and `KiroAcpClient`
   (JSON-RPC 2.0 over stdio) for real LLM-driven workflows.
 - HS256 JWT actor tokens with hierarchical scope matching, signed with a

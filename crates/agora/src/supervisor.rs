@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::config::{NatsConfig, TelemetryConfig, TopologyConfig};
-use swarm_core::{bus::Bus, command::split_command_line};
+use agora_core::{bus::Bus, command::split_command_line};
 
 const MAX_RESTARTS: u32 = 3;
 

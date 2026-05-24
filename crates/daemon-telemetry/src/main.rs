@@ -1,11 +1,11 @@
 //! Telemetry log appender — subscribes to `agent.telemetry.logs` and writes
-//! newline-delimited JSON to `.swarm/logs/telemetry.jsonl`.
+//! newline-delimited JSON to `.agora/logs/telemetry.jsonl`.
 
+use agora_core::bus::Bus;
 use anyhow::{Context, Result};
 use clap::Parser;
 use futures::StreamExt;
 use std::{io::Write, path::PathBuf};
-use swarm_core::bus::Bus;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
     // Plain NATS subscribe (not durable) for telemetry — best effort
     let mut sub = bus
         .client
-        .subscribe(swarm_core::AGENT_TELEMETRY_LOGS.to_string())
+        .subscribe(agora_core::AGENT_TELEMETRY_LOGS.to_string())
         .await
         .context("Failed to subscribe to agent.telemetry.logs")?;
 

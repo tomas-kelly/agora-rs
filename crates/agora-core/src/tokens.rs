@@ -7,7 +7,7 @@ use std::{
 };
 
 const ALGORITHM: jsonwebtoken::Algorithm = jsonwebtoken::Algorithm::HS256;
-const ISSUER: &str = "swarm-tui";
+const ISSUER: &str = "agora";
 const DEFAULT_TOKEN_PATH: &str = ".kiro/session_token";
 pub const DEFAULT_TTL_SECS: u64 = 15 * 60;
 
@@ -82,7 +82,7 @@ pub fn mint_actor_token(
 
 pub fn mint_default_token(session_id: &str, signing_key: &[u8]) -> Result<String> {
     mint_actor_token(
-        "swarm-daemon",
+        "agora-daemon",
         &["workspace:read", "workspace:write", "shell:run:src/"],
         session_id,
         signing_key,

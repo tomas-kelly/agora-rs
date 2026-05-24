@@ -21,8 +21,17 @@ pub const SESSION_NAMED: &str = "session.named";
 
 // JetStream
 pub const EVENT_STREAM: &str = "AGORA_EVENTS";
+/// Subjects captured by the `AGORA_EVENTS` JetStream stream.
+///
+/// **Any topic an agent publishes must match one of these patterns**, or the
+/// publish will succeed at the NATS layer but JetStream will return "no
+/// stream matches the subject" on the ack and the agent will loop forever
+/// on `Publish ack failed`. Adding a new topic family means appending it
+/// here AND restarting the swarm so `Bus::ensure_event_stream` updates the
+/// live stream to include the new subjects.
 pub const EVENT_STREAM_SUBJECTS: &[&str] = &[
     "workspace.>",
+    "product.>",
     "code.>",
     "test.>",
     "security.>",
@@ -33,7 +42,7 @@ pub const EVENT_STREAM_SUBJECTS: &[&str] = &[
 ];
 
 // KV bucket for agent registry
-pub const KV_AGENT_REGISTRY: &str = "SWARM_AGENT_REGISTRY";
+pub const KV_AGENT_REGISTRY: &str = "AGORA_AGENT_REGISTRY";
 
 pub fn direct_inbox_topic(agent_name: &str) -> String {
     format!("agent.inbox.{}", agent_name)

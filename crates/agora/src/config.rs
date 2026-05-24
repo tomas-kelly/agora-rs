@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, path::Path};
 
-use swarm_core::agent_spec::AgentSpec;
+use agora_core::agent_spec::AgentSpec;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NatsConfig {
@@ -176,8 +176,61 @@ impl TopologyConfig {
             }
         }
 
+        // 5. Every topic any agent publishes (or subscribes to) must be
+        //    covered by the JetStream stream's subject filters, or the
+        //    publish will succeed at the NATS layer but fail on the ack
+        //    with "Publish ack failed" and the agent will loop forever.
+        let stream_subjects = swarm_core_stream_subjects();
+        let mut all_topics: HashSet<&str> = HashSet::new();
+        for agent in &self.agents {
+            for p in &agent.publishes {
+                all_topics.insert(p.topic.as_str());
+            }
+            for s in &agent.subscriptions {
+                all_topics.insert(s.topic.as_str());
+                if let Some(emit) = &s.emit {
+                    all_topics.insert(emit.topic.as_str());
+                }
+            }
+        }
+        for topic in &all_topics {
+            if !stream_subjects.iter().any(|filter| subject_matches(filter, topic)) {
+                bail!(
+                    "topic `{topic}` is referenced by the topology but not covered by any JetStream \
+                     subject filter ({stream_subjects:?}). Add a matching pattern to \
+                     `EVENT_STREAM_SUBJECTS` in agora-core/src/topics.rs and restart."
+                );
+            }
+        }
+
         Ok(())
     }
+}
+
+fn swarm_core_stream_subjects() -> &'static [&'static str] {
+    agora_core::topics::EVENT_STREAM_SUBJECTS
+}
+
+/// Match a NATS subject filter (with `.` separators and `>` / `*` wildcards)
+/// against a concrete topic. `>` matches all remaining tokens; `*` matches
+/// exactly one.
+fn subject_matches(filter: &str, topic: &str) -> bool {
+    let f: Vec<&str> = filter.split('.').collect();
+    let t: Vec<&str> = topic.split('.').collect();
+    let mut i = 0;
+    while i < f.len() {
+        if f[i] == ">" {
+            return true;
+        }
+        if i >= t.len() {
+            return false;
+        }
+        if f[i] != "*" && f[i] != t[i] {
+            return false;
+        }
+        i += 1;
+    }
+    i == t.len()
 }
 
 #[cfg(test)]

@@ -1,15 +1,15 @@
-use anyhow::Result;
-use serde::Deserialize;
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::Arc,
-};
-use swarm_core::{
+use agora_core::{
     bus::Bus,
     envelope::Envelope,
     manifest::AgentManifest,
     tokens::mint_actor_token,
     topics::{direct_inbox_topic, SESSION_NAMED, WORKSPACE_IDEA_SUBMITTED},
+};
+use anyhow::Result;
+use serde::Deserialize;
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
 };
 
 const MAX_EVENTS: usize = 500;
@@ -79,6 +79,13 @@ pub struct App {
     pub command_output: Option<String>,
     pub output_scroll: u16,
 
+    pub input_scroll: u16,
+    pub input_view_height: u16,
+    pub input_view_width: u16,
+    pub input_visual_lines: u16,
+    pub input_area_top: u16,
+    pub input_area_bottom: u16,
+
     pub events_scroll: u16,
     pub auto_scroll: bool,
 
@@ -104,6 +111,12 @@ impl App {
             status_msg: Some("Type !help for commands · Enter to submit · Esc to quit".into()),
             command_output: None,
             output_scroll: 0,
+            input_scroll: 0,
+            input_view_height: 1,
+            input_view_width: 1,
+            input_visual_lines: 1,
+            input_area_top: 0,
+            input_area_bottom: 0,
             events_scroll: 0,
             auto_scroll: true,
             pending_action: None,
@@ -125,6 +138,56 @@ impl App {
         }
     }
 
+    pub fn set_input_viewport(&mut self, top: u16, height: u16, width: u16, visual_lines: u16) {
+        self.input_area_top = top;
+        self.input_area_bottom = top.saturating_add(height);
+        self.input_view_height = height.max(1);
+        self.input_view_width = width.max(1);
+        self.input_visual_lines = visual_lines.max(1);
+        self.clamp_input_scroll();
+    }
+
+    pub fn input_overflows(&self) -> bool {
+        self.input_visual_lines > self.input_view_height
+    }
+
+    pub fn mouse_over_input(&self, row: u16) -> bool {
+        row >= self.input_area_top && row < self.input_area_bottom
+    }
+
+    pub fn scroll_input(&mut self, delta: i32) {
+        if delta < 0 {
+            self.input_scroll = self.input_scroll.saturating_add((-delta) as u16);
+        } else {
+            self.input_scroll = self.input_scroll.saturating_sub(delta as u16);
+        }
+        self.clamp_input_scroll();
+    }
+
+    pub fn reset_input_scroll(&mut self) {
+        self.input_scroll = 0;
+    }
+
+    pub fn push_input_char(&mut self, ch: char) {
+        self.input.push(ch);
+        self.reset_input_scroll();
+    }
+
+    pub fn push_input_newline(&mut self) {
+        self.input.push('\n');
+        self.reset_input_scroll();
+    }
+
+    pub fn pop_input_char(&mut self) {
+        self.input.pop();
+        self.reset_input_scroll();
+    }
+
+    pub fn replace_input(&mut self, input: String) {
+        self.input = input;
+        self.reset_input_scroll();
+    }
+
     pub fn dismiss_command_output(&mut self) -> bool {
         if self.command_output.is_some() {
             self.command_output = None;
@@ -132,6 +195,13 @@ impl App {
         } else {
             false
         }
+    }
+
+    fn clamp_input_scroll(&mut self) {
+        let max_scroll = self
+            .input_visual_lines
+            .saturating_sub(self.input_view_height);
+        self.input_scroll = self.input_scroll.min(max_scroll);
     }
 
     pub fn display_name(&self, session_id: &str) -> String {
@@ -207,6 +277,7 @@ impl App {
             return;
         }
         self.stashed_input = std::mem::take(&mut self.input);
+        self.reset_input_scroll();
         self.mode = InputMode::NamingNew;
     }
 
@@ -221,7 +292,7 @@ impl App {
         };
         self.stashed_input = std::mem::take(&mut self.input);
         // Preload with existing name (if any) so user can edit
-        self.input = self.session_names.get(&target).cloned().unwrap_or_default();
+        self.replace_input(self.session_names.get(&target).cloned().unwrap_or_default());
         self.rename_target = Some(target);
         self.mode = InputMode::Renaming;
     }
@@ -230,7 +301,8 @@ impl App {
         if self.mode == InputMode::Normal {
             return;
         }
-        self.input = std::mem::take(&mut self.stashed_input);
+        let restored = std::mem::take(&mut self.stashed_input);
+        self.replace_input(restored);
         self.mode = InputMode::Normal;
         self.rename_target = None;
     }
@@ -244,7 +316,8 @@ impl App {
                     return Ok(());
                 }
                 self.create_session(&name).await;
-                self.input = std::mem::take(&mut self.stashed_input);
+                let restored = std::mem::take(&mut self.stashed_input);
+                self.replace_input(restored);
                 self.mode = InputMode::Normal;
             }
             InputMode::Renaming => {
@@ -252,7 +325,8 @@ impl App {
                 if let Some(sid) = self.rename_target.take() {
                     self.rename_session(&sid, &new_name).await;
                 }
-                self.input = std::mem::take(&mut self.stashed_input);
+                let restored = std::mem::take(&mut self.stashed_input);
+                self.replace_input(restored);
                 self.mode = InputMode::Normal;
             }
             InputMode::Normal => {}
@@ -455,6 +529,7 @@ impl App {
 
     fn cmd_editor(&mut self) {
         let initial = std::mem::take(&mut self.input);
+        self.reset_input_scroll();
         self.pending_action = Some(PendingAction::OpenEditor { initial });
     }
 
@@ -495,7 +570,7 @@ impl App {
              \n\
              KEYS:  Ctrl-N/R/X · Tab/Shift-Tab · ↑/↓/End for events\n\
              \x20\x20\x20\x20\x20\x20Shift+Enter or Alt+Enter inserts a newline\n\
-             \x20\x20\x20\x20\x20\x20PgUp/PgDn · mouse wheel to scroll this panel · Esc to dismiss"
+             \x20\x20\x20\x20\x20\x20PgUp/PgDn scroll long drafts or this panel · wheel over the composer scrolls it · Esc to dismiss"
             .to_string();
         self.set_output(text);
     }
@@ -542,7 +617,7 @@ impl App {
                 let status = self
                     .agents
                     .get(name)
-                    .map(|a| format!("{:?}", a.status).to_lowercase())
+                    .map(|a| format!("{:?}", a.observed_status()).to_lowercase())
                     .unwrap_or_else(|| "—".into());
                 out.push_str(&format!(
                     "  {name:30}  {status:8}  {count} event{}\n",
@@ -575,6 +650,10 @@ impl App {
         match manifest {
             Some(m) => {
                 out.push_str(&format!("  status:        {:?}\n", m.status));
+                let observed = m.observed_status();
+                if observed != m.status {
+                    out.push_str(&format!("  observed:      {:?}\n", observed));
+                }
                 out.push_str(&format!("  port:          {}\n", m.port));
                 out.push_str(&format!("  last seen:     {}\n", m.last_seen));
                 out.push_str(&format!("  capabilities:  {}\n", m.capabilities.join(", ")));

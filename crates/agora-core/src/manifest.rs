@@ -1,5 +1,8 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+pub const AGENT_STALE_AFTER_SECS: i64 = 15;
+pub const AGENT_DOWN_AFTER_SECS: i64 = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -7,6 +10,7 @@ pub enum AgentStatus {
     Starting,
     Ready,
     Busy,
+    Stale,
     Draining,
     Down,
 }
@@ -70,7 +74,52 @@ impl AgentManifest {
         self
     }
 
+    pub fn observed_status(&self) -> AgentStatus {
+        self.observed_status_at(Utc::now())
+    }
+
+    pub fn observed_status_at(&self, now: DateTime<Utc>) -> AgentStatus {
+        if self.status == AgentStatus::Down {
+            return AgentStatus::Down;
+        }
+
+        let Ok(last_seen) = DateTime::parse_from_rfc3339(&self.last_seen) else {
+            return AgentStatus::Stale;
+        };
+        let age = now.signed_duration_since(last_seen.with_timezone(&Utc));
+        if age.num_seconds() >= AGENT_DOWN_AFTER_SECS {
+            AgentStatus::Down
+        } else if age.num_seconds() >= AGENT_STALE_AFTER_SECS {
+            AgentStatus::Stale
+        } else {
+            self.status.clone()
+        }
+    }
+
     pub fn to_bytes(&self) -> anyhow::Result<bytes::Bytes> {
         Ok(bytes::Bytes::from(serde_json::to_vec(self)?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+
+    #[test]
+    fn observed_status_marks_old_heartbeats_stale_and_down() {
+        let now = Utc::now();
+        let mut manifest = AgentManifest::new("agent", 4001, vec![], vec![], vec![])
+            .with_status(AgentStatus::Ready);
+
+        manifest.last_seen = (now - Duration::seconds(AGENT_STALE_AFTER_SECS + 1))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        assert_eq!(manifest.observed_status_at(now), AgentStatus::Stale);
+
+        manifest.last_seen = (now - Duration::seconds(AGENT_DOWN_AFTER_SECS + 1))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        assert_eq!(manifest.observed_status_at(now), AgentStatus::Down);
     }
 }

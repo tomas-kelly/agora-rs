@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "crates/swarm-core",
+    "crates/agora-core",
     "crates/agora",
     "crates/agora-agent",
     "crates/agora-console",
@@ -17,7 +17,7 @@ authors    = ["Tom Kelly <tomasbkelly@gmail.com>"]
 description = "Local-first event-driven multi-agent swarm runtime on NATS JetStream"
 
 [workspace.dependencies]
-swarm-core = { path = "crates/swarm-core" }
+agora-core = { path = "crates/agora-core" }
 
 async-nats   = "0.37"
 async-trait  = "0.1"

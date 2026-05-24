@@ -8,11 +8,11 @@ reacts to events published by other agents.
 
 ```
 crates/
-  swarm-core/          # shared library — envelope, bus, daemon runtime, ACP, tokens
+  agora-core/          # shared library — envelope, bus, daemon runtime, ACP, tokens
   agora/               # supervisor CLI binary
   agora-agent/         # generic config-driven agent process
   agora-console/       # terminal console for sessions, events, agents, history
-  daemon-telemetry/    # appends agent.telemetry.logs to .swarm/logs/telemetry.jsonl
+  daemon-telemetry/    # appends agent.telemetry.logs to .agora/logs/telemetry.jsonl
 ```
 
 ## Prerequisites
@@ -62,12 +62,15 @@ this terminal running; `Ctrl-C` stops the whole swarm.
 ### Step 2 — Open the console (Terminal 2)
 
 ```bash
-cargo run -p agora-console
+cargo run -p agora -- console
 ```
 
 The TUI window onto the running swarm: sessions / events / agents panes
 plus a composer for ideas and direct messages. Safe to quit and reopen
 anytime — the JetStream replay catches you up on what you missed.
+
+`cargo run -p agora-console` still works as a compatibility entry point, but
+`agora console` is the canonical CLI command.
 
 > The console **requires Step 1 to be running**. If you see
 > `cannot connect to nats://127.0.0.1:4222`, that's why — start the
@@ -92,10 +95,37 @@ JetStream until the full loopback completes:
 The Agora session ID from each event is passed through to ACP so all agent
 activity stays attached to the same Agora session.
 
+### Operate the swarm from the CLI
+
+The top-level commands mirror the Docker-style workflow for local operations:
+
+```bash
+cargo run -p agora -- ps
+cargo run -p agora -- logs backend-coder -f --tail 200
+cargo run -p agora -- inspect backend-coder
+cargo run -p agora -- events --follow --session-id sess_<id>
+cargo run -p agora -- stats
+cargo run -p agora -- top backend-coder
+cargo run -p agora -- info
+cargo run -p agora -- version
+```
+
+Object-scoped aliases are available when that reads better:
+
+```bash
+cargo run -p agora -- agent ls
+cargo run -p agora -- agent logs backend-coder -f
+cargo run -p agora -- agent inspect backend-coder --json
+cargo run -p agora -- session ls
+cargo run -p agora -- session inspect sess_<id>
+cargo run -p agora -- system info
+cargo run -p agora -- system events --follow
+```
+
 ### What it looks like
 
 ```
- agora-console │ nats://127.0.0.1:4222 │ events:24 sessions:2 agents:6 │ Submitted idea to "Task manager"
+ agora console │ nats://127.0.0.1:4222 │ events:24 sessions:2 agents:6 │ Submitted idea to "Task manager"
 ┌─ Sessions (2) ─────────────┬─ Events ───────────────────────────────────────┬─ Agents (6) ─────────────────┐
 │ ▶ Task manager             │ 10:00:01  workspace.idea.submitted   sess_01J… │ ● product-manager            │
 │   workspace.idea… · 8 evts │ 10:00:04  product.requirements…      sess_01J… │    :4001 · product           │
@@ -168,8 +198,8 @@ to dump into `$PAGER`, `!copy` to drop the whole thing on the clipboard.
 | `Shift-Tab` | Cycle active session backwards |
 | `Shift+Enter` / `Alt+Enter` / `Ctrl+J` | Insert a newline (the input box grows) |
 | `↑` / `↓` | Scroll events pane by 1 line (pauses auto-scroll) |
-| `PgUp` / `PgDn` | Scroll the command output panel (or events by 5 lines) |
-| Mouse wheel | Same as PgUp/PgDn — over the command output panel if open, else events |
+| `PgUp` / `PgDn` | Scroll the command output panel, or a long draft in the composer, otherwise events by 5 lines |
+| Mouse wheel | Scrolls the composer when the pointer is over a long draft; otherwise scrolls command output or events |
 | `End` | Snap back to the live tail |
 | `Esc` (in modal) | Cancel naming/renaming |
 | `Esc` (normal mode, with command output) | Dismiss the output panel |
@@ -224,11 +254,16 @@ workspace.idea.submitted
 
 ```bash
 # All events
-cargo run -p agora -- replay
+cargo run -p agora -- events
 
 # Specific session
-cargo run -p agora -- replay --session-id sess_<id>
+cargo run -p agora -- events --session-id sess_<id>
+
+# Live stream
+cargo run -p agora -- events --follow
 ```
+
+`agora replay` remains as a compatibility command for the older event dump.
 
 ## Architecture
 
@@ -244,7 +279,7 @@ cargo run -p agora -- replay --session-id sess_<id>
                             └─┬──────────────────────────────────────┘
                               │
    ┌──────────────┐   publish │   subscribe (durable pull consumer per topic)
-   │ agora-console│ ──────────┤            ┌────────────────────────────┐
+   │ agora console│ ──────────┤            ┌────────────────────────────┐
    │ (TUI)        │           ├──────────► │ agora-agent (one per spec) │
    └──────────────┘           │            │   ├─ Mock or Kiro ACP      │
                               │            │   ├─ render prompt         │
@@ -305,18 +340,18 @@ Every NATS message is a JSON `Envelope`:
   `security.>`, `human.>`, `agent.>`, `event.>`, `session.>`
 - **Consumers**: one durable pull consumer per agent per topic —
   `{agent-name}_{topic_with_underscores}` — survives restart
-- **KV bucket**: `SWARM_AGENT_REGISTRY` — live agent manifests
+- **KV bucket**: `AGORA_AGENT_REGISTRY` — live agent manifests
 
 ### Daemon runtime
 
-`DaemonRunner<A: Agent>` in `swarm-core::daemon`:
+`DaemonRunner<A: Agent>` in `agora-core::daemon`:
 
 1. Connects to NATS and creates the JetStream stream
 2. Creates one durable pull consumer per declared subscription
 3. Spawns a subscriber task for each consumer; messages fan into an `mpsc` channel
 4. A single processing loop drains the channel sequentially (one event at a time)
 5. Passes a `Publisher` handle to `on_event` so agents can publish child events
-6. Emits heartbeats to `SWARM_AGENT_REGISTRY` KV every 5 s
+6. Emits heartbeats to `AGORA_AGENT_REGISTRY` KV every 5 s
 
 Durable messages are acknowledged after successful agent processing. Failed
 agent handling requests JetStream redelivery; invalid envelopes are terminated.
@@ -326,7 +361,7 @@ agent handling requests JetStream redelivery; invalid envelopes are terminated.
 Short-lived HS256 JWTs signed with a cluster-local secret (`.kiro/session_token`).
 The TUI/CLI mints a token per session. Agent inbound subscriptions enforce the
 declared `required_scopes`, and child events are minted with the declared scopes
-for their output topic. Verify with `swarm_core::tokens::verify_actor_token`.
+for their output topic. Verify with `agora_core::tokens::verify_actor_token`.
 
 ## Adding a new agent
 
@@ -339,5 +374,5 @@ from `.kiro/agents`: `product-manager`, `system-architect`, `backend-coder`,
 2. Set `acp` or rely on `default_acp` (`kiro` for the checked-in local topology, `mock` for smoke tests).
 3. Include every output topic in either `publishes[]` or a subscription `emit`.
 
-For custom Rust behavior, implement `swarm_core::daemon::Agent` in a new crate
+For custom Rust behavior, implement `agora_core::daemon::Agent` in a new crate
 and call `DaemonRunner::new(daemon, config).run().await` from its `main`.

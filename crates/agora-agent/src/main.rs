@@ -16,12 +16,7 @@
 //!   default emit topic (the actual data is taken from `_data` if present,
 //!   otherwise from the whole response minus `_topic`).
 
-use anyhow::{anyhow, Context, Result};
-use async_trait::async_trait;
-use clap::Parser;
-use std::collections::HashMap;
-use std::path::PathBuf;
-use swarm_core::{
+use agora_core::{
     acp::{AcpClient, KiroAcpClient, MockAcpClient},
     agent_spec::{AgentSpec, SubscriptionSpec},
     daemon::{Agent, DaemonConfig, DaemonRunner, Publisher},
@@ -29,6 +24,11 @@ use swarm_core::{
     manifest::{PublishedEvent, Subscription},
     topics::direct_inbox_topic,
 };
+use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
+use clap::Parser;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use tracing::{info, warn};
 
 #[derive(Parser)]
@@ -317,7 +317,7 @@ impl Agent for ConfigAgent {
 #[cfg(test)]
 mod tests {
     use super::{resolve_key, ConfigAgent};
-    use swarm_core::{
+    use agora_core::{
         acp::MockAcpClient,
         agent_spec::{AgentSpec, EmitSpec, SubscriptionSpec},
         envelope::Envelope,

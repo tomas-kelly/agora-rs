@@ -12,13 +12,17 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 name = "agora"
 version = "0.1.0"
 dependencies = [
+ "agora-console",
+ "agora-core",
  "anyhow",
  "bytes",
+ "chrono",
  "clap",
+ "futures",
  "getrandom 0.2.17",
  "serde",
  "serde_json",
- "swarm-core",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
@@ -31,12 +35,12 @@ dependencies = [
 name = "agora-agent"
 version = "0.1.0"
 dependencies = [
+ "agora-core",
  "anyhow",
  "async-trait",
  "clap",
  "serde",
  "serde_json",
- "swarm-core",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -46,6 +50,7 @@ dependencies = [
 name = "agora-console"
 version = "0.1.0"
 dependencies = [
+ "agora-core",
  "anyhow",
  "arboard",
  "async-nats",
@@ -56,9 +61,27 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
- "swarm-core",
  "tempfile",
  "tokio",
+ "ulid",
+]
+
+[[package]]
+name = "agora-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "futures",
+ "jsonwebtoken",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
  "ulid",
 ]
 
@@ -493,11 +516,11 @@ dependencies = [
 name = "daemon-telemetry"
 version = "0.1.0"
 dependencies = [
+ "agora-core",
  "anyhow",
  "clap",
  "futures",
  "serde_json",
- "swarm-core",
  "tokio",
  "tokio-util",
  "tracing",
@@ -2026,25 +2049,6 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
-
-[[package]]
-name = "swarm-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-nats",
- "async-trait",
- "bytes",
- "chrono",
- "futures",
- "jsonwebtoken",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
- "ulid",
-]
 
 [[package]]
 name = "syn"
