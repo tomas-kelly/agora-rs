@@ -1,6 +1,7 @@
 mod config;
 mod lifecycle;
 mod supervisor;
+mod watch;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -15,13 +16,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use agora_core::{
+    bookmark::{validate_bookmark_label, BookmarkEvent},
     bus::{AgentRegistryRecord, Bus},
     envelope::Envelope,
     manifest::{AgentManifest, AgentStatus},
+    tags::validate_tag,
     tokens::{default_key_path, load_signing_key, mint_actor_token},
     topics::{
-        direct_inbox_topic, AGENT_TELEMETRY_LOGS, EVENT_STREAM, EVENT_STREAM_SUBJECTS,
-        SESSION_DELETED, SESSION_NAMED, WORKSPACE_IDEA_SUBMITTED,
+        direct_inbox_topic, AGENT_TELEMETRY_LOGS, EVENT_BOOKMARKED, EVENT_STREAM,
+        EVENT_STREAM_SUBJECTS, EVENT_UNBOOKMARKED, SESSION_DELETED, SESSION_NAMED, SESSION_TAGGED,
+        SESSION_UNTAGGED, WORKSPACE_IDEA_SUBMITTED,
     },
 };
 use config::TopologyConfig;
@@ -118,6 +122,8 @@ enum Cmd {
     },
     /// Show events from the swarm event stream
     Events(EventArgs),
+    /// Stream formatted events to stdout in real-time
+    Watch(watch::WatchArgs),
     /// Inspect an agent, session, process, or runtime object
     Inspect {
         target: String,
@@ -228,6 +234,46 @@ enum Cmd {
         #[arg(long, default_value = ".kiro/session_token")]
         key_path: String,
     },
+    /// Manage event bookmarks
+    Bookmark {
+        #[command(subcommand)]
+        command: BookmarkCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum BookmarkCmd {
+    /// Bookmark an event
+    Add {
+        event_id: String,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long, default_value = "nats://127.0.0.1:4222")]
+        bus_url: String,
+        #[arg(long, default_value = ".kiro/session_token")]
+        key_path: String,
+    },
+    /// Remove a bookmark from an event
+    Remove {
+        event_id: String,
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long, default_value = "nats://127.0.0.1:4222")]
+        bus_url: String,
+        #[arg(long, default_value = ".kiro/session_token")]
+        key_path: String,
+    },
+    /// List bookmarked events
+    Ls {
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value = "nats://127.0.0.1:4222")]
+        bus_url: String,
+    },
 }
 
 #[derive(Debug, Clone, Args)]
@@ -266,6 +312,8 @@ enum SessionCmd {
     Ls {
         #[arg(long)]
         include_deleted: bool,
+        #[arg(long)]
+        tag: Option<String>,
         #[arg(long, default_value = "nats://127.0.0.1:4222")]
         bus_url: String,
     },
@@ -289,6 +337,24 @@ enum SessionCmd {
     /// Hide a session from default lists without erasing its events
     Delete {
         session_id: String,
+        #[arg(long, default_value = "nats://127.0.0.1:4222")]
+        bus_url: String,
+        #[arg(long, default_value = ".kiro/session_token")]
+        key_path: String,
+    },
+    /// Add a tag to a session
+    Tag {
+        session_id: String,
+        label: String,
+        #[arg(long, default_value = "nats://127.0.0.1:4222")]
+        bus_url: String,
+        #[arg(long, default_value = ".kiro/session_token")]
+        key_path: String,
+    },
+    /// Remove a tag from a session
+    Untag {
+        session_id: String,
+        label: String,
         #[arg(long, default_value = "nats://127.0.0.1:4222")]
         bus_url: String,
         #[arg(long, default_value = ".kiro/session_token")]
@@ -447,6 +513,7 @@ struct SessionSummary {
     event_count: usize,
     deleted: bool,
     deleted_at: Option<String>,
+    tags: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -503,12 +570,13 @@ async fn main() -> Result<()> {
         Cmd::Sessions {
             include_deleted,
             bus_url,
-        } => list_sessions(&bus_url, include_deleted).await,
+        } => list_sessions(&bus_url, include_deleted, None).await,
         Cmd::Session { command } => match command {
             SessionCmd::Ls {
                 include_deleted,
+                tag,
                 bus_url,
-            } => list_sessions(&bus_url, include_deleted).await,
+            } => list_sessions(&bus_url, include_deleted, tag.as_deref()).await,
             SessionCmd::New {
                 name,
                 bus_url,
@@ -525,6 +593,18 @@ async fn main() -> Result<()> {
                 bus_url,
                 key_path,
             } => delete_session(&session_id, &bus_url, &key_path).await,
+            SessionCmd::Tag {
+                session_id,
+                label,
+                bus_url,
+                key_path,
+            } => tag_session(&session_id, &label, &bus_url, &key_path).await,
+            SessionCmd::Untag {
+                session_id,
+                label,
+                bus_url,
+                key_path,
+            } => untag_session(&session_id, &label, &bus_url, &key_path).await,
             SessionCmd::Inspect {
                 session_id,
                 json,
@@ -666,6 +746,7 @@ async fn main() -> Result<()> {
             )
         }
         Cmd::Events(args) => show_events(&args).await,
+        Cmd::Watch(args) => watch::run_watch(&args).await,
         Cmd::Inspect {
             target,
             json,
@@ -752,7 +833,156 @@ async fn main() -> Result<()> {
             } => prune_registry(&config, bus_url.as_deref(), apply).await,
         },
         Cmd::Doctor { config, key_path } => doctor(&config, &key_path).await,
+        Cmd::Bookmark { command } => match command {
+            BookmarkCmd::Add {
+                event_id,
+                label,
+                session_id,
+                bus_url,
+                key_path,
+            } => {
+                add_bookmark(
+                    &event_id,
+                    label.as_deref(),
+                    session_id.as_deref(),
+                    &bus_url,
+                    &key_path,
+                )
+                .await
+            }
+            BookmarkCmd::Remove {
+                event_id,
+                session_id,
+                bus_url,
+                key_path,
+            } => remove_bookmark(&event_id, session_id.as_deref(), &bus_url, &key_path).await,
+            BookmarkCmd::Ls {
+                session_id,
+                json,
+                bus_url,
+            } => list_bookmarks(session_id.as_deref(), &bus_url, json).await,
+        },
     }
+}
+
+async fn add_bookmark(
+    event_id: &str,
+    label: Option<&str>,
+    session_id: Option<&str>,
+    bus_url: &str,
+    key_path: &str,
+) -> Result<()> {
+    if let Some(l) = label {
+        validate_bookmark_label(l)?;
+    }
+    let bus = Bus::connect(bus_url).await?;
+    let events = bus.read_all_events().await?;
+    let target = events
+        .iter()
+        .find(|e| e.event_id == event_id)
+        .with_context(|| format!("event `{event_id}` not found in stream"))?;
+    let sid = session_id.unwrap_or(&target.context.session_id);
+
+    let signing_key = load_signing_key(key_path)?;
+    let token = mint_actor_token("cli-user", &["workspace:write"], sid, &signing_key, 900)?;
+    let bookmark = BookmarkEvent {
+        target_event_id: event_id.to_string(),
+        label: label.map(String::from),
+        actor: "agora-cli".to_string(),
+    };
+    let env = Envelope::build(
+        EVENT_BOOKMARKED,
+        "agora-cli",
+        0u16,
+        token,
+        sid,
+        serde_json::to_value(&bookmark)?,
+        None,
+        vec![],
+    );
+    bus.publish(&env).await?;
+    println!("Bookmarked {event_id}");
+    Ok(())
+}
+
+async fn remove_bookmark(
+    event_id: &str,
+    session_id: Option<&str>,
+    bus_url: &str,
+    key_path: &str,
+) -> Result<()> {
+    let bus = Bus::connect(bus_url).await?;
+    let events = bus.read_all_events().await?;
+    let target = events
+        .iter()
+        .find(|e| e.event_id == event_id)
+        .with_context(|| format!("event `{event_id}` not found in stream"))?;
+    let sid = session_id.unwrap_or(&target.context.session_id);
+
+    let signing_key = load_signing_key(key_path)?;
+    let token = mint_actor_token("cli-user", &["workspace:write"], sid, &signing_key, 900)?;
+    let bookmark = BookmarkEvent {
+        target_event_id: event_id.to_string(),
+        label: None,
+        actor: "agora-cli".to_string(),
+    };
+    let env = Envelope::build(
+        EVENT_UNBOOKMARKED,
+        "agora-cli",
+        0u16,
+        token,
+        sid,
+        serde_json::to_value(&bookmark)?,
+        None,
+        vec![],
+    );
+    bus.publish(&env).await?;
+    println!("Unbookmarked {event_id}");
+    Ok(())
+}
+
+async fn list_bookmarks(session_id: Option<&str>, bus_url: &str, json: bool) -> Result<()> {
+    let bus = Bus::connect(bus_url).await?;
+    let events = bus.read_all_events().await?;
+    let mut bookmarks: BTreeMap<String, BookmarkEvent> = BTreeMap::new();
+
+    for event in &events {
+        if let Some(sid) = session_id {
+            if event.context.session_id != sid {
+                continue;
+            }
+        }
+        if event.topic == EVENT_BOOKMARKED {
+            if let Ok(bm) = serde_json::from_value::<BookmarkEvent>(event.data.clone()) {
+                bookmarks.insert(bm.target_event_id.clone(), bm);
+            }
+        } else if event.topic == EVENT_UNBOOKMARKED {
+            if let Ok(bm) = serde_json::from_value::<BookmarkEvent>(event.data.clone()) {
+                bookmarks.remove(&bm.target_event_id);
+            }
+        }
+    }
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&bookmarks)?);
+        return Ok(());
+    }
+
+    if bookmarks.is_empty() {
+        println!("No bookmarks found.");
+        return Ok(());
+    }
+
+    println!("{:<24} {:<16} LABEL", "EVENT", "ACTOR");
+    for (event_id, bm) in &bookmarks {
+        println!(
+            "{:<24} {:<16} {}",
+            short(event_id, 24),
+            bm.actor,
+            bm.label.as_deref().unwrap_or("-")
+        );
+    }
+    Ok(())
 }
 
 /// Run a sequence of preflight checks and exit non-zero on any failure.
@@ -1417,13 +1647,67 @@ async fn publish_session_deleted(session_id: &str, bus_url: &str, key_path: &str
     bus.publish(&env).await
 }
 
-async fn list_sessions(bus_url: &str, include_deleted: bool) -> Result<()> {
+async fn tag_session(session_id: &str, label: &str, bus_url: &str, key_path: &str) -> Result<()> {
+    let tag = validate_tag(label)?;
+    let signing_key = load_signing_key(key_path)?;
+    let token = mint_actor_token(
+        "cli-user",
+        &["workspace:write"],
+        session_id,
+        &signing_key,
+        900,
+    )?;
     let bus = Bus::connect(bus_url).await?;
-    let sessions = load_sessions(&bus).await?;
+    let env = Envelope::build(
+        SESSION_TAGGED,
+        "agora-cli",
+        0,
+        token,
+        session_id,
+        serde_json::json!({ "tag": tag, "actor": "agora-cli" }),
+        None,
+        vec![],
+    );
+    bus.publish(&env).await?;
+    println!("Tagged {session_id}: {tag}");
+    Ok(())
+}
+
+async fn untag_session(session_id: &str, label: &str, bus_url: &str, key_path: &str) -> Result<()> {
+    let tag = validate_tag(label)?;
+    let signing_key = load_signing_key(key_path)?;
+    let token = mint_actor_token(
+        "cli-user",
+        &["workspace:write"],
+        session_id,
+        &signing_key,
+        900,
+    )?;
+    let bus = Bus::connect(bus_url).await?;
+    let env = Envelope::build(
+        SESSION_UNTAGGED,
+        "agora-cli",
+        0,
+        token,
+        session_id,
+        serde_json::json!({ "tag": tag, "actor": "agora-cli" }),
+        None,
+        vec![],
+    );
+    bus.publish(&env).await?;
+    println!("Untagged {session_id}: {tag}");
+    Ok(())
+}
+
+async fn list_sessions(bus_url: &str, include_deleted: bool, tag: Option<&str>) -> Result<()> {
+    let bus = Bus::connect(bus_url).await?;
+    let events = bus.read_all_events().await?;
+    let sessions = build_sessions(&events);
 
     let mut rows: Vec<_> = sessions
         .values()
         .filter(|session| include_deleted || !session.deleted)
+        .filter(|session| tag.map(|t| session.tags.contains(t)).unwrap_or(true))
         .collect();
 
     if rows.is_empty() {
@@ -1438,17 +1722,23 @@ async fn list_sessions(bus_url: &str, include_deleted: bool) -> Result<()> {
     });
 
     println!(
-        "{:<32} {:<24} {:>6}  {:<9} {:<22} LAST TOPIC",
-        "SESSION", "NAME", "EVENTS", "STATE", "STARTED"
+        "{:<32} {:<24} {:>6}  {:<9} {:<22} {:<20} LAST TOPIC",
+        "SESSION", "NAME", "EVENTS", "STATE", "STARTED", "TAGS"
     );
     for session in rows {
+        let tags_str = if session.tags.is_empty() {
+            "-".to_string()
+        } else {
+            session.tags.iter().cloned().collect::<Vec<_>>().join(",")
+        };
         println!(
-            "{:<32} {:<24} {:>6}  {:<9} {:<22} {}",
+            "{:<32} {:<24} {:>6}  {:<9} {:<22} {:<20} {}",
             session.session_id,
             session.name.as_deref().unwrap_or("-"),
             session.event_count,
             if session.deleted { "deleted" } else { "active" },
             session.started_at,
+            tags_str,
             if session.last_topic.is_empty() {
                 "-"
             } else {
@@ -2130,6 +2420,7 @@ fn build_sessions(events: &[Envelope]) -> BTreeMap<String, SessionSummary> {
                 event_count: 0,
                 deleted: false,
                 deleted_at: None,
+                tags: BTreeSet::new(),
             });
 
         if event.timestamp < entry.started_at {
@@ -2145,6 +2436,20 @@ fn build_sessions(events: &[Envelope]) -> BTreeMap<String, SessionSummary> {
         if event.topic == SESSION_DELETED {
             entry.deleted = true;
             entry.deleted_at = Some(event.timestamp.clone());
+            continue;
+        }
+        if event.topic == SESSION_TAGGED {
+            if let Some(t) = event.data.get("tag").and_then(|v| v.as_str()) {
+                if entry.tags.len() < agora_core::tags::MAX_TAGS_PER_SESSION {
+                    entry.tags.insert(t.to_string());
+                }
+            }
+            continue;
+        }
+        if event.topic == SESSION_UNTAGGED {
+            if let Some(t) = event.data.get("tag").and_then(|v| v.as_str()) {
+                entry.tags.remove(t);
+            }
             continue;
         }
 

@@ -4,7 +4,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
 };
 
-use crate::app::{App, InputMode, Panel};
+use crate::app::{App, InputMode};
 
 const COMPOSER_MIN_HEIGHT: u16 = 7;
 const COMPOSER_MAX_HEIGHT: u16 = 18;
@@ -12,13 +12,18 @@ const COMPOSER_MAX_HEIGHT: u16 = 18;
 pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
-    let main_visible = app.panels.sessions || app.panels.events || app.panels.agents;
+    let main_visible = !app.full_event_details_open()
+        && (app.panels.sessions || app.panels.events || app.panels.agents);
     let detail_height = if !app.panels.detail {
         0
     } else if app.command_output.is_some() {
         (area.height / 3).clamp(10, 16)
-    } else {
+    } else if app.full_event_details_open() {
+        0
+    } else if app.event_details_open() {
         8
+    } else {
+        0
     };
     let content_width = area.width.saturating_sub(4).max(1);
     let input_lines = visual_line_count(&app.input, content_width);
@@ -26,25 +31,35 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let input_height = (input_lines + 3)
         .clamp(COMPOSER_MIN_HEIGHT, COMPOSER_MAX_HEIGHT)
         .min(max_for_terminal);
+    let full_details = app.panels.detail && app.full_event_details_open();
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // status bar
-            if main_visible {
-                Constraint::Min(6)
-            } else {
-                Constraint::Length(0)
-            },
-            Constraint::Length(detail_height), // detail / command output
-            Constraint::Length(input_height),  // input (grows for multi-line)
-        ])
+        .constraints(if full_details {
+            [
+                Constraint::Length(1), // status bar
+                Constraint::Length(0), // hidden main panels
+                Constraint::Min(8),    // full event details
+                Constraint::Length(input_height),
+            ]
+        } else {
+            [
+                Constraint::Length(1), // status bar
+                if main_visible {
+                    Constraint::Min(6)
+                } else {
+                    Constraint::Length(0)
+                },
+                Constraint::Length(detail_height), // detail / command output
+                Constraint::Length(input_height),  // input (grows for multi-line)
+            ]
+        })
         .split(area);
 
     render_status(f, app, outer[0]);
 
     render_main_panels(f, app, outer[1]);
 
-    if app.panels.detail {
+    if app.panels.detail && (app.command_output.is_some() || app.event_details_open()) {
         render_detail(f, app, outer[2]);
     }
     render_input(f, app, outer[3]);
@@ -82,53 +97,53 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_main_panels(f: &mut Frame, app: &mut App, area: Rect) {
-    let mut panels = Vec::new();
-    if app.panels.sessions {
-        panels.push(Panel::Sessions);
-    }
-    if app.panels.events {
-        panels.push(Panel::Events);
-    }
-    if app.panels.agents {
-        panels.push(Panel::Agents);
-    }
-
-    if panels.is_empty() || area.height == 0 || area.width == 0 {
+    if area.height == 0 || area.width == 0 {
         app.events_view_height = 1;
         return;
     }
 
-    let constraints = main_panel_constraints(&panels);
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(constraints)
-        .split(area);
+    let sidebar_visible = app.panels.sessions || app.panels.agents;
+    let events_visible = app.panels.events;
 
-    for (idx, panel) in panels.into_iter().enumerate() {
-        match panel {
-            Panel::Sessions => render_sessions(f, app, cols[idx]),
-            Panel::Events => render_events(f, app, cols[idx]),
-            Panel::Agents => render_agents(f, app, cols[idx]),
-            Panel::Detail => {}
+    match (sidebar_visible, events_visible) {
+        (false, false) => {
+            app.events_view_height = 1;
+        }
+        (false, true) => {
+            render_events(f, app, area);
+        }
+        (true, false) => {
+            app.events_view_height = 1;
+            render_sidebar(f, app, area);
+        }
+        (true, true) => {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(34), Constraint::Min(40)])
+                .split(area);
+            render_sidebar(f, app, cols[0]);
+            render_events(f, app, cols[1]);
         }
     }
 }
 
-fn main_panel_constraints(panels: &[Panel]) -> Vec<Constraint> {
-    if panels.len() == 1 {
-        return vec![Constraint::Min(1)];
-    }
+fn render_sidebar(f: &mut Frame, app: &App, area: Rect) {
+    let sessions_visible = app.panels.sessions;
+    let agents_visible = app.panels.agents;
 
-    let events_visible = panels.contains(&Panel::Events);
-    panels
-        .iter()
-        .map(|panel| match (panel, events_visible) {
-            (Panel::Events, _) => Constraint::Min(40),
-            (Panel::Sessions | Panel::Agents, true) => Constraint::Length(34),
-            (Panel::Sessions | Panel::Agents, false) => Constraint::Ratio(1, panels.len() as u32),
-            (Panel::Detail, _) => Constraint::Length(0),
-        })
-        .collect()
+    match (sessions_visible, agents_visible) {
+        (true, true) => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+                .split(area);
+            render_sessions(f, app, rows[0]);
+            render_agents(f, app, rows[1]);
+        }
+        (true, false) => render_sessions(f, app, area),
+        (false, true) => render_agents(f, app, area),
+        (false, false) => {}
+    }
 }
 
 fn render_sessions(f: &mut Frame, app: &App, area: Rect) {
@@ -136,6 +151,10 @@ fn render_sessions(f: &mut Frame, app: &App, area: Rect) {
         .sessions
         .values()
         .filter(|session| !session.deleted)
+        .filter(|session| match app.tag_filter.as_deref() {
+            Some(tag) => session.tags.iter().any(|session_tag| session_tag == tag),
+            None => true,
+        })
         .collect();
     sessions.sort_by(|a, b| b.started_at.cmp(&a.started_at));
 
@@ -156,17 +175,25 @@ fn render_sessions(f: &mut Frame, app: &App, area: Rect) {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
             };
-            let secondary = if s.event_count == 0 && s.last_topic.is_empty() {
+            let secondary_text = if s.event_count == 0 && s.last_topic.is_empty() {
                 "  (empty)".to_string()
             } else {
                 format!("  {} · {} events", &s.last_topic, s.event_count)
             };
+            let mut secondary_spans: Vec<Span> = vec![Span::styled(
+                secondary_text,
+                Style::default().fg(Color::DarkGray),
+            )];
+            let tag_style = Style::default().fg(Color::Magenta);
+            for tag in s.tags.iter().take(3) {
+                secondary_spans.push(Span::styled(format!(" [{tag}]"), tag_style));
+            }
+            if s.tags.len() > 3 {
+                secondary_spans.push(Span::styled(format!(" +{}", s.tags.len() - 3), tag_style));
+            }
             ListItem::new(vec![
                 Line::from(vec![Span::raw(marker), Span::styled(display, title_style)]),
-                Line::from(Span::styled(
-                    secondary,
-                    Style::default().fg(Color::DarkGray),
-                )),
+                Line::from(secondary_spans),
             ])
         })
         .collect();
@@ -174,23 +201,31 @@ fn render_sessions(f: &mut Frame, app: &App, area: Rect) {
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(format!(" Sessions ({}) ", sessions.len()))
+            .title(match app.tag_filter.as_deref() {
+                Some(tag) => format!(" Sessions ({}) · tag:{tag} ", sessions.len()),
+                None => format!(" Sessions ({}) ", sessions.len()),
+            })
             .border_style(Style::default().fg(Color::DarkGray)),
     );
     f.render_widget(list, area);
 }
 
 fn render_events(f: &mut Frame, app: &mut App, area: Rect) {
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+
+    // Record viewport height so selection movement can keep the highlighted
+    // event visible after terminal resizes.
+    app.sync_events_viewport(inner.height);
+
+    let title = match app.selected_event_index() {
+        Some(idx) => format!(" Events ({}/{}) ", idx + 1, app.events.len()),
+        None => " Events ".to_string(),
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Events ")
+        .title(title)
         .border_style(Style::default().fg(Color::DarkGray));
-    let inner = block.inner(area);
     f.render_widget(block, area);
-
-    // Record viewport height so `scroll_up` in app.rs can cap correctly
-    // (terminal resize may have changed it since last frame).
-    app.events_view_height = inner.height;
 
     let height = inner.height as usize;
     // Clamp scroll so the pane never goes blank when scrolled past the
@@ -205,17 +240,33 @@ fn render_events(f: &mut Frame, app: &mut App, area: Rect) {
     // The newest events sit at the end; auto-scroll keeps the bottom in view.
     let end = app.events.len().saturating_sub(scroll);
     let start = end.saturating_sub(height);
+    let selected_idx = app.selected_event_index();
 
     let items: Vec<ListItem> = app.events[start..end]
         .iter()
-        .map(|e| ListItem::new(format_event_line(e)))
+        .enumerate()
+        .map(|(offset, e)| {
+            let idx = start + offset;
+            let selected = selected_idx == Some(idx);
+            let bookmarked = app.bookmarks.contains_key(&e.event_id);
+            let item = ListItem::new(format_event_line(e, selected, bookmarked));
+            if selected {
+                item.style(Style::default().add_modifier(Modifier::REVERSED))
+            } else {
+                item
+            }
+        })
         .collect();
 
     let list = List::new(items);
     f.render_widget(list, inner);
 }
 
-fn format_event_line(e: &agora_core::envelope::Envelope) -> Line<'static> {
+fn format_event_line(
+    e: &agora_core::envelope::Envelope,
+    selected: bool,
+    bookmarked: bool,
+) -> Line<'static> {
     let ts = if e.timestamp.len() >= 19 {
         e.timestamp[11..19].to_string()
     } else {
@@ -223,14 +274,20 @@ fn format_event_line(e: &agora_core::envelope::Envelope) -> Line<'static> {
     };
     let session = short_id(&e.context.session_id, 12);
     let color = topic_color(&e.topic);
+    let marker = if selected { "› " } else { "  " };
 
-    Line::from(vec![
+    let mut spans = vec![
+        Span::styled(marker, Style::default().fg(Color::Yellow)),
         Span::styled(ts, Style::default().fg(Color::DarkGray)),
         Span::raw("  "),
         Span::styled(format!("{:32}", e.topic), Style::default().fg(color)),
         Span::raw("  "),
         Span::styled(session, Style::default().fg(Color::DarkGray)),
-    ])
+    ];
+    if bookmarked {
+        spans.push(Span::styled(" ★", Style::default().fg(Color::Yellow)));
+    }
+    Line::from(spans)
 }
 
 fn topic_color(topic: &str) -> Color {
@@ -253,6 +310,7 @@ fn topic_color(topic: &str) -> Color {
         }
         "human" => Color::Magenta,
         "agent" => Color::Blue,
+        "product" => Color::LightBlue,
         "event" => Color::Red,
         _ => Color::White,
     }
@@ -306,7 +364,7 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
                 total_lines
             )
         } else {
-            " Command output (Esc to dismiss · !clear) ".to_string()
+            " Command output (Esc to dismiss) ".to_string()
         };
         let block = Block::default()
             .borders(Borders::ALL)
@@ -320,29 +378,84 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Latest event ")
-        .border_style(Style::default().fg(Color::DarkGray));
-    let text = match app.events.last() {
-        Some(e) => {
-            let data_pretty =
-                serde_json::to_string_pretty(&e.data).unwrap_or_else(|_| e.data.to_string());
-            let session_label = app.display_name(&e.context.session_id);
+    let (idx, event) = match app.inspected_event_with_index() {
+        Some(event) => event,
+        None => return,
+    };
+
+    if app.full_event_details_open() {
+        let text = redacted_event_json(event);
+        let total_lines = text.lines().count() as u16;
+        let visible = area.height.saturating_sub(2);
+        let max_scroll = total_lines.saturating_sub(visible);
+        let scroll = app.output_scroll.min(max_scroll);
+        let title = if total_lines > visible {
             format!(
-                "topic:   {}\nevent:   {}\nsession: {}  ({})\nfrom:    {}\ndata:    {}",
+                " Full event details ({}/{})  [line {}/{}, PgUp/PgDn or wheel · Left collapses · Esc closes] ",
+                idx + 1,
+                app.events.len(),
+                scroll + 1,
+                total_lines
+            )
+        } else {
+            format!(
+                " Full event details ({}/{}) · Left collapses · Esc closes ",
+                idx + 1,
+                app.events.len()
+            )
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(Style::default().fg(Color::Cyan));
+        let para = Paragraph::new(text)
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0));
+        f.render_widget(para, area);
+        return;
+    }
+
+    let (title, text) = {
+        let e = event;
+        let data_pretty =
+            serde_json::to_string_pretty(&e.data).unwrap_or_else(|_| e.data.to_string());
+        let session_label = app.display_name(&e.context.session_id);
+        (
+            format!(
+                " Event inspector ({}/{}) · Right expands · Esc closes ",
+                idx + 1,
+                app.events.len()
+            ),
+            format!(
+                "topic:   {}\nevent:   {}\ntime:    {}\nsession: {}  ({})\nfrom:    {}\ndata:    {}",
                 e.topic,
                 e.event_id,
+                e.timestamp,
                 session_label,
                 e.context.session_id,
                 e.sender.agent_name,
                 data_pretty
-            )
-        }
-        None => "(no events yet — submit an idea below, or type !help)".into(),
+            ),
+        )
     };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::DarkGray));
     let para = Paragraph::new(text).block(block).wrap(Wrap { trim: false });
     f.render_widget(para, area);
+}
+
+fn redacted_event_json(e: &agora_core::envelope::Envelope) -> String {
+    let mut value = serde_json::to_value(e).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(token) = value
+        .get_mut("security")
+        .and_then(|security| security.get_mut("actorToken"))
+    {
+        *token = serde_json::Value::String("<redacted>".into());
+    }
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| e.data.to_string())
 }
 
 fn render_input(f: &mut Frame, app: &mut App, area: Rect) {

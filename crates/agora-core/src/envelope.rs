@@ -32,6 +32,8 @@ pub struct Context {
     pub git_commit: Option<String>,
     #[serde(default)]
     pub affected_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +76,7 @@ impl Envelope {
                 session_id: session_id.into(),
                 git_commit,
                 affected_files,
+                tags: vec![],
             },
             data,
         }
@@ -89,7 +92,7 @@ impl Envelope {
         affected_files: Option<Vec<String>>,
         git_commit: Option<String>,
     ) -> Self {
-        Self::build(
+        let mut child = Self::build(
             topic,
             agent_name,
             port,
@@ -98,7 +101,9 @@ impl Envelope {
             data,
             git_commit.or_else(|| self.context.git_commit.clone()),
             affected_files.unwrap_or_else(|| self.context.affected_files.clone()),
-        )
+        );
+        child.context.tags = self.context.tags.clone();
+        child
     }
 
     pub fn to_bytes(&self) -> Result<bytes::Bytes> {

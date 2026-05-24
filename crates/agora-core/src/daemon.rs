@@ -8,10 +8,15 @@ use tracing::{error, info, warn};
 use crate::{
     bus::Bus,
     envelope::Envelope,
+    human::{HumanInteractionRequest, HumanInteractionResponse},
     manifest::{AgentManifest, AgentStatus, PublishedEvent, Subscription},
     tokens::{load_signing_key, mint_actor_token, verify_actor_token},
-    topics::{AGENT_REGISTRY_HEARTBEAT, AGENT_TELEMETRY_LOGS},
+    topics::{AGENT_REGISTRY_HEARTBEAT, AGENT_TELEMETRY_LOGS, HUMAN_INTERACTION_REQUEST, HUMAN_INTERACTION_RESPONSE},
 };
+
+/// Shared map of pending human interaction requests awaiting responses.
+pub type PendingInteractions =
+    Arc<Mutex<HashMap<String, oneshot::Sender<HumanInteractionResponse>>>>;
 
 /// Handle passed to `on_event` so agents can publish child events.
 #[derive(Clone)]
@@ -22,6 +27,7 @@ pub struct Publisher {
     inbound: Arc<Envelope>,
     published_topics: Arc<HashMap<String, Vec<String>>>,
     signing_key: Arc<Vec<u8>>,
+    pending_interactions: PendingInteractions,
 }
 
 impl Publisher {
@@ -105,6 +111,66 @@ impl Publisher {
                 bytes::Bytes::from(serde_json::to_vec(&payload)?),
             )
             .await
+    }
+
+    /// Ask a human a question and block until a response arrives or timeout.
+    pub async fn ask_human(
+        &self,
+        question: &str,
+        choices: Option<Vec<String>>,
+        timeout_secs: Option<u64>,
+    ) -> Result<HumanInteractionResponse> {
+        let timeout_secs = timeout_secs.unwrap_or(120);
+        let request = HumanInteractionRequest {
+            question: question.to_string(),
+            choices,
+            timeout_secs: Some(timeout_secs),
+        };
+
+        // Publish the request envelope
+        let token = mint_actor_token(
+            &self.agent_name,
+            &["workspace:read", "workspace:write"],
+            &self.inbound.context.session_id,
+            &self.signing_key,
+            crate::tokens::DEFAULT_TTL_SECS,
+        )?;
+        let env = self.inbound.child(
+            HUMAN_INTERACTION_REQUEST,
+            &self.agent_name,
+            self.port,
+            serde_json::to_value(&request)?,
+            None,
+            None,
+        );
+        let mut env = env;
+        env.security.actor_token = token;
+        let event_id = env.event_id.clone();
+
+        // Register the pending interaction before publishing
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self.pending_interactions.lock().await;
+            pending.insert(event_id.clone(), tx);
+        }
+
+        self.bus.publish(&env).await?;
+        info!(event_id = %event_id, "published human.interaction.request");
+
+        // Wait for response with timeout
+        let duration = std::time::Duration::from_secs(timeout_secs);
+        match tokio::time::timeout(duration, rx).await {
+            Ok(Ok(response)) => Ok(response),
+            _ => {
+                // Remove pending entry on timeout/channel drop
+                self.pending_interactions.lock().await.remove(&event_id);
+                Ok(HumanInteractionResponse {
+                    correlation_id: event_id,
+                    answer: "[timeout]".to_string(),
+                    responded_by: "system".to_string(),
+                })
+            }
+        }
     }
 }
 

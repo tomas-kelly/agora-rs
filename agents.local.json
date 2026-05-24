@@ -4,7 +4,7 @@
   "pidDir": ".agora/pids",
   "logDir": ".agora/logs",
   "nats": {
-    "command": "nats-server -js -p 4222",
+    "command": "nats-server -js -p 4222 -sd .agora/nats",
     "log_file": ".agora/logs/nats.log"
   },
   "telemetry": {

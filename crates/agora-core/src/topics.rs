@@ -15,10 +15,17 @@ pub const SECURITY_SCAN_CLEAN: &str = "security.scan.clean";
 
 // Human-in-the-loop
 pub const HUMAN_INTERACTION_REQUEST: &str = "human.interaction.request";
+pub const HUMAN_INTERACTION_RESPONSE: &str = "human.interaction.response";
 
 // Session metadata
 pub const SESSION_NAMED: &str = "session.named";
 pub const SESSION_DELETED: &str = "session.deleted";
+pub const SESSION_TAGGED: &str = "session.tagged";
+pub const SESSION_UNTAGGED: &str = "session.untagged";
+
+// Event bookmarks
+pub const EVENT_BOOKMARKED: &str = "event.bookmarked";
+pub const EVENT_UNBOOKMARKED: &str = "event.unbookmarked";
 
 // JetStream
 pub const EVENT_STREAM: &str = "AGORA_EVENTS";

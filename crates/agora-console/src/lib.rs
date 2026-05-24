@@ -13,7 +13,7 @@ use agora_core::{
     envelope::Envelope,
     manifest::AgentManifest,
     tokens::load_signing_key,
-    topics::{AGENT_REGISTRY_HEARTBEAT, AGENT_TELEMETRY_LOGS},
+    topics::{AGENT_REGISTRY_HEARTBEAT, AGENT_TELEMETRY_LOGS, EVENT_STREAM_SUBJECTS},
 };
 use anyhow::{Context, Result};
 use app::{App, AppEvent, InputMode, Panel, PendingAction, TelemetryEntry};
@@ -282,9 +282,13 @@ async fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool> {
         }
         KeyCode::Char('j') if ctrl => app.push_input_newline(),
         KeyCode::Enter => {
-            let text = std::mem::take(&mut app.input);
-            app.reset_input_scroll();
-            app.submit(text).await?;
+            if app.input.trim().is_empty() && app.command_output.is_none() {
+                app.open_selected_event();
+            } else {
+                let text = std::mem::take(&mut app.input);
+                app.reset_input_scroll();
+                app.submit(text).await?;
+            }
         }
         KeyCode::Backspace => {
             app.pop_input_char();
@@ -292,23 +296,31 @@ async fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool> {
         KeyCode::PageUp => {
             if app.command_output.is_some() {
                 app.scroll_output(-5);
+            } else if app.full_event_details_open() {
+                app.scroll_output(-5);
             } else if app.input_overflows() || app.input_scroll > 0 {
                 app.scroll_input(-5);
             } else {
-                for _ in 0..5 {
-                    app.scroll_up();
-                }
+                app.page_events_up();
             }
         }
         KeyCode::PageDown => {
             if app.command_output.is_some() {
                 app.scroll_output(5);
+            } else if app.full_event_details_open() {
+                app.scroll_output(5);
             } else if app.input_overflows() || app.input_scroll > 0 {
                 app.scroll_input(5);
             } else {
-                for _ in 0..5 {
-                    app.scroll_down();
-                }
+                app.page_events_down();
+            }
+        }
+        KeyCode::Left => {
+            app.collapse_event_details();
+        }
+        KeyCode::Right => {
+            if app.input.trim().is_empty() {
+                app.expand_event_details();
             }
         }
         KeyCode::Up => app.scroll_up(),
@@ -333,6 +345,8 @@ fn handle_mouse(m: MouseEvent, app: &mut App) {
                 app.scroll_input(-2);
             } else if app.command_output.is_some() {
                 app.scroll_output(-2);
+            } else if app.full_event_details_open() {
+                app.scroll_output(-2);
             } else {
                 app.scroll_up();
                 app.scroll_up();
@@ -342,6 +356,8 @@ fn handle_mouse(m: MouseEvent, app: &mut App) {
             if app.mouse_over_input(m.row) && (app.input_overflows() || app.input_scroll > 0) {
                 app.scroll_input(2);
             } else if app.command_output.is_some() {
+                app.scroll_output(2);
+            } else if app.full_event_details_open() {
                 app.scroll_output(2);
             } else {
                 app.scroll_down();
@@ -353,18 +369,7 @@ fn handle_mouse(m: MouseEvent, app: &mut App) {
 }
 
 fn spawn_subscribers(bus: Arc<Bus>, tx: mpsc::Sender<AppEvent>) {
-    let app_subjects = [
-        "workspace.>",
-        "code.>",
-        "test.>",
-        "security.>",
-        "human.>",
-        "agent.inbox.>",
-        "event.>",
-        "session.>",
-    ];
-
-    for subj in app_subjects {
+    for subj in live_event_subjects() {
         let client = bus.client.clone();
         let tx = tx.clone();
         let s = subj.to_string();
@@ -418,4 +423,19 @@ fn spawn_subscribers(bus: Arc<Bus>, tx: mpsc::Sender<AppEvent>) {
             }
         }
     });
+}
+
+fn live_event_subjects() -> &'static [&'static str] {
+    EVENT_STREAM_SUBJECTS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn console_live_subjects_match_event_stream() {
+        assert_eq!(live_event_subjects(), EVENT_STREAM_SUBJECTS);
+        assert!(live_event_subjects().contains(&"product.>"));
+    }
 }

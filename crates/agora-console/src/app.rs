@@ -1,9 +1,14 @@
 use agora_core::{
+    bookmark::validate_bookmark_label,
     bus::Bus,
     envelope::Envelope,
+    human::HumanInteractionRequest,
     manifest::AgentManifest,
     tokens::mint_actor_token,
-    topics::{direct_inbox_topic, SESSION_DELETED, SESSION_NAMED, WORKSPACE_IDEA_SUBMITTED},
+    topics::{
+        direct_inbox_topic, EVENT_BOOKMARKED, EVENT_UNBOOKMARKED, HUMAN_INTERACTION_REQUEST,
+        HUMAN_INTERACTION_RESPONSE, SESSION_DELETED, SESSION_NAMED, WORKSPACE_IDEA_SUBMITTED,
+    },
 };
 use anyhow::Result;
 use serde::Deserialize;
@@ -14,6 +19,30 @@ use std::{
 
 const MAX_EVENTS: usize = 500;
 const MAX_TELEMETRY: usize = 2000;
+
+// Local constants until agora-core exposes these (backend task B3)
+const SESSION_TAGGED: &str = "session.tagged";
+const SESSION_UNTAGGED: &str = "session.untagged";
+const MAX_TAGS_PER_SESSION: usize = 10;
+
+fn validate_tag(input: &str) -> Option<String> {
+    let tag = input.trim().to_lowercase();
+    if tag.is_empty() || tag.len() > 64 {
+        return None;
+    }
+    let bytes = tag.as_bytes();
+    if !bytes[0].is_ascii_alphanumeric() {
+        return None;
+    }
+    if tag
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+    {
+        Some(tag)
+    } else {
+        None
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TelemetryEntry {
@@ -59,6 +88,7 @@ pub struct SessionInfo {
     pub event_count: usize,
     pub deleted: bool,
     pub deleted_at: Option<String>,
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +173,9 @@ pub struct App {
     pub rename_target: Option<String>,
 
     pub events: Vec<Envelope>,
+    pub selected_event: Option<usize>,
+    pub inspected_event: Option<usize>,
+    pub full_event_details: bool,
     pub telemetry: Vec<TelemetryEntry>,
     pub sessions: BTreeMap<String, SessionInfo>,
     pub session_names: HashMap<String, String>,
@@ -171,6 +204,9 @@ pub struct App {
     pub auto_scroll: bool,
     pub panels: PanelVisibility,
 
+    pub tag_filter: Option<String>,
+    pub bookmarks: HashMap<String, Option<String>>,
+    pub pending_requests: Vec<(String, HumanInteractionRequest, String)>,
     pub pending_action: Option<PendingAction>,
 }
 
@@ -182,6 +218,9 @@ impl App {
             mode: InputMode::Normal,
             rename_target: None,
             events: Vec::new(),
+            selected_event: None,
+            inspected_event: None,
+            full_event_details: false,
             telemetry: Vec::new(),
             sessions: BTreeMap::new(),
             session_names: HashMap::new(),
@@ -203,6 +242,8 @@ impl App {
             events_view_height: 1,
             auto_scroll: true,
             panels: PanelVisibility::default(),
+            tag_filter: None,
+            bookmarks: HashMap::new(),
             pending_action: None,
         }
     }
@@ -214,12 +255,44 @@ impl App {
         len.saturating_sub(self.events_view_height)
     }
 
+    pub fn sync_events_viewport(&mut self, height: u16) {
+        self.events_view_height = height.max(1);
+        self.clamp_event_selection();
+        self.ensure_selected_event_visible();
+    }
+
+    pub fn selected_event_index(&self) -> Option<usize> {
+        self.selected_event.filter(|idx| *idx < self.events.len())
+    }
+
+    pub fn selected_event_with_index(&self) -> Option<(usize, &Envelope)> {
+        let idx = self.selected_event_index()?;
+        self.events.get(idx).map(|event| (idx, event))
+    }
+
+    pub fn inspected_event_index(&self) -> Option<usize> {
+        self.inspected_event.filter(|idx| *idx < self.events.len())
+    }
+
+    pub fn inspected_event_with_index(&self) -> Option<(usize, &Envelope)> {
+        let idx = self.inspected_event_index()?;
+        self.events.get(idx).map(|event| (idx, event))
+    }
+
+    pub fn event_details_open(&self) -> bool {
+        self.inspected_event_index().is_some()
+    }
+
+    pub fn full_event_details_open(&self) -> bool {
+        self.full_event_details && self.event_details_open() && self.command_output.is_none()
+    }
+
     pub fn take_pending_action(&mut self) -> Option<PendingAction> {
         self.pending_action.take()
     }
 
     pub fn scroll_output(&mut self, delta: i32) {
-        if self.command_output.is_none() {
+        if self.command_output.is_none() && !self.full_event_details_open() {
             return;
         }
         if delta < 0 {
@@ -283,6 +356,11 @@ impl App {
         if self.command_output.is_some() {
             self.command_output = None;
             true
+        } else if self.inspected_event.is_some() {
+            self.inspected_event = None;
+            self.full_event_details = false;
+            self.output_scroll = 0;
+            true
         } else {
             false
         }
@@ -293,6 +371,53 @@ impl App {
             .input_visual_lines
             .saturating_sub(self.input_view_height);
         self.input_scroll = self.input_scroll.min(max_scroll);
+    }
+
+    fn clamp_event_selection(&mut self) {
+        if self.events.is_empty() {
+            self.selected_event = None;
+            self.events_scroll = 0;
+            self.auto_scroll = true;
+            return;
+        }
+
+        if let Some(idx) = self.selected_event {
+            let last = self.events.len() - 1;
+            self.selected_event = Some(idx.min(last));
+        }
+        if let Some(idx) = self.inspected_event {
+            let last = self.events.len() - 1;
+            self.inspected_event = Some(idx.min(last));
+        }
+        if self.inspected_event.is_none() {
+            self.full_event_details = false;
+        }
+        self.events_scroll = self.events_scroll.min(self.max_events_scroll());
+    }
+
+    fn ensure_selected_event_visible(&mut self) {
+        self.clamp_event_selection();
+        let Some(idx) = self.selected_event else {
+            return;
+        };
+
+        let len = self.events.len();
+        let height = self.events_view_height.max(1) as usize;
+        let max_scroll = len.saturating_sub(height);
+        let scroll = (self.events_scroll as usize).min(max_scroll);
+        let end = len.saturating_sub(scroll);
+        let start = end.saturating_sub(height);
+
+        if idx < start {
+            let desired_end = (idx + height).min(len);
+            self.events_scroll = len.saturating_sub(desired_end) as u16;
+        } else if idx >= end {
+            self.events_scroll = len.saturating_sub(idx + 1) as u16;
+        } else {
+            self.events_scroll = scroll as u16;
+        }
+
+        self.events_scroll = self.events_scroll.min(self.max_events_scroll());
     }
 
     pub fn display_name(&self, session_id: &str) -> String {
@@ -347,6 +472,7 @@ impl App {
                         event_count: 0,
                         deleted: false,
                         deleted_at: None,
+                        tags: Vec::new(),
                     });
             }
             return;
@@ -364,11 +490,67 @@ impl App {
                     event_count: 0,
                     deleted: false,
                     deleted_at: None,
+                    tags: Vec::new(),
                 });
             session.deleted = true;
             session.deleted_at = Some(env.timestamp.clone());
             if self.active_session.as_deref() == Some(sid.as_str()) {
                 self.active_session = None;
+            }
+            return;
+        }
+
+        if env.topic == SESSION_TAGGED {
+            if let Some(tag) = env.data.get("tag").and_then(|v| v.as_str()) {
+                if let Some(tag) = validate_tag(tag) {
+                    let sid = env.context.session_id.clone();
+                    let session = self
+                        .sessions
+                        .entry(sid.clone())
+                        .or_insert_with(|| SessionInfo {
+                            session_id: sid,
+                            started_at: env.timestamp.clone(),
+                            last_topic: String::new(),
+                            event_count: 0,
+                            deleted: false,
+                            deleted_at: None,
+                            tags: Vec::new(),
+                        });
+                    if !session.tags.contains(&tag) && session.tags.len() < MAX_TAGS_PER_SESSION {
+                        session.tags.push(tag);
+                    }
+                }
+            }
+            return;
+        }
+
+        if env.topic == SESSION_UNTAGGED {
+            if let Some(tag) = env.data.get("tag").and_then(|v| v.as_str()) {
+                if let Some(tag) = validate_tag(tag) {
+                    let sid = env.context.session_id.clone();
+                    if let Some(session) = self.sessions.get_mut(&sid) {
+                        session.tags.retain(|t| t != &tag);
+                    }
+                }
+            }
+            return;
+        }
+
+        if env.topic == EVENT_BOOKMARKED {
+            if let Some(target) = env.data.get("targetEventId").and_then(|v| v.as_str()) {
+                let label = env
+                    .data
+                    .get("label")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                self.bookmarks.insert(target.to_string(), label);
+            }
+            return;
+        }
+
+        if env.topic == EVENT_UNBOOKMARKED {
+            if let Some(target) = env.data.get("targetEventId").and_then(|v| v.as_str()) {
+                self.bookmarks.remove(target);
             }
             return;
         }
@@ -385,14 +567,38 @@ impl App {
                 event_count: 0,
                 deleted: false,
                 deleted_at: None,
+                tags: Vec::new(),
             });
         session.last_topic = topic;
         session.event_count += 1;
 
+        let was_following = self.auto_scroll || self.selected_event.is_none();
         self.events.push(env);
+        if !was_following {
+            self.events_scroll = self.events_scroll.saturating_add(1);
+        }
+
         if self.events.len() > MAX_EVENTS {
             let excess = self.events.len() - MAX_EVENTS;
             self.events.drain(0..excess);
+            if let Some(idx) = self.selected_event {
+                self.selected_event = idx.checked_sub(excess);
+            }
+            if let Some(idx) = self.inspected_event {
+                self.inspected_event = idx.checked_sub(excess);
+            }
+            if self.inspected_event.is_none() {
+                self.full_event_details = false;
+            }
+        }
+
+        if was_following {
+            self.selected_event = None;
+            self.events_scroll = 0;
+            self.auto_scroll = true;
+        } else {
+            self.clamp_event_selection();
+            self.ensure_selected_event_visible();
         }
     }
 
@@ -472,6 +678,7 @@ impl App {
                 event_count: 0,
                 deleted: false,
                 deleted_at: None,
+                tags: Vec::new(),
             },
         );
         self.session_names
@@ -568,29 +775,113 @@ impl App {
     }
 
     pub fn scroll_up(&mut self) {
-        let max = self.max_events_scroll();
-        if self.events_scroll >= max {
-            // Already showing the oldest event at the top — nothing further
-            // back to scroll to. Keep auto_scroll false (user is reviewing
-            // history) but don't push the view off the top.
-            self.events_scroll = max;
-            self.auto_scroll = max == 0;
-            return;
-        }
-        self.auto_scroll = false;
-        self.events_scroll = (self.events_scroll + 1).min(max);
+        self.select_event_delta(-1);
     }
 
     pub fn scroll_down(&mut self) {
-        self.events_scroll = self.events_scroll.saturating_sub(1);
-        if self.events_scroll == 0 {
-            self.auto_scroll = true;
+        self.select_event_delta(1);
+    }
+
+    pub fn page_events_up(&mut self) {
+        self.select_event_delta(-5);
+    }
+
+    pub fn page_events_down(&mut self) {
+        self.select_event_delta(5);
+    }
+
+    fn select_event_delta(&mut self, delta: i32) {
+        if self.events.is_empty() {
+            return;
         }
+        self.clamp_event_selection();
+        let last = self.events.len() - 1;
+        let idx = match self.selected_event {
+            Some(idx) => idx,
+            None if delta < 0 => self.events.len(),
+            None => last,
+        };
+        let next = if delta < 0 {
+            idx.saturating_sub((-delta) as usize)
+        } else {
+            idx.saturating_add(delta as usize).min(last)
+        };
+        self.selected_event = Some(next);
+        self.auto_scroll = false;
+        self.ensure_selected_event_visible();
+        self.status_msg = Some(format!(
+            "Selected event {}/{} · empty Enter opens inspector",
+            next + 1,
+            self.events.len()
+        ));
     }
 
     pub fn end_scroll(&mut self) {
+        self.selected_event = None;
+        self.inspected_event = None;
+        self.full_event_details = false;
+        self.output_scroll = 0;
         self.events_scroll = 0;
         self.auto_scroll = true;
+        if self.events.is_empty() {
+            self.status_msg = Some("Following live tail".into());
+        } else {
+            self.status_msg = Some(format!(
+                "Following live tail after event {}",
+                self.events.len()
+            ));
+        }
+    }
+
+    pub fn open_selected_event(&mut self) {
+        let Some((idx, _event)) = self.selected_event_with_index() else {
+            self.status_msg = Some("No event selected.".into());
+            return;
+        };
+        self.command_output = None;
+        self.output_scroll = 0;
+        self.inspected_event = Some(idx);
+        self.full_event_details = false;
+        self.panels.detail = true;
+        self.status_msg = Some(format!(
+            "Inspecting event {}/{} · Right expands · Esc hides inspector",
+            idx + 1,
+            self.events.len(),
+        ));
+    }
+
+    pub fn expand_event_details(&mut self) {
+        if self.command_output.is_some() {
+            return;
+        }
+        if self.inspected_event.is_none() {
+            self.open_selected_event();
+        }
+        if self.inspected_event.is_some() {
+            self.full_event_details = true;
+            self.output_scroll = 0;
+            self.panels.detail = true;
+            self.status_msg = Some("Full event details · Left collapses · Esc closes".into());
+        }
+    }
+
+    pub fn collapse_event_details(&mut self) -> bool {
+        if self.command_output.is_some() {
+            return false;
+        }
+        if self.full_event_details {
+            self.full_event_details = false;
+            self.output_scroll = 0;
+            self.status_msg = Some("Compact event inspector".into());
+            return true;
+        }
+        if self.inspected_event.is_some() {
+            self.inspected_event = None;
+            self.output_scroll = 0;
+            self.status_msg = Some("Closed event inspector".into());
+            return true;
+        }
+        false
     }
 
     pub fn toggle_panel(&mut self, panel: Panel) {
@@ -645,15 +936,17 @@ impl App {
             "new" => self.cmd_new(rest).await,
             "rename" => self.cmd_rename(rest).await,
             "delete" | "del" => self.cmd_delete(rest).await,
+            "tag" => self.cmd_tag(rest).await,
+            "untag" => self.cmd_untag(rest).await,
+            "filter" => self.cmd_filter(rest),
+            "bookmark" | "bm" => self.cmd_bookmark(rest).await,
+            "unbookmark" | "ubm" => self.cmd_unbookmark(rest).await,
+            "bookmarks" => self.cmd_bookmarks(),
             "agents" => self.cmd_agents(),
             "status" => self.cmd_status(rest),
             "history" => self.cmd_history(rest),
             "panel" | "panels" | "toggle" => self.cmd_panel(rest),
-            "clear" => {
-                self.command_output = None;
-                self.output_scroll = 0;
-            }
-            "reset" => self.cmd_reset(),
+            "clear" => self.cmd_clear(),
             "copy" => self.cmd_copy(),
             "editor" => self.cmd_editor(),
             "page" => self.cmd_page(),
@@ -666,27 +959,31 @@ impl App {
         Ok(())
     }
 
-    fn cmd_reset(&mut self) {
+    fn cmd_clear(&mut self) {
         let n_events = self.events.len();
         let n_tel = self.telemetry.len();
         self.events.clear();
+        self.selected_event = None;
+        self.inspected_event = None;
+        self.full_event_details = false;
         self.telemetry.clear();
-        self.sessions.clear();
-        // Keep session_names + agents — they're persistent metadata.
+        // Keep sessions, session_names, active session, and agents. Clear is a
+        // local event/telemetry clear, not a metadata wipe.
         self.events_scroll = 0;
         self.auto_scroll = true;
         self.command_output = None;
         self.output_scroll = 0;
         self.status_msg = Some(format!(
-            "Reset view ({n_events} events, {n_tel} telemetry cleared)"
+            "Cleared view ({n_events} events, {n_tel} telemetry cleared; sessions kept)"
         ));
     }
 
     fn cmd_copy(&mut self) {
-        let text = self
-            .command_output
-            .clone()
-            .or_else(|| self.events.last().map(format_event_for_clipboard));
+        let text = self.command_output.clone().or_else(|| {
+            self.inspected_event_with_index()
+                .or_else(|| self.selected_event_with_index())
+                .map(|(_, event)| format_event_for_clipboard(event))
+        });
         let Some(text) = text else {
             self.status_msg = Some("Nothing to copy.".into());
             return;
@@ -713,6 +1010,8 @@ impl App {
 
     fn set_output(&mut self, text: String) {
         self.panels.detail = true;
+        self.inspected_event = None;
+        self.full_event_details = false;
         self.command_output = Some(text);
         self.output_scroll = 0;
     }
@@ -723,15 +1022,17 @@ impl App {
              \x20\x20!new [name]            Create new session (prompts if name omitted)\n\
              \x20\x20!rename [name]         Rename active session\n\
              \x20\x20!delete [session]      Hide a session from lists; history is retained\n\
+             \x20\x20!tag <label>           Tag active session (max 10 tags)\n\
+             \x20\x20!untag <label>         Remove tag from active session\n\
+             \x20\x20!filter [tag]          Filter sessions pane by tag (no arg clears)\n\
              \x20\x20!agents                Agents seen in active session\n\
              \x20\x20!status <agent>        Agent's manifest + activity in active session\n\
              \x20\x20!history <agent>       Full conversation: received · prompts · responses · published\n\
              \x20\x20!panel <name>          Toggle sessions, events, agents, detail, or all\n\
-             \x20\x20!copy                  Copy command output (or latest event) to clipboard\n\
+             \x20\x20!copy                  Copy command output (or selected event) to clipboard\n\
              \x20\x20!editor                Compose input in $EDITOR (for long ideas / multi-line)\n\
              \x20\x20!page                  Open command output in $PAGER (for long !history)\n\
-             \x20\x20!reset                 Clear local events/telemetry/sessions view\n\
-             \x20\x20!clear                 Dismiss this panel\n\
+             \x20\x20!clear                 Clear local events/telemetry; keep sessions\n\
              \x20\x20!exit | !quit          Quit (same as Esc)\n\
              \n\
              DIRECT MESSAGES:\n\
@@ -741,7 +1042,7 @@ impl App {
              \n\
              Plain text is published as workspace.idea.submitted.\n\
              \n\
-             KEYS:  Ctrl-N/R/X · F1/F2/F3/F4 panels · Tab/Shift-Tab · ↑/↓/End for events\n\
+             KEYS:  Ctrl-N/R/X · F1/F2/F3/F4 panels · Tab/Shift-Tab · ↑/↓ select events · empty Enter inspects · ←/→ collapse/expand details\n\
              \x20\x20\x20\x20\x20\x20Shift+Enter or Alt+Enter inserts a newline\n\
              \x20\x20\x20\x20\x20\x20PgUp/PgDn scroll long drafts or this panel · wheel over the composer scrolls it · Esc to dismiss"
             .to_string();
@@ -815,6 +1116,177 @@ impl App {
             }
         };
         self.delete_session(&sid).await;
+    }
+
+    async fn cmd_tag(&mut self, rest: &str) {
+        let label = rest.trim();
+        if label.is_empty() {
+            self.status_msg = Some("Usage: !tag <label>".into());
+            return;
+        }
+        let Some(tag) = validate_tag(label) else {
+            self.status_msg = Some(format!(
+                "Invalid tag: {label} (lowercase alphanumeric, dashes, underscores, max 64)"
+            ));
+            return;
+        };
+        let Some(sid) = self.active_session.clone() else {
+            self.status_msg = Some("No active session. Use !new first.".into());
+            return;
+        };
+        if let Err(e) = self.publish_session_tag(&sid, &tag).await {
+            self.status_msg = Some(format!("Tag broadcast failed: {e}"));
+        } else {
+            self.status_msg = Some(format!("Tagged session with [{tag}]"));
+        }
+    }
+
+    async fn cmd_untag(&mut self, rest: &str) {
+        let label = rest.trim();
+        if label.is_empty() {
+            self.status_msg = Some("Usage: !untag <label>".into());
+            return;
+        }
+        let Some(tag) = validate_tag(label) else {
+            self.status_msg = Some(format!("Invalid tag: {label}"));
+            return;
+        };
+        let Some(sid) = self.active_session.clone() else {
+            self.status_msg = Some("No active session.".into());
+            return;
+        };
+        if let Err(e) = self.publish_session_untag(&sid, &tag).await {
+            self.status_msg = Some(format!("Untag broadcast failed: {e}"));
+        } else {
+            self.status_msg = Some(format!("Removed tag [{tag}]"));
+        }
+    }
+
+    fn cmd_filter(&mut self, rest: &str) {
+        let label = rest.trim();
+        if label.is_empty() {
+            self.tag_filter = None;
+            self.status_msg = Some("Tag filter cleared — showing all sessions".into());
+            return;
+        }
+        match validate_tag(label) {
+            Some(tag) => {
+                self.tag_filter = Some(tag.clone());
+                self.status_msg = Some(format!("Filtering sessions by tag [{tag}]"));
+            }
+            None => {
+                self.status_msg = Some(format!("Invalid tag: {label}"));
+            }
+        }
+    }
+
+    async fn cmd_bookmark(&mut self, rest: &str) {
+        let Some(sid) = self.active_session.clone() else {
+            self.status_msg = Some("No active session.".into());
+            return;
+        };
+        let Some((idx, event)) = self.selected_event_with_index() else {
+            self.status_msg = Some("Select an event first (↑/↓).".into());
+            return;
+        };
+        let label = if rest.is_empty() {
+            None
+        } else {
+            match validate_bookmark_label(rest) {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    self.status_msg = Some(format!("Invalid label: {e}"));
+                    return;
+                }
+            }
+        };
+        let target_id = event.event_id.clone();
+        let token = match mint_actor_token(
+            "console-user",
+            &["workspace:read", "workspace:write"],
+            &sid,
+            &self.signing_key,
+            900,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                self.status_msg = Some(format!("Token error: {e}"));
+                return;
+            }
+        };
+        let env = Envelope::build(
+            EVENT_BOOKMARKED,
+            "agora-console",
+            0,
+            token,
+            sid,
+            serde_json::json!({
+                "targetEventId": target_id,
+                "label": label,
+                "actor": "agora-console",
+            }),
+            None,
+            vec![],
+        );
+        match self.bus.publish(&env).await {
+            Ok(()) => self.status_msg = Some(format!("Bookmarked event {}", idx + 1)),
+            Err(e) => self.status_msg = Some(format!("Bookmark failed: {e}")),
+        }
+    }
+
+    async fn cmd_unbookmark(&mut self, _rest: &str) {
+        let Some((idx, event)) = self.selected_event_with_index() else {
+            self.status_msg = Some("Select an event first (↑/↓).".into());
+            return;
+        };
+        let sid = self
+            .active_session
+            .clone()
+            .unwrap_or_else(|| event.context.session_id.clone());
+        let target_id = event.event_id.clone();
+        let token = match mint_actor_token(
+            "console-user",
+            &["workspace:read", "workspace:write"],
+            &sid,
+            &self.signing_key,
+            900,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                self.status_msg = Some(format!("Token error: {e}"));
+                return;
+            }
+        };
+        let env = Envelope::build(
+            EVENT_UNBOOKMARKED,
+            "agora-console",
+            0,
+            token,
+            sid,
+            serde_json::json!({
+                "targetEventId": target_id,
+                "actor": "agora-console",
+            }),
+            None,
+            vec![],
+        );
+        match self.bus.publish(&env).await {
+            Ok(()) => self.status_msg = Some(format!("Unbookmarked event {}", idx + 1)),
+            Err(e) => self.status_msg = Some(format!("Unbookmark failed: {e}")),
+        }
+    }
+
+    fn cmd_bookmarks(&mut self) {
+        if self.bookmarks.is_empty() {
+            self.status_msg = Some("No bookmarks yet.".into());
+            return;
+        }
+        let mut out = format!("Bookmarks ({}):\n\n", self.bookmarks.len());
+        for (event_id, label) in &self.bookmarks {
+            let label_str = label.as_deref().unwrap_or("(no label)");
+            out.push_str(&format!("  {} · {}\n", short_id(event_id, 24), label_str));
+        }
+        self.set_output(out);
     }
 
     fn cmd_agents(&mut self) {
@@ -1146,6 +1618,48 @@ impl App {
             token,
             session_id,
             serde_json::json!({ "sessionId": session_id, "deletedBy": "agora-console" }),
+            None,
+            vec![],
+        );
+        self.bus.publish(&env).await
+    }
+
+    async fn publish_session_tag(&self, session_id: &str, tag: &str) -> Result<()> {
+        let token = mint_actor_token(
+            "console-user",
+            &["workspace:read", "workspace:write"],
+            session_id,
+            &self.signing_key,
+            900,
+        )?;
+        let env = Envelope::build(
+            SESSION_TAGGED,
+            "agora-console",
+            0,
+            token,
+            session_id,
+            serde_json::json!({ "tag": tag, "actor": "agora-console" }),
+            None,
+            vec![],
+        );
+        self.bus.publish(&env).await
+    }
+
+    async fn publish_session_untag(&self, session_id: &str, tag: &str) -> Result<()> {
+        let token = mint_actor_token(
+            "console-user",
+            &["workspace:read", "workspace:write"],
+            session_id,
+            &self.signing_key,
+            900,
+        )?;
+        let env = Envelope::build(
+            SESSION_UNTAGGED,
+            "agora-console",
+            0,
+            token,
+            session_id,
+            serde_json::json!({ "tag": tag, "actor": "agora-console" }),
             None,
             vec![],
         );

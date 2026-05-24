@@ -240,26 +240,28 @@ cargo run -p agora -- system stats
 
 ```
  agora console │ nats://127.0.0.1:4222 │ events:24 sessions:2 agents:6 │ Submitted idea to "Task manager"
-┌─ Sessions (2) ─────────────┬─ Events ───────────────────────────────────────┬─ Agents (6) ─────────────────┐
-│ ▶ Task manager             │ 10:00:01  workspace.idea.submitted   sess_01J… │ ● product-manager            │
-│   workspace.idea… · 8 evts │ 10:00:04  product.requirements…      sess_01J… │    :4001 · product           │
-│   Chess engine             │ 10:00:09  workspace.design…          sess_01J… │ ● system-architect           │
-│   test.passed · 11 evts    │ 10:00:13  code.changed               sess_01J… │    :4002 · architecture      │
-│                            │ 10:00:14  code.changed               sess_01J… │ ◐ backend-coder              │
-│                            │ 10:00:17  test.failed                sess_01J… │    :4003 · backend, rust     │
-│                            │ 10:00:18  security.scan.clean        sess_01J… │ ◐ frontend-coder             │
-│                            │ 10:00:21  code.changed               sess_01J… │    :4004 · frontend, tui     │
-│                            │ 10:00:24  test.passed                sess_01J… │ ● quality-assurance          │
-│                            │                                                │    :4005 · testing           │
-│                            │                                                │ ● security-engineer          │
-│                            │                                                │    :4006 · security-audit    │
-├─ Latest event ─────────────┴────────────────────────────────────────────────┴──────────────────────────────┤
+┌─ Sessions (2) ─────────────┬─ Events ──────────────────────────────────────────────────────────────────────┐
+│ ▶ Task manager             │ 10:00:01  workspace.idea.submitted   sess_01J…                               │
+│   workspace.idea… · 8 evts │ 10:00:04  product.requirements…      sess_01J…                               │
+│   Chess engine             │ 10:00:09  workspace.design…          sess_01J…                               │
+│   test.passed · 11 evts    │ 10:00:13  code.changed               sess_01J…                               │
+├─ Agents (6) ───────────────┤ 10:00:14  code.changed               sess_01J…                               │
+│ ● product-manager          │ 10:00:17  test.failed                sess_01J…                               │
+│    :4001 · product         │ 10:00:18  security.scan.clean        sess_01J…                               │
+│ ● system-architect         │ 10:00:21  code.changed               sess_01J…                               │
+│    :4002 · architecture    │ 10:00:24  test.passed                sess_01J…                               │
+│ ◐ backend-coder            │                                                                            │
+│    :4003 · backend, rust   │                                                                            │
+└────────────────────────────┴──────────────────────────────────────────────────────────────────────────────┘
+┌─ Event inspector (24/24) · Right expands · Esc closes ─────────────────────────────────────────────────────┐
 │ topic:   test.passed                                                                                       │
 │ event:   evt_01J5ZT9VYC9X7HE8GZ8RVKDM3X                                                                    │
+│ time:    2026-05-24T10:00:24Z                                                                              │
 │ session: Task manager  (sess_01J5ZT…)                                                                      │
 │ from:    quality-assurance                                                                                 │
 │ data:    { "summary": "All tests passing", "passedTests": ["api", "ui_render", "task_crud"] }              │
-├─ Compose · active: Task manager ───────────────────────────────────────────────────────────────────────────┤
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌─ Compose · active: Task manager ───────────────────────────────────────────────────────────────────────────┐
 │ ›  Build a collaborative editor with offline support, conflict resolution,                                 │
 │    audit logging, and a minimal admin view.                                                                │
 │                                                                                                            │
@@ -274,12 +276,19 @@ cargo run -p agora -- system stats
 > `◐` busy, `◌` starting/stale, `◑` draining, `○` down.
 
 The composer is intentionally large enough for multi-line prompts. Long drafts
-scroll with PgUp/PgDn or with the mouse wheel over the composer. `!history
-backend-coder` replaces the **Latest event** pane with a scrollable conversation
-timeline — inbound events the agent received, prompts sent to Kiro, responses
-received, and outbound events published — all interleaved by timestamp.
-PgUp/PgDn or mouse-wheel scroll the output, `!page` dumps it into `$PAGER`,
-and `!copy` puts it on the clipboard.
+scroll with PgUp/PgDn or with the mouse wheel over the composer. The Events pane
+acts like a stream browser: `↑` / `↓` select an event without opening details.
+Press `Enter` with an empty composer to open the Event inspector for that
+selected event, `Right` expands it into the full event-details view, `Left`
+collapses/closes it, and `Esc` hides it. Live-tail mode has no inspector panel.
+`End` returns to the live tail and hides the inspector. Agents sit below
+Sessions in the left sidebar.
+
+`!history backend-coder` replaces the Event inspector with a scrollable
+conversation timeline — inbound events the agent received, prompts sent to Kiro,
+responses received, and outbound events published — all interleaved by
+timestamp. PgUp/PgDn or mouse-wheel scroll the output, `!page` dumps it into
+`$PAGER`, and `!copy` puts it on the clipboard.
 
 ### Console keys
 
@@ -295,11 +304,10 @@ and `!copy` puts it on the clipboard.
 | `!status <agent>` | Manifest + per-session activity for that agent |
 | `!history <agent>` | Full conversation timeline for that agent in the active session: events received, prompts sent to ACP, responses received, events published |
 | `!panel <name>` | Toggle `sessions`, `events`, `agents`, `detail`, or `all` panels |
-| `!copy` | Copy command output (or latest event detail) to system clipboard |
+| `!copy` | Copy command output (or selected event detail) to system clipboard |
 | `!editor` | Compose input in `$EDITOR` — drops the TUI, opens your editor with current input, returns when you save and quit |
 | `!page` | Open the command output panel in `$PAGER` (e.g. `less`) — useful for long `!history` results |
-| `!reset` | Clear the local events / telemetry / sessions view (keeps known agents and session names) |
-| `!clear` | Dismiss the command output panel |
+| `!clear` | Clear local events and telemetry from the console view; keep sessions, session names, active session, and known agents |
 | `!exit` / `!quit` | Quit (same as Esc) |
 
 **Submitting work**
@@ -320,12 +328,14 @@ and `!copy` puts it on the clipboard.
 | `Tab` | If input starts with `@<prefix>`, autocomplete the agent name; otherwise cycle which session is active |
 | `Shift-Tab` | Cycle active session backwards |
 | `Shift+Enter` / `Alt+Enter` / `Ctrl+J` | Insert a newline (the input box grows) |
-| `↑` / `↓` | Scroll events pane by 1 line (pauses auto-scroll) |
-| `PgUp` / `PgDn` | Scroll the command output panel, or a long draft in the composer, otherwise events by 5 lines |
-| Mouse wheel | Scrolls the composer when the pointer is over a long draft; otherwise scrolls command output or events |
+| `Enter` with empty composer | Open the Event inspector for the selected event |
+| `←` / `→` | Collapse or expand the Event inspector into full event details |
+| `↑` / `↓` | Select the previous / next event in the stream |
+| `PgUp` / `PgDn` | Scroll command output, full event details, or a long draft; otherwise select events by 5 lines |
+| Mouse wheel | Scrolls the composer when the pointer is over a long draft; otherwise scrolls command output, full details, or selects events |
 | `End` | Snap back to the live tail |
 | `Esc` (in modal) | Cancel naming/renaming |
-| `Esc` (normal mode, with command output) | Dismiss the output panel |
+| `Esc` (normal mode, with command output/details) | Dismiss the output or Event inspector panel |
 | `Esc` / `q` / `Ctrl-C` (otherwise) | Quit |
 
 ### Debugging an agent
@@ -426,6 +436,7 @@ Runtime files live under `.agora/`:
 | `.agora/pids/` | Supervisor, service, and agent pid files used by `ps`, `stop`, and `restart`. |
 | `.agora/logs/*.log` | Process logs for the supervisor, NATS, telemetry, and each agent. |
 | `.agora/logs/telemetry.jsonl` | Raw agent telemetry, including prompts and ACP responses. |
+| `.agora/nats/` | Persistent NATS JetStream store for `AGORA_EVENTS`, consumers, and registry KV data. |
 
 If submit or console publish paths fail with a missing key error, rerun:
 
