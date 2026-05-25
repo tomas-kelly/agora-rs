@@ -2,8 +2,8 @@
 //!
 //! Connects to the NATS bus, subscribes to all application topics + the
 //! agent registry, and renders a multi-pane view (sessions / events /
-//! agents) with a composer at the bottom. Type an idea + Enter to publish
-//! `workspace.idea.submitted`, or `@agent <msg>` to send a direct message.
+//! agents) with a composer at the bottom. Type text + Enter to publish the
+//! configured submit event, or `@agent <msg>` to send a direct message.
 
 mod app;
 mod ui;
@@ -41,6 +41,12 @@ pub struct ConsoleArgs {
     bus_url: String,
     #[arg(long, default_value = ".kiro/session_token")]
     key_path: String,
+    /// Topic used when plain composer text is submitted
+    #[arg(long, default_value = "workspace.event.submitted")]
+    submit_topic: String,
+    /// Field used to wrap plain composer text into JSON
+    #[arg(long, default_value = "text")]
+    submit_field: String,
     /// Skip the JetStream replay on startup (start with an empty event list)
     #[arg(long)]
     no_replay: bool,
@@ -54,7 +60,13 @@ pub async fn run(args: ConsoleArgs) -> Result<()> {
     );
     let signing_key = load_signing_key(&args.key_path)?;
 
-    let mut app = App::new(bus.clone(), signing_key, args.bus_url.clone());
+    let mut app = App::new(
+        bus.clone(),
+        signing_key,
+        args.bus_url.clone(),
+        args.submit_topic.clone(),
+        args.submit_field.clone(),
+    );
 
     let (tx, mut rx) = mpsc::channel::<AppEvent>(256);
     spawn_subscribers(bus.clone(), tx.clone());
@@ -76,6 +88,7 @@ pub async fn run(args: ConsoleArgs) -> Result<()> {
                 for env in events {
                     app.handle_envelope(env);
                 }
+                app.select_default_session();
             }
             Err(e) => {
                 app.status_msg = Some(format!("Replay failed: {e}"));
@@ -294,9 +307,7 @@ async fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool> {
             app.pop_input_char();
         }
         KeyCode::PageUp => {
-            if app.command_output.is_some() {
-                app.scroll_output(-5);
-            } else if app.full_event_details_open() {
+            if app.command_output.is_some() || app.full_event_details_open() {
                 app.scroll_output(-5);
             } else if app.input_overflows() || app.input_scroll > 0 {
                 app.scroll_input(-5);
@@ -305,9 +316,7 @@ async fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool> {
             }
         }
         KeyCode::PageDown => {
-            if app.command_output.is_some() {
-                app.scroll_output(5);
-            } else if app.full_event_details_open() {
+            if app.command_output.is_some() || app.full_event_details_open() {
                 app.scroll_output(5);
             } else if app.input_overflows() || app.input_scroll > 0 {
                 app.scroll_input(5);
@@ -318,10 +327,8 @@ async fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool> {
         KeyCode::Left => {
             app.collapse_event_details();
         }
-        KeyCode::Right => {
-            if app.input.trim().is_empty() {
-                app.expand_event_details();
-            }
+        KeyCode::Right if app.input.trim().is_empty() => {
+            app.expand_event_details();
         }
         KeyCode::Up => app.scroll_up(),
         KeyCode::Down => app.scroll_down(),
@@ -343,9 +350,7 @@ fn handle_mouse(m: MouseEvent, app: &mut App) {
         MouseEventKind::ScrollUp => {
             if app.mouse_over_input(m.row) && (app.input_overflows() || app.input_scroll > 0) {
                 app.scroll_input(-2);
-            } else if app.command_output.is_some() {
-                app.scroll_output(-2);
-            } else if app.full_event_details_open() {
+            } else if app.command_output.is_some() || app.full_event_details_open() {
                 app.scroll_output(-2);
             } else {
                 app.scroll_up();
@@ -355,9 +360,7 @@ fn handle_mouse(m: MouseEvent, app: &mut App) {
         MouseEventKind::ScrollDown => {
             if app.mouse_over_input(m.row) && (app.input_overflows() || app.input_scroll > 0) {
                 app.scroll_input(2);
-            } else if app.command_output.is_some() {
-                app.scroll_output(2);
-            } else if app.full_event_details_open() {
+            } else if app.command_output.is_some() || app.full_event_details_open() {
                 app.scroll_output(2);
             } else {
                 app.scroll_down();
@@ -416,10 +419,22 @@ fn spawn_subscribers(bus: Arc<Bus>, tx: mpsc::Sender<AppEvent>) {
             Err(_) => return,
         };
         while let Some(msg) = sub.next().await {
-            if let Ok(entry) = serde_json::from_slice::<TelemetryEntry>(&msg.payload) {
-                if tx.send(AppEvent::Telemetry(entry)).await.is_err() {
-                    break;
-                }
+            // Telemetry is now an Envelope on JetStream — unwrap `data`
+            // to recover the legacy TelemetryEntry shape.
+            let entry = match agora_core::envelope::Envelope::from_bytes(&msg.payload) {
+                Ok(env) => match serde_json::from_value::<TelemetryEntry>(env.data) {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                },
+                // Fall back to legacy raw shape for messages from older agents
+                // still publishing via plain NATS.
+                Err(_) => match serde_json::from_slice::<TelemetryEntry>(&msg.payload) {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                },
+            };
+            if tx.send(AppEvent::Telemetry(entry)).await.is_err() {
+                break;
             }
         }
     });

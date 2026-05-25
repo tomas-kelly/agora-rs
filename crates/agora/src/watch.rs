@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn color_mapping_workspace_cyan() {
-        let env = test_envelope("workspace.idea.submitted");
+        let env = test_envelope("workspace.event.submitted");
         let output = format_watch_line(&env, true);
         assert!(output.contains("\x1b[36m"));
     }

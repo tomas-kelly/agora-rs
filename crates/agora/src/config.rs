@@ -309,10 +309,10 @@ mod tests {
                 "name": "t", {MINIMAL_NATS},
                 "agents": [
                     {{ "name": "a", "port": 1, "subscriptions": [
-                        {{ "topic": "workspace.idea.submitted", "required_scopes": ["x"], "prompt_template": "_" }}
+                        {{ "topic": "workspace.event.submitted", "required_scopes": ["x"], "prompt_template": "_" }}
                     ] }},
                     {{ "name": "b", "port": 2, "subscriptions": [
-                        {{ "topic": "workspace.idea.submitted", "required_scopes": ["y"], "prompt_template": "_" }}
+                        {{ "topic": "workspace.event.submitted", "required_scopes": ["y"], "prompt_template": "_" }}
                     ] }}
                 ]
             }}"#

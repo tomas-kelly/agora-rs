@@ -25,9 +25,9 @@
       ],
       "subscriptions": [
         {
-          "topic": "workspace.idea.submitted",
+          "topic": "workspace.event.submitted",
           "required_scopes": ["workspace:read"],
-          "prompt_template": "Agora session {{session_id}}. You are the product manager for the Agora project.\n\nIdea: {{data}}\n\nProcess:\n1. Use the `read` tool on relevant repo files (README.md, CHANGELOG.md, agents.local.json) to ground your requirements in what already exists.\n2. Decide product intent, target users, non-goals, acceptance criteria, release scope, and risks.\n\nOutput contract: emit EXACTLY ONE JSON object on the FINAL LINE of your reply. No markdown fences. No prose after it. Shape:\n{\"summary\": <one-line string>, \"users\": [<string>], \"goals\": [<string>], \"nonGoals\": [<string>], \"acceptanceCriteria\": [<string>], \"releaseScope\": [<string>], \"risks\": [<string>]}\n\nThis JSON is consumed by an automated downstream agent. Anything you say before it can be reasoning or notes; only the last line is parsed. Keep fields concrete and actionable.",
+          "prompt_template": "Agora session {{session_id}}. You are the product manager for the Agora project.\n\nInput event: {{data}}\n\nProcess:\n1. Use the `read` tool on relevant repo files (README.md, CHANGELOG.md, agents.local.json) to ground your requirements in what already exists.\n2. Decide product intent, target users, non-goals, acceptance criteria, release scope, and risks.\n\nOutput contract: emit EXACTLY ONE JSON object on the FINAL LINE of your reply. No markdown fences. No prose after it. Shape:\n{\"summary\": <one-line string>, \"users\": [<string>], \"goals\": [<string>], \"nonGoals\": [<string>], \"acceptanceCriteria\": [<string>], \"releaseScope\": [<string>], \"risks\": [<string>]}\n\nThis JSON is consumed by an automated downstream agent. Anything you say before it can be reasoning or notes; only the last line is parsed. Keep fields concrete and actionable.",
           "emit": { "topic": "product.requirements.defined", "required_scopes": ["workspace:read", "workspace:write"] }
         }
       ]

@@ -2,12 +2,12 @@ use agora_core::{
     bookmark::validate_bookmark_label,
     bus::Bus,
     envelope::Envelope,
-    human::HumanInteractionRequest,
+    event_data_from_input,
     manifest::AgentManifest,
     tokens::mint_actor_token,
     topics::{
-        direct_inbox_topic, EVENT_BOOKMARKED, EVENT_UNBOOKMARKED, HUMAN_INTERACTION_REQUEST,
-        HUMAN_INTERACTION_RESPONSE, SESSION_DELETED, SESSION_NAMED, WORKSPACE_IDEA_SUBMITTED,
+        direct_inbox_topic, AGENT_TELEMETRY_LOGS, EVENT_BOOKMARKED, EVENT_UNBOOKMARKED,
+        HUMAN_INTERACTION_REQUEST, HUMAN_INTERACTION_RESPONSE, SESSION_DELETED, SESSION_NAMED,
     },
 };
 use anyhow::Result;
@@ -185,6 +185,8 @@ pub struct App {
     pub bus_url: String,
     pub bus: Arc<Bus>,
     pub signing_key: Vec<u8>,
+    pub submit_topic: String,
+    pub submit_field: String,
     pub status_msg: Option<String>,
     pub command_output: Option<String>,
     pub output_scroll: u16,
@@ -206,12 +208,17 @@ pub struct App {
 
     pub tag_filter: Option<String>,
     pub bookmarks: HashMap<String, Option<String>>,
-    pub pending_requests: Vec<(String, HumanInteractionRequest, String)>,
     pub pending_action: Option<PendingAction>,
 }
 
 impl App {
-    pub fn new(bus: Arc<Bus>, signing_key: Vec<u8>, bus_url: String) -> Self {
+    pub fn new(
+        bus: Arc<Bus>,
+        signing_key: Vec<u8>,
+        bus_url: String,
+        submit_topic: String,
+        submit_field: String,
+    ) -> Self {
         Self {
             input: String::new(),
             stashed_input: String::new(),
@@ -229,6 +236,8 @@ impl App {
             bus_url,
             bus,
             signing_key,
+            submit_topic,
+            submit_field,
             status_msg: Some("Type !help for commands · Enter to submit · Esc to quit".into()),
             command_output: None,
             output_scroll: 0,
@@ -251,8 +260,23 @@ impl App {
     /// Maximum scroll offset such that the events pane stays full of content.
     /// Anything beyond this would leave blank space at the top.
     pub fn max_events_scroll(&self) -> u16 {
-        let len = self.events.len() as u16;
+        let len = self.active_session_event_count() as u16;
         len.saturating_sub(self.events_view_height)
+    }
+
+    pub fn active_session_event_indices(&self) -> Vec<usize> {
+        let Some(session_id) = self.active_session.as_deref() else {
+            return Vec::new();
+        };
+        self.events
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, event)| (event.context.session_id == session_id).then_some(idx))
+            .collect()
+    }
+
+    pub fn active_session_event_count(&self) -> usize {
+        self.active_session_event_indices().len()
     }
 
     pub fn sync_events_viewport(&mut self, height: u16) {
@@ -262,7 +286,8 @@ impl App {
     }
 
     pub fn selected_event_index(&self) -> Option<usize> {
-        self.selected_event.filter(|idx| *idx < self.events.len())
+        self.selected_event
+            .filter(|idx| self.event_belongs_to_active_session(*idx))
     }
 
     pub fn selected_event_with_index(&self) -> Option<(usize, &Envelope)> {
@@ -270,13 +295,28 @@ impl App {
         self.events.get(idx).map(|event| (idx, event))
     }
 
+    pub fn selected_event_position(&self) -> Option<usize> {
+        let selected = self.selected_event_index()?;
+        self.active_session_event_indices()
+            .iter()
+            .position(|idx| *idx == selected)
+    }
+
     pub fn inspected_event_index(&self) -> Option<usize> {
-        self.inspected_event.filter(|idx| *idx < self.events.len())
+        self.inspected_event
+            .filter(|idx| self.event_belongs_to_active_session(*idx))
     }
 
     pub fn inspected_event_with_index(&self) -> Option<(usize, &Envelope)> {
         let idx = self.inspected_event_index()?;
         self.events.get(idx).map(|event| (idx, event))
+    }
+
+    pub fn inspected_event_position(&self) -> Option<usize> {
+        let inspected = self.inspected_event_index()?;
+        self.active_session_event_indices()
+            .iter()
+            .position(|idx| *idx == inspected)
     }
 
     pub fn event_details_open(&self) -> bool {
@@ -285,6 +325,35 @@ impl App {
 
     pub fn full_event_details_open(&self) -> bool {
         self.full_event_details && self.event_details_open() && self.command_output.is_none()
+    }
+
+    fn event_belongs_to_active_session(&self, idx: usize) -> bool {
+        let Some(session_id) = self.active_session.as_deref() else {
+            return false;
+        };
+        self.events
+            .get(idx)
+            .is_some_and(|event| event.context.session_id == session_id)
+    }
+
+    /// Returns (event_id, session_id, question) if the inspected event is a
+    /// pending human interaction request the user can respond to.
+    pub fn active_interaction_request(&self) -> Option<(String, String, String)> {
+        let (_, event) = self.inspected_event_with_index()?;
+        if event.topic != HUMAN_INTERACTION_REQUEST {
+            return None;
+        }
+        let question = event
+            .data
+            .get("question")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .to_string();
+        Some((
+            event.event_id.clone(),
+            event.context.session_id.clone(),
+            question,
+        ))
     }
 
     pub fn take_pending_action(&mut self) -> Option<PendingAction> {
@@ -374,20 +443,26 @@ impl App {
     }
 
     fn clamp_event_selection(&mut self) {
-        if self.events.is_empty() {
+        if self.active_session_event_count() == 0 {
             self.selected_event = None;
+            self.inspected_event = None;
+            self.full_event_details = false;
             self.events_scroll = 0;
             self.auto_scroll = true;
             return;
         }
 
-        if let Some(idx) = self.selected_event {
-            let last = self.events.len() - 1;
-            self.selected_event = Some(idx.min(last));
+        if self
+            .selected_event
+            .is_some_and(|idx| !self.event_belongs_to_active_session(idx))
+        {
+            self.selected_event = None;
         }
-        if let Some(idx) = self.inspected_event {
-            let last = self.events.len() - 1;
-            self.inspected_event = Some(idx.min(last));
+        if self
+            .inspected_event
+            .is_some_and(|idx| !self.event_belongs_to_active_session(idx))
+        {
+            self.inspected_event = None;
         }
         if self.inspected_event.is_none() {
             self.full_event_details = false;
@@ -397,22 +472,22 @@ impl App {
 
     fn ensure_selected_event_visible(&mut self) {
         self.clamp_event_selection();
-        let Some(idx) = self.selected_event else {
+        let Some(pos) = self.selected_event_position() else {
             return;
         };
 
-        let len = self.events.len();
+        let len = self.active_session_event_count();
         let height = self.events_view_height.max(1) as usize;
         let max_scroll = len.saturating_sub(height);
         let scroll = (self.events_scroll as usize).min(max_scroll);
         let end = len.saturating_sub(scroll);
         let start = end.saturating_sub(height);
 
-        if idx < start {
-            let desired_end = (idx + height).min(len);
+        if pos < start {
+            let desired_end = (pos + height).min(len);
             self.events_scroll = len.saturating_sub(desired_end) as u16;
-        } else if idx >= end {
-            self.events_scroll = len.saturating_sub(idx + 1) as u16;
+        } else if pos >= end {
+            self.events_scroll = len.saturating_sub(pos + 1) as u16;
         } else {
             self.events_scroll = scroll as u16;
         }
@@ -457,6 +532,21 @@ impl App {
     }
 
     pub fn handle_envelope(&mut self, env: Envelope) {
+        // Telemetry envelopes carry the same TelemetryEntry shape inside
+        // `data`. Route them to the telemetry collector so JetStream replay
+        // on startup populates `!history` with past prompts/responses,
+        // without polluting the events pane.
+        if env.topic == AGENT_TELEMETRY_LOGS {
+            if let Ok(entry) = serde_json::from_value::<TelemetryEntry>(env.data) {
+                self.telemetry.push(entry);
+                if self.telemetry.len() > MAX_TELEMETRY {
+                    let excess = self.telemetry.len() - MAX_TELEMETRY;
+                    self.telemetry.drain(0..excess);
+                }
+            }
+            return;
+        }
+
         // `session.named` is metadata — update the name map and ensure a
         // SessionInfo exists, but don't push it into the events list.
         if env.topic == SESSION_NAMED {
@@ -496,6 +586,11 @@ impl App {
             session.deleted_at = Some(env.timestamp.clone());
             if self.active_session.as_deref() == Some(sid.as_str()) {
                 self.active_session = None;
+                self.selected_event = None;
+                self.inspected_event = None;
+                self.full_event_details = false;
+                self.events_scroll = 0;
+                self.auto_scroll = true;
             }
             return;
         }
@@ -573,8 +668,9 @@ impl App {
         session.event_count += 1;
 
         let was_following = self.auto_scroll || self.selected_event.is_none();
+        let event_matches_active_session = self.active_session.as_deref() == Some(sid.as_str());
         self.events.push(env);
-        if !was_following {
+        if !was_following && event_matches_active_session {
             self.events_scroll = self.events_scroll.saturating_add(1);
         }
 
@@ -684,6 +780,11 @@ impl App {
         self.session_names
             .insert(session_id.clone(), name.to_string());
         self.active_session = Some(session_id.clone());
+        self.selected_event = None;
+        self.inspected_event = None;
+        self.full_event_details = false;
+        self.events_scroll = 0;
+        self.auto_scroll = true;
 
         if let Err(e) = self.publish_session_named(&session_id, name).await {
             self.status_msg = Some(format!("Created locally; broadcast failed: {e}"));
@@ -716,6 +817,11 @@ impl App {
         }
         if self.active_session.as_deref() == Some(sid) {
             self.active_session = None;
+            self.selected_event = None;
+            self.inspected_event = None;
+            self.full_event_details = false;
+            self.events_scroll = 0;
+            self.auto_scroll = true;
         }
         if let Err(e) = self.publish_session_deleted(sid).await {
             self.status_msg = Some(format!("Deleted locally; broadcast failed: {e}"));
@@ -765,13 +871,47 @@ impl App {
             }
         };
         self.active_session = Some(next.clone());
+        self.selected_event = None;
+        self.inspected_event = None;
+        self.full_event_details = false;
+        self.events_scroll = 0;
+        self.auto_scroll = true;
         self.status_msg = Some(format!("Active: {}", self.display_name(&next)));
     }
 
     pub fn clear_active(&mut self) {
         if self.active_session.take().is_some() {
+            self.selected_event = None;
+            self.inspected_event = None;
+            self.full_event_details = false;
+            self.events_scroll = 0;
+            self.auto_scroll = true;
             self.status_msg = Some("Cleared active session".into());
         }
+    }
+
+    pub fn select_default_session(&mut self) {
+        if self.active_session.as_deref().is_some_and(|sid| {
+            self.sessions
+                .get(sid)
+                .is_some_and(|session| !session.deleted)
+        }) {
+            return;
+        }
+        let Some((sid, _)) = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| !session.deleted)
+            .max_by(|a, b| a.1.started_at.cmp(&b.1.started_at))
+        else {
+            return;
+        };
+        self.active_session = Some(sid.clone());
+        self.selected_event = None;
+        self.inspected_event = None;
+        self.full_event_details = false;
+        self.events_scroll = 0;
+        self.auto_scroll = true;
     }
 
     pub fn scroll_up(&mut self) {
@@ -791,28 +931,39 @@ impl App {
     }
 
     fn select_event_delta(&mut self, delta: i32) {
-        if self.events.is_empty() {
+        let indices = self.active_session_event_indices();
+        if indices.is_empty() {
+            self.status_msg = Some(match &self.active_session {
+                Some(session_id) => {
+                    format!("No events in {}", self.display_name(session_id))
+                }
+                None => "No active session selected.".into(),
+            });
             return;
         }
         self.clamp_event_selection();
-        let last = self.events.len() - 1;
-        let idx = match self.selected_event {
-            Some(idx) => idx,
-            None if delta < 0 => self.events.len(),
-            None => last,
+        let len = indices.len();
+        let pos = match self
+            .selected_event_index()
+            .and_then(|idx| indices.iter().position(|candidate| *candidate == idx))
+        {
+            Some(pos) => pos,
+            None if delta < 0 => len,
+            None => len - 1,
         };
-        let next = if delta < 0 {
-            idx.saturating_sub((-delta) as usize)
+        let next_pos = if delta < 0 {
+            pos.saturating_sub((-delta) as usize)
         } else {
-            idx.saturating_add(delta as usize).min(last)
+            pos.saturating_add(delta as usize).min(len - 1)
         };
+        let next = indices[next_pos];
         self.selected_event = Some(next);
         self.auto_scroll = false;
         self.ensure_selected_event_visible();
         self.status_msg = Some(format!(
             "Selected event {}/{} · empty Enter opens inspector",
-            next + 1,
-            self.events.len()
+            next_pos + 1,
+            len
         ));
     }
 
@@ -823,13 +974,11 @@ impl App {
         self.output_scroll = 0;
         self.events_scroll = 0;
         self.auto_scroll = true;
-        if self.events.is_empty() {
+        let count = self.active_session_event_count();
+        if count == 0 {
             self.status_msg = Some("Following live tail".into());
         } else {
-            self.status_msg = Some(format!(
-                "Following live tail after event {}",
-                self.events.len()
-            ));
+            self.status_msg = Some(format!("Following live tail after event {count}"));
         }
     }
 
@@ -838,6 +987,8 @@ impl App {
             self.status_msg = Some("No event selected.".into());
             return;
         };
+        let pos = self.selected_event_position().unwrap_or(0);
+        let count = self.active_session_event_count();
         self.command_output = None;
         self.output_scroll = 0;
         self.inspected_event = Some(idx);
@@ -845,8 +996,8 @@ impl App {
         self.panels.detail = true;
         self.status_msg = Some(format!(
             "Inspecting event {}/{} · Right expands · Esc hides inspector",
-            idx + 1,
-            self.events.len(),
+            pos + 1,
+            count,
         ));
     }
 
@@ -919,7 +1070,17 @@ impl App {
                 .await;
         }
 
-        self.submit_idea(text).await
+        if let Some((correlation_id, session_id, _)) = self.active_interaction_request() {
+            return self
+                .submit_human_response(text, correlation_id, session_id)
+                .await;
+        }
+
+        let topic = self.submit_topic.clone();
+        if let Err(e) = self.submit_event(&topic, text).await {
+            self.status_msg = Some(format!("Submit failed: {e}"));
+        }
+        Ok(())
     }
 
     // -------------------------------------------- commands
@@ -946,6 +1107,7 @@ impl App {
             "status" => self.cmd_status(rest),
             "history" => self.cmd_history(rest),
             "panel" | "panels" | "toggle" => self.cmd_panel(rest),
+            "submit" => self.cmd_submit(rest).await,
             "clear" => self.cmd_clear(),
             "copy" => self.cmd_copy(),
             "editor" => self.cmd_editor(),
@@ -1029,8 +1191,9 @@ impl App {
              \x20\x20!status <agent>        Agent's manifest + activity in active session\n\
              \x20\x20!history <agent>       Full conversation: received · prompts · responses · published\n\
              \x20\x20!panel <name>          Toggle sessions, events, agents, detail, or all\n\
+             \x20\x20!submit <topic> <data> Publish an arbitrary event (JSON or text)\n\
              \x20\x20!copy                  Copy command output (or selected event) to clipboard\n\
-             \x20\x20!editor                Compose input in $EDITOR (for long ideas / multi-line)\n\
+             \x20\x20!editor                Compose input in $EDITOR (for long events / multi-line)\n\
              \x20\x20!page                  Open command output in $PAGER (for long !history)\n\
              \x20\x20!clear                 Clear local events/telemetry; keep sessions\n\
              \x20\x20!exit | !quit          Quit (same as Esc)\n\
@@ -1040,7 +1203,7 @@ impl App {
              \x20\x20/steer @agent <msg>    Same as @\n\
              \x20\x20/queue @agent <msg>    Queue behind agent's current event\n\
              \n\
-             Plain text is published as workspace.idea.submitted.\n\
+             Plain text is published as the configured submit topic.\n\
              \n\
              KEYS:  Ctrl-N/R/X · F1/F2/F3/F4 panels · Tab/Shift-Tab · ↑/↓ select events · empty Enter inspects · ←/→ collapse/expand details\n\
              \x20\x20\x20\x20\x20\x20Shift+Enter or Alt+Enter inserts a newline\n\
@@ -1073,6 +1236,19 @@ impl App {
                     ));
                 }
             }
+        }
+    }
+
+    async fn cmd_submit(&mut self, rest: &str) {
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let topic = parts.next().unwrap_or("").trim();
+        let data = parts.next().unwrap_or("").trim();
+        if topic.is_empty() || data.is_empty() {
+            self.status_msg = Some("Usage: !submit <topic> <json-or-text>".into());
+            return;
+        }
+        if let Err(e) = self.submit_event(topic, data.to_string()).await {
+            self.status_msg = Some(format!("Submit failed: {e}"));
         }
     }
 
@@ -1305,7 +1481,7 @@ impl App {
         let label = self.display_name(&sid);
         let mut out = format!("Agents in session \"{label}\":\n\n");
         if counts.is_empty() {
-            out.push_str("  (no events yet — submit an idea to begin)\n");
+            out.push_str("  (no events yet — submit an event to begin)\n");
         } else {
             for (name, count) in &counts {
                 let status = self
@@ -1453,7 +1629,7 @@ impl App {
         ));
 
         if items.is_empty() {
-            out.push_str("  (no activity yet — start an idea, or wait for the agent to react)\n");
+            out.push_str("  (no activity yet — submit an event, or wait for the agent to react)\n");
         }
 
         for (_, item) in items {
@@ -1508,7 +1684,13 @@ impl App {
         self.set_output(out);
     }
 
-    async fn submit_idea(&mut self, idea: String) -> Result<()> {
+    async fn submit_event(&mut self, topic: &str, input: String) -> Result<()> {
+        let topic = topic.trim();
+        if topic.is_empty() {
+            self.status_msg = Some("Submit topic cannot be empty".into());
+            return Ok(());
+        }
+        let data = event_data_from_input(&input, &self.submit_field)?;
         let session_id = self
             .active_session
             .clone()
@@ -1521,21 +1703,56 @@ impl App {
             900,
         )?;
         let env = Envelope::build(
-            WORKSPACE_IDEA_SUBMITTED,
+            topic,
             "agora-console",
             0,
             token,
             session_id.clone(),
-            serde_json::json!({ "idea": idea }),
+            data,
             None,
             vec![],
         );
         match self.bus.publish(&env).await {
             Ok(()) => {
+                self.active_session = Some(session_id.clone());
                 let label = self.display_name(&session_id);
-                self.status_msg = Some(format!("Submitted idea to {label}"));
+                self.status_msg = Some(format!("Submitted event {topic} to {label}"));
             }
             Err(e) => self.status_msg = Some(format!("Submit failed: {e}")),
+        }
+        Ok(())
+    }
+
+    async fn submit_human_response(
+        &mut self,
+        answer: String,
+        correlation_id: String,
+        session_id: String,
+    ) -> Result<()> {
+        let token = mint_actor_token(
+            "console-user",
+            &["workspace:read", "workspace:write"],
+            &session_id,
+            &self.signing_key,
+            900,
+        )?;
+        let env = Envelope::build(
+            HUMAN_INTERACTION_RESPONSE,
+            "agora-console",
+            0,
+            token,
+            session_id,
+            serde_json::json!({
+                "correlationId": correlation_id,
+                "answer": answer,
+                "respondedBy": "agora-console",
+            }),
+            None,
+            vec![],
+        );
+        match self.bus.publish(&env).await {
+            Ok(()) => self.status_msg = Some("Response sent".into()),
+            Err(e) => self.status_msg = Some(format!("Response failed: {e}")),
         }
         Ok(())
     }
@@ -1566,7 +1783,7 @@ impl App {
             "agora-console",
             0,
             token,
-            session_id,
+            session_id.clone(),
             serde_json::json!({
                 "messageType": msg_type,
                 "recipient": agent,
@@ -1576,7 +1793,10 @@ impl App {
             vec![],
         );
         match self.bus.publish(&env).await {
-            Ok(()) => self.status_msg = Some(format!("[{msg_type}] @{agent}: {message}")),
+            Ok(()) => {
+                self.active_session = Some(session_id);
+                self.status_msg = Some(format!("[{msg_type}] @{agent}: {message}"));
+            }
             Err(e) => self.status_msg = Some(format!("Direct send failed: {e}")),
         }
         Ok(())
@@ -1779,14 +1999,14 @@ mod tests {
     #[test]
     fn nats_wildcard_matching() {
         assert!(topic_matches(
-            "workspace.idea.submitted",
-            "workspace.idea.submitted"
+            "workspace.event.submitted",
+            "workspace.event.submitted"
         ));
-        assert!(topic_matches("workspace.>", "workspace.idea.submitted"));
+        assert!(topic_matches("workspace.>", "workspace.event.submitted"));
         assert!(topic_matches("workspace.>", "workspace.design.finalized"));
         assert!(topic_matches("*.changed", "code.changed"));
         assert!(!topic_matches("*.changed", "code.changed.again"));
-        assert!(!topic_matches("workspace.idea.submitted", "code.changed"));
+        assert!(!topic_matches("workspace.event.submitted", "code.changed"));
         assert!(topic_matches(">", "anything.goes.here"));
     }
 }

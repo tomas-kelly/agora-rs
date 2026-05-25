@@ -78,7 +78,7 @@ cargo run -p agora -- console
 ```
 
 The TUI window onto the running swarm: sessions / events / agents panes
-plus a composer for ideas and direct messages. Safe to quit and reopen
+plus a composer for events and direct messages. Safe to quit and reopen
 anytime — the JetStream replay catches you up on what you missed.
 
 `cargo run -p agora-console` still works as a compatibility entry point, but
@@ -90,18 +90,18 @@ anytime — the JetStream replay catches you up on what you missed.
 
 ### Headless alternative
 
-For scripted use you can skip the console and submit ideas directly:
+For scripted use you can skip the console and submit events directly:
 
 ```bash
-cargo run -p agora -- submit "Build a REST API for user management"
+cargo run -p agora -- submit workspace.event.submitted "Build a REST API for user management"
 ```
 
-Or run the bundled smoke-test demo, which submits a canned idea and polls
+Or run the bundled smoke-test demo, which submits a canned event and polls
 JetStream until the full loopback completes:
 
 ```bash
-./scripts/demo.sh                          # canned idea
-./scripts/demo.sh "Build a chess engine"   # custom idea
+./scripts/demo.sh                          # canned event
+./scripts/demo.sh "Build a chess engine"   # custom event text
 ```
 
 The Agora session ID from each event is passed through to ACP so all agent
@@ -128,7 +128,7 @@ Core commands:
 |---|---|
 | `agora start --config agents.local.json` | Start NATS, telemetry, and all agents from the topology. Add `--detach` to run in the background. |
 | `agora console` | Open the TUI against the running swarm. |
-| `agora submit "idea"` | Publish `workspace.idea.submitted` without opening the TUI. |
+| `agora submit <topic> <data>` | Publish an event without opening the TUI. Plain text becomes `{ "text": "..." }`; valid JSON is sent as-is. |
 | `agora ps` | Show supervisor, service, and agent process status from pid files. |
 | `agora logs [target]` | List log targets, or tail one target. |
 | `agora events` | Dump or follow the `AGORA_EVENTS` stream. |
@@ -239,28 +239,20 @@ cargo run -p agora -- system stats
 ### What it looks like
 
 ```
- agora console │ nats://127.0.0.1:4222 │ events:24 sessions:2 agents:6 │ Submitted idea to "Task manager"
-┌─ Sessions (2) ─────────────┬─ Events ──────────────────────────────────────────────────────────────────────┐
-│ ▶ Task manager             │ 10:00:01  workspace.idea.submitted   sess_01J…                               │
-│   workspace.idea… · 8 evts │ 10:00:04  product.requirements…      sess_01J…                               │
-│   Chess engine             │ 10:00:09  workspace.design…          sess_01J…                               │
-│   test.passed · 11 evts    │ 10:00:13  code.changed               sess_01J…                               │
-├─ Agents (6) ───────────────┤ 10:00:14  code.changed               sess_01J…                               │
-│ ● product-manager          │ 10:00:17  test.failed                sess_01J…                               │
-│    :4001 · product         │ 10:00:18  security.scan.clean        sess_01J…                               │
-│ ● system-architect         │ 10:00:21  code.changed               sess_01J…                               │
-│    :4002 · architecture    │ 10:00:24  test.passed                sess_01J…                               │
-│ ◐ backend-coder            │                                                                            │
-│    :4003 · backend, rust   │                                                                            │
-└────────────────────────────┴──────────────────────────────────────────────────────────────────────────────┘
-┌─ Event inspector (24/24) · Right expands · Esc closes ─────────────────────────────────────────────────────┐
-│ topic:   test.passed                                                                                       │
-│ event:   evt_01J5ZT9VYC9X7HE8GZ8RVKDM3X                                                                    │
-│ time:    2026-05-24T10:00:24Z                                                                              │
-│ session: Task manager  (sess_01J5ZT…)                                                                      │
-│ from:    quality-assurance                                                                                 │
-│ data:    { "summary": "All tests passing", "passedTests": ["api", "ui_render", "task_crud"] }              │
-└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ agora console │ nats://127.0.0.1:4222 │ events:24 sessions:2 agents:6 │ Submitted event to "Task manager"
+┌─ Sessions (2) ─────────────┬─ Events: Task manager (8/8) ───────┬─ Event inspector (8/8) ──────────────────┐
+│ ▶ Task manager             │ 10:00:01  workspace.event.submitted│ topic: test.passed                       │
+│   Chess engine             │ 10:00:04  product.requirements...  │ event: evt_01J5ZT9VYC9X7...              │
+│                            │ 10:00:09  workspace.design...      │ time:  2026-05-24T10:00:24Z              │
+│                            │ 10:00:13  code.changed             │ from:  quality-assurance                 │
+├─ Agents (6) ───────────────┤ 10:00:14  code.changed             │ data:  {                                 │
+│ ● product-manager          │ 10:00:17  test.failed              │   "summary": "All tests..."              │
+│    :4001 · product         │ 10:00:18  security.scan.clean      │ }                                        │
+│ ● system-architect         │›10:00:24  test.passed              │ Right expands · Esc closes               │
+│    :4002 · architecture    │                                    │                                          │
+│ ◐ backend-coder            │                                    │                                          │
+│    :4003 · backend, rust   │                                    │                                          │
+└────────────────────────────┴────────────────────────────────────┴──────────────────────────────────────────┘
 ┌─ Compose · active: Task manager ───────────────────────────────────────────────────────────────────────────┐
 │ ›  Build a collaborative editor with offline support, conflict resolution,                                 │
 │    audit logging, and a minimal admin view.                                                                │
@@ -277,12 +269,12 @@ cargo run -p agora -- system stats
 
 The composer is intentionally large enough for multi-line prompts. Long drafts
 scroll with PgUp/PgDn or with the mouse wheel over the composer. The Events pane
-acts like a stream browser: `↑` / `↓` select an event without opening details.
-Press `Enter` with an empty composer to open the Event inspector for that
-selected event, `Right` expands it into the full event-details view, `Left`
-collapses/closes it, and `Esc` hides it. Live-tail mode has no inspector panel.
-`End` returns to the live tail and hides the inspector. Agents sit below
-Sessions in the left sidebar.
+shows only events from the active session and acts like a stream browser:
+`↑` / `↓` select an event without opening details. Press `Enter` with an empty
+composer to open the Event inspector to the right of the Events pane, `Right`
+expands it into the full event-details view, `Left` collapses/closes it, and
+`Esc` hides it. Live-tail mode has no inspector panel. `End` returns to the live
+tail and hides the inspector. Agents sit below Sessions in the left sidebar.
 
 `!history backend-coder` replaces the Event inspector with a scrollable
 conversation timeline — inbound events the agent received, prompts sent to Kiro,
@@ -314,7 +306,8 @@ timestamp. PgUp/PgDn or mouse-wheel scroll the output, `!page` dumps it into
 
 | Input | Action |
 |---|---|
-| Plain text + `Enter` | Submit as `workspace.idea.submitted` (under active session if any, else new) |
+| Plain text + `Enter` | Submit as the console's configured submit topic, `workspace.event.submitted` by default |
+| `!submit <topic> <data>` | Publish a one-off event from the console; data may be JSON or text |
 | `@agent <msg>` + `Enter` | Direct message to that agent's inbox |
 | `/steer @agent <msg>` | Steering message (preempts current work) |
 | `/queue @agent <msg>` | Queue behind agent's current event |
@@ -376,7 +369,7 @@ The loopback cycle is event driven. QA and security both react to
 or security publishes `security.alert.found`:
 
 ```
-workspace.idea.submitted
+workspace.event.submitted
   → [product-manager]   → product.requirements.defined
     → [system-architect] → workspace.design.finalized
       → [backend-coder]   → code.changed
@@ -480,10 +473,10 @@ cargo run -p agora -- bootstrap
    └────────────────────────────────────────────────────────────────┘
 ```
 
-Cascading loopback for a single idea:
+Cascading loopback for a single submitted event:
 
 ```
-workspace.idea.submitted
+workspace.event.submitted
   → [product-manager]   → product.requirements.defined
     → [system-architect] → workspace.design.finalized
       → [backend-coder]   → code.changed
@@ -505,11 +498,11 @@ Every NATS message is a JSON `Envelope`:
 {
   "eventId": "evt_01J...",
   "timestamp": "2026-05-22T10:00:00Z",
-  "topic": "workspace.idea.submitted",
+  "topic": "workspace.event.submitted",
   "sender": { "agentName": "agora-cli", "port": 0 },
   "security": { "actorToken": "eyJ..." },
   "context": { "sessionId": "sess_01J...", "affectedFiles": [] },
-  "data": { "idea": "Build a REST API" }
+  "data": { "text": "Build a REST API" }
 }
 ```
 
@@ -548,6 +541,12 @@ Most agents are declared in `agents.local.json` and run through the generic
 `agora-agent` process. The local topology starts the six workspace Kiro agents
 from `.kiro/agents`: `product-manager`, `system-architect`, `backend-coder`,
 `frontend-coder`, `security-engineer`, and `quality-assurance`.
+
+Agents should follow the prompt/response contract in
+[`docs/agent-io-contract.md`](docs/agent-io-contract.md). In short:
+topology declares input topics, allowed output topics, and prompt templates;
+agents return exactly one JSON object; `agora-agent` validates, envelopes, and
+publishes the resulting event.
 
 1. Add an `agents[]` entry with subscriptions, publish declarations, and prompt templates.
 2. Set `acp` or rely on `default_acp` (`kiro` for the checked-in local topology, `mock` for smoke tests).

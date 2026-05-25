@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use futures::StreamExt;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -11,7 +12,10 @@ use crate::{
     human::{HumanInteractionRequest, HumanInteractionResponse},
     manifest::{AgentManifest, AgentStatus, PublishedEvent, Subscription},
     tokens::{load_signing_key, mint_actor_token, verify_actor_token},
-    topics::{AGENT_REGISTRY_HEARTBEAT, AGENT_TELEMETRY_LOGS, HUMAN_INTERACTION_REQUEST, HUMAN_INTERACTION_RESPONSE},
+    topics::{
+        AGENT_REGISTRY_HEARTBEAT, AGENT_TELEMETRY_LOGS, HUMAN_INTERACTION_REQUEST,
+        HUMAN_INTERACTION_RESPONSE,
+    },
 };
 
 /// Shared map of pending human interaction requests awaiting responses.
@@ -97,6 +101,11 @@ impl Publisher {
         action: &str,
         telemetry: serde_json::Value,
     ) -> Result<()> {
+        // Telemetry now flows through JetStream so consoles that connect
+        // later replay past prompts/responses on startup. The legacy
+        // payload shape is preserved inside `data` so daemon-telemetry's
+        // JSONL output and the console's `TelemetryEntry` decoding both
+        // keep working — they just unwrap `envelope.data` first.
         let payload = serde_json::json!({
             "timestamp": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             "sessionId": self.inbound.context.session_id,
@@ -105,12 +114,26 @@ impl Publisher {
             "action": action,
             "telemetry": telemetry,
         });
-        self.bus
-            .publish_raw(
-                AGENT_TELEMETRY_LOGS,
-                bytes::Bytes::from(serde_json::to_vec(&payload)?),
-            )
-            .await
+
+        // Telemetry envelopes need a valid actor token because every
+        // subscriber that reads from JetStream verifies the JWT.
+        let token = mint_actor_token(
+            &self.agent_name,
+            &["agent:telemetry"],
+            &self.inbound.context.session_id,
+            &self.signing_key,
+            crate::tokens::DEFAULT_TTL_SECS,
+        )?;
+        let mut envelope = self.inbound.child(
+            AGENT_TELEMETRY_LOGS,
+            &self.agent_name,
+            self.port,
+            payload,
+            Some(vec![]),
+            None,
+        );
+        envelope.security.actor_token = token;
+        self.bus.publish(&envelope).await
     }
 
     /// Ask a human a question and block until a response arrives or timeout.
@@ -273,6 +296,7 @@ impl<A: Agent> DaemonRunner<A> {
         .await;
 
         let shutdown = CancellationToken::new();
+        let pending_interactions: PendingInteractions = Arc::new(Mutex::new(HashMap::new()));
 
         // Heartbeat task
         {
@@ -303,6 +327,61 @@ impl<A: Agent> DaemonRunner<A> {
             info!("Shutdown signal received");
             shutdown_signal.cancel();
         });
+
+        // Human interaction responses are delivered back to the requesting
+        // agent by correlation id. This live subscriber completes the pending
+        // `ask_human` oneshot without routing the response through `on_event`.
+        {
+            let client = bus.client.clone();
+            let pending_interactions = pending_interactions.clone();
+            let shutdown = shutdown.clone();
+
+            tokio::spawn(async move {
+                let mut sub = match client
+                    .subscribe(HUMAN_INTERACTION_RESPONSE.to_string())
+                    .await
+                {
+                    Ok(sub) => sub,
+                    Err(e) => {
+                        warn!("Human interaction response subscriber failed to start: {e}");
+                        return;
+                    }
+                };
+
+                loop {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        maybe_msg = sub.next() => {
+                            let Some(msg) = maybe_msg else { break };
+                            let envelope = match Envelope::from_bytes(&msg.payload) {
+                                Ok(envelope) => envelope,
+                                Err(e) => {
+                                    warn!("Failed to deserialize human interaction response envelope: {e}");
+                                    continue;
+                                }
+                            };
+                            let response = match serde_json::from_value::<HumanInteractionResponse>(envelope.data) {
+                                Ok(response) => response,
+                                Err(e) => {
+                                    warn!("Failed to decode human interaction response: {e}");
+                                    continue;
+                                }
+                            };
+                            let correlation_id = response.correlation_id.clone();
+                            let sender = {
+                                let mut pending = pending_interactions.lock().await;
+                                pending.remove(&correlation_id)
+                            };
+                            if let Some(sender) = sender {
+                                let _ = sender.send(response);
+                            } else {
+                                warn!(%correlation_id, "Human interaction response had no pending request");
+                            }
+                        }
+                    }
+                }
+            });
+        }
 
         // One subscriber task per subscription, all feeding a shared channel
         let (tx, mut rx) = tokio::sync::mpsc::channel::<WorkItem>(64);
@@ -386,6 +465,7 @@ impl<A: Agent> DaemonRunner<A> {
                 inbound: Arc::new(envelope.clone()),
                 published_topics: published_topics.clone(),
                 signing_key: signing_key.clone(),
+                pending_interactions: pending_interactions.clone(),
             };
 
             let mut agent = self.agent.lock().await;

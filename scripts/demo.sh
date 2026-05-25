@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Submit a canned idea to a running swarm and wait for the loopback to
+# Submit a canned event to a running swarm and wait for the loopback to
 # complete. Useful both as a quick smoke test and as something to show to
 # someone who's never seen the swarm before.
 #
 # Usage:
-#   ./scripts/demo.sh                          # canned idea
-#   ./scripts/demo.sh "Build a chess engine"   # custom idea
+#   ./scripts/demo.sh                          # canned event
+#   ./scripts/demo.sh "Build a chess engine"   # custom event text
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -31,13 +31,14 @@ if ! run_agora doctor; then
   exit 1
 fi
 
-IDEA="${1:-Build a small task manager with a REST API and a single-page UI}"
+EVENT_TEXT="${1:-Build a small task manager with a REST API and a single-page UI}"
 echo
-echo ">>> Submitting idea:"
-echo "    \"$IDEA\""
+echo ">>> Submitting event:"
+echo "    workspace.event.submitted"
+echo "    \"$EVENT_TEXT\""
 echo
 
-OUTPUT="$(run_agora submit "$IDEA")"
+OUTPUT="$(run_agora submit workspace.event.submitted "$EVENT_TEXT")"
 echo "$OUTPUT"
 SESSION_ID="$(echo "$OUTPUT" | grep -oE 'sess_[A-Za-z0-9]+' | head -n1)"
 if [[ -z "${SESSION_ID:-}" ]]; then

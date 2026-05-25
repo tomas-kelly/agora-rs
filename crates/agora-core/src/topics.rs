@@ -3,7 +3,7 @@ pub const AGENT_REGISTRY_HEARTBEAT: &str = "agent.registry.heartbeat";
 pub const AGENT_TELEMETRY_LOGS: &str = "agent.telemetry.logs";
 
 // Workspace flow
-pub const WORKSPACE_IDEA_SUBMITTED: &str = "workspace.idea.submitted";
+pub const WORKSPACE_EVENT_SUBMITTED: &str = "workspace.event.submitted";
 pub const WORKSPACE_DESIGN_FINALIZED: &str = "workspace.design.finalized";
 
 // Code & feedback loops

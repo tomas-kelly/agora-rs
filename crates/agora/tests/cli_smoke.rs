@@ -64,6 +64,7 @@ fn cli_mutating_commands_work_against_isolated_nats() {
     ]);
     run_ok([
         "submit",
+        "workspace.event.submitted",
         "Build smoke path",
         "--session-id",
         &session_id,
@@ -91,12 +92,12 @@ fn cli_mutating_commands_work_against_isolated_nats() {
 
     let replay = run_ok(["replay", "--session-id", &session_id, "--bus-url", &bus_url]);
     let replay = String::from_utf8(replay.stdout).unwrap();
-    assert!(replay.contains("workspace.idea.submitted"));
+    assert!(replay.contains("workspace.event.submitted"));
     assert!(replay.contains("agent.inbox.product-manager"));
 
     let events = run_ok(["events", "--session-id", &session_id, "--bus-url", &bus_url]);
     let events = String::from_utf8(events.stdout).unwrap();
-    assert!(events.contains("workspace.idea.submitted"));
+    assert!(events.contains("workspace.event.submitted"));
     assert!(events.contains("agent.inbox.product-manager"));
 
     let session_ls = run_ok(["session", "ls", "--bus-url", &bus_url]);
@@ -123,7 +124,7 @@ fn cli_mutating_commands_work_against_isolated_nats() {
         &bus_url,
     ]);
     let session_history = String::from_utf8(session_history.stdout).unwrap();
-    assert!(session_history.contains("workspace.idea.submitted"));
+    assert!(session_history.contains("workspace.event.submitted"));
 
     run_ok([
         "session",
@@ -171,12 +172,12 @@ fn cli_mutating_commands_work_against_isolated_nats() {
         assert!(v.get("eventId").is_some(), "missing eventId in: {line}");
         assert!(v.get("topic").is_some(), "missing topic in: {line}");
     }
-    let idea_line = lines
+    let submitted_line = lines
         .iter()
-        .find(|l| l.contains("workspace.idea.submitted"))
-        .expect("no workspace.idea.submitted line in --json replay");
-    let idea: serde_json::Value = serde_json::from_str(idea_line).unwrap();
-    assert_eq!(idea["data"]["idea"], "Build smoke path");
+        .find(|l| l.contains("workspace.event.submitted"))
+        .expect("no workspace.event.submitted line in --json replay");
+    let submitted: serde_json::Value = serde_json::from_str(submitted_line).unwrap();
+    assert_eq!(submitted["data"]["text"], "Build smoke path");
 }
 
 fn run_ok<const N: usize>(args: [&str; N]) -> Output {

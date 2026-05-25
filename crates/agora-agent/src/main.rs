@@ -332,7 +332,7 @@ mod tests {
             acp: None,
             publishes: vec![],
             subscriptions: vec![SubscriptionSpec {
-                topic: "workspace.idea.submitted".into(),
+                topic: "workspace.event.submitted".into(),
                 required_scopes: vec!["workspace:read".into()],
                 prompt_template: template.into(),
                 emit: Some(EmitSpec {
@@ -345,7 +345,7 @@ mod tests {
 
     fn envelope(data: serde_json::Value) -> Envelope {
         Envelope::build(
-            "workspace.idea.submitted",
+            "workspace.event.submitted",
             "agora-console",
             0,
             "tok",
@@ -358,12 +358,12 @@ mod tests {
 
     #[test]
     fn resolves_top_level_keys() {
-        let env = envelope(serde_json::json!({ "idea": "x" }));
-        assert_eq!(resolve_key("topic", &env), "workspace.idea.submitted");
+        let env = envelope(serde_json::json!({ "text": "x" }));
+        assert_eq!(resolve_key("topic", &env), "workspace.event.submitted");
         assert_eq!(resolve_key("session_id", &env), "sess_abc");
         assert_eq!(resolve_key("sessionId", &env), "sess_abc");
         assert_eq!(resolve_key("event_id", &env), env.event_id);
-        assert_eq!(resolve_key("data.idea", &env), "x");
+        assert_eq!(resolve_key("data.text", &env), "x");
     }
 
     #[test]
@@ -382,15 +382,15 @@ mod tests {
     #[test]
     fn renders_prompt_template_substituting_placeholders() {
         let agent = ConfigAgent::new(
-            spec_with_sub("idea={{data.idea}} in {{session_id}} ({{topic}})"),
+            spec_with_sub("event={{data.text}} in {{session_id}} ({{topic}})"),
             Box::new(MockAcpClient::new("test-agent")),
         );
-        let env = envelope(serde_json::json!({ "idea": "ship it" }));
+        let env = envelope(serde_json::json!({ "text": "ship it" }));
         let rendered =
-            agent.render_prompt("idea={{data.idea}} in {{session_id}} ({{topic}})", &env);
+            agent.render_prompt("event={{data.text}} in {{session_id}} ({{topic}})", &env);
         assert_eq!(
             rendered,
-            "idea=ship it in sess_abc (workspace.idea.submitted)"
+            "event=ship it in sess_abc (workspace.event.submitted)"
         );
     }
 

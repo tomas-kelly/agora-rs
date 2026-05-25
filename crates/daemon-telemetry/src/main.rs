@@ -58,15 +58,19 @@ async fn main() -> Result<()> {
             msg = sub.next() => {
                 match msg {
                     Some(msg) => {
-                        match serde_json::from_slice::<serde_json::Value>(&msg.payload) {
-                            Ok(payload) => {
-                                let line = serde_json::to_string(&payload).unwrap_or_default();
+                        // Telemetry is now wrapped in an Envelope so it can
+                        // live in JetStream and be replayed by consoles that
+                        // connect later. We unwrap `envelope.data` to keep
+                        // the JSONL output shape backwards-compatible.
+                        match agora_core::envelope::Envelope::from_bytes(&msg.payload) {
+                            Ok(envelope) => {
+                                let line = serde_json::to_string(&envelope.data).unwrap_or_default();
                                 let mut f = file.lock().unwrap();
                                 if let Err(e) = writeln!(f, "{line}") {
                                     error!("Failed to write telemetry: {e}");
                                 }
                             }
-                            Err(e) => warn!("Could not parse telemetry payload: {e}"),
+                            Err(e) => warn!("Could not parse telemetry envelope: {e}"),
                         }
                     }
                     None => break,

@@ -19,13 +19,15 @@ use agora_core::{
     bookmark::{validate_bookmark_label, BookmarkEvent},
     bus::{AgentRegistryRecord, Bus},
     envelope::Envelope,
+    event_data_from_input,
     manifest::{AgentManifest, AgentStatus},
     tags::validate_tag,
     tokens::{default_key_path, load_signing_key, mint_actor_token},
     topics::{
         direct_inbox_topic, AGENT_TELEMETRY_LOGS, EVENT_BOOKMARKED, EVENT_STREAM,
-        EVENT_STREAM_SUBJECTS, EVENT_UNBOOKMARKED, SESSION_DELETED, SESSION_NAMED, SESSION_TAGGED,
-        SESSION_UNTAGGED, WORKSPACE_IDEA_SUBMITTED,
+        EVENT_STREAM_SUBJECTS, EVENT_UNBOOKMARKED, HUMAN_INTERACTION_REQUEST,
+        HUMAN_INTERACTION_RESPONSE, SESSION_DELETED, SESSION_NAMED, SESSION_TAGGED,
+        SESSION_UNTAGGED,
     },
 };
 use config::TopologyConfig;
@@ -63,10 +65,15 @@ enum Cmd {
     },
     /// Open the terminal console for the running swarm
     Console(agora_console::ConsoleArgs),
-    /// Submit an idea to a running swarm (fires workspace.idea.submitted)
+    /// Submit an event to a running swarm
     Submit {
-        /// The idea text
-        idea: String,
+        /// Event topic to publish
+        topic: String,
+        /// Event data as JSON, or plain text wrapped as {"text": "..."}
+        data: String,
+        /// Field name used when DATA is plain text
+        #[arg(long, default_value = "text")]
+        field: String,
         #[arg(long)]
         session_id: Option<String>,
         #[arg(long, default_value = "nats://127.0.0.1:4222")]
@@ -238,6 +245,17 @@ enum Cmd {
     Bookmark {
         #[command(subcommand)]
         command: BookmarkCmd,
+    },
+    /// Respond to a pending human.interaction.request
+    Respond {
+        /// Event ID of the human.interaction.request to respond to
+        event_id: String,
+        /// Response text (reads from stdin if omitted)
+        answer: Option<String>,
+        #[arg(long, default_value = "nats://127.0.0.1:4222")]
+        bus_url: String,
+        #[arg(long, default_value = ".kiro/session_token")]
+        key_path: String,
     },
 }
 
@@ -562,11 +580,23 @@ async fn main() -> Result<()> {
         }
         Cmd::Console(args) => agora_console::run(args).await,
         Cmd::Submit {
-            idea,
+            topic,
+            data,
+            field,
             session_id,
             bus_url,
             key_path,
-        } => submit_idea(&idea, session_id.as_deref(), &bus_url, &key_path).await,
+        } => {
+            submit_event(
+                &topic,
+                &data,
+                &field,
+                session_id.as_deref(),
+                &bus_url,
+                &key_path,
+            )
+            .await
+        }
         Cmd::Sessions {
             include_deleted,
             bus_url,
@@ -862,7 +892,68 @@ async fn main() -> Result<()> {
                 bus_url,
             } => list_bookmarks(session_id.as_deref(), &bus_url, json).await,
         },
+        Cmd::Respond {
+            event_id,
+            answer,
+            bus_url,
+            key_path,
+        } => respond_to_interaction(&event_id, answer.as_deref(), &bus_url, &key_path).await,
     }
+}
+
+async fn respond_to_interaction(
+    event_id: &str,
+    answer: Option<&str>,
+    bus_url: &str,
+    key_path: &str,
+) -> Result<()> {
+    let answer = match answer {
+        Some(answer) => answer.to_string(),
+        None => {
+            let mut input = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+            input.trim_end_matches('\n').to_string()
+        }
+    };
+
+    let bus = Bus::connect(bus_url).await?;
+    let events = bus.read_all_events().await?;
+    let request = events
+        .iter()
+        .find(|event| event.event_id == event_id)
+        .with_context(|| format!("event `{event_id}` not found in stream"))?;
+    if request.topic != HUMAN_INTERACTION_REQUEST {
+        bail!(
+            "event `{event_id}` is `{}`, not `{HUMAN_INTERACTION_REQUEST}`",
+            request.topic
+        );
+    }
+
+    let signing_key = load_signing_key(key_path)?;
+    let token = mint_actor_token(
+        "cli-user",
+        &["workspace:read", "workspace:write"],
+        &request.context.session_id,
+        &signing_key,
+        900,
+    )?;
+    let env = Envelope::build(
+        HUMAN_INTERACTION_RESPONSE,
+        "agora-cli",
+        0,
+        token,
+        request.context.session_id.clone(),
+        serde_json::json!({
+            "correlationId": event_id,
+            "answer": answer,
+            "respondedBy": "agora-cli",
+        }),
+        None,
+        vec![],
+    );
+    bus.publish(&env).await?;
+    println!("Responded to {event_id}");
+    Ok(())
 }
 
 async fn add_bookmark(
@@ -1542,12 +1633,19 @@ impl Drop for PidFileGuard {
     }
 }
 
-async fn submit_idea(
-    idea: &str,
+async fn submit_event(
+    topic: &str,
+    data: &str,
+    text_field: &str,
     session_id: Option<&str>,
     bus_url: &str,
     key_path: &str,
 ) -> Result<()> {
+    let topic = topic.trim();
+    if topic.is_empty() {
+        bail!("event topic cannot be empty");
+    }
+    let data = event_data_from_input(data, text_field)?;
     let signing_key = load_signing_key(key_path)?;
     let session_id = session_id
         .map(String::from)
@@ -1562,18 +1660,18 @@ async fn submit_idea(
 
     let bus = Bus::connect(bus_url).await?;
     let envelope = Envelope::build(
-        WORKSPACE_IDEA_SUBMITTED,
+        topic,
         "agora-cli",
         0u16,
         token,
         session_id.clone(),
-        serde_json::json!({ "idea": idea }),
+        data,
         None,
         vec![],
     );
 
     bus.publish(&envelope).await?;
-    println!("Submitted session {session_id}: {idea}");
+    println!("Submitted event {topic} in session {session_id}");
     Ok(())
 }
 
@@ -2694,6 +2792,7 @@ fn write_new_signing_key(path: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agora_core::topics::WORKSPACE_EVENT_SUBMITTED;
 
     fn event(topic: &str, session_id: &str, data: serde_json::Value) -> Envelope {
         Envelope::build(topic, "test", 0, "tok", session_id, data, None, vec![])
@@ -2708,9 +2807,9 @@ mod tests {
                 serde_json::json!({ "name": "Delete me" }),
             ),
             event(
-                WORKSPACE_IDEA_SUBMITTED,
+                WORKSPACE_EVENT_SUBMITTED,
                 "sess_delete",
-                serde_json::json!({ "idea": "keep history" }),
+                serde_json::json!({ "text": "keep history" }),
             ),
             event(
                 SESSION_DELETED,
@@ -2723,7 +2822,7 @@ mod tests {
         let summary = sessions.get("sess_delete").expect("session summary");
         assert_eq!(summary.name.as_deref(), Some("Delete me"));
         assert_eq!(summary.event_count, 1);
-        assert_eq!(summary.last_topic, WORKSPACE_IDEA_SUBMITTED);
+        assert_eq!(summary.last_topic, WORKSPACE_EVENT_SUBMITTED);
         assert!(summary.deleted);
         assert!(summary.deleted_at.is_some());
     }

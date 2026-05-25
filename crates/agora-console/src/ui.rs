@@ -8,20 +8,16 @@ use crate::app::{App, InputMode};
 
 const COMPOSER_MIN_HEIGHT: u16 = 7;
 const COMPOSER_MAX_HEIGHT: u16 = 18;
+const EVENT_LIST_WITH_DETAIL_WIDTH: u16 = 46;
+const EVENT_LIST_WITH_DETAIL_MIN_WIDTH: u16 = 32;
+const EVENT_DETAIL_MIN_WIDTH: u16 = 48;
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
-    let main_visible = !app.full_event_details_open()
-        && (app.panels.sessions || app.panels.events || app.panels.agents);
-    let detail_height = if !app.panels.detail {
-        0
-    } else if app.command_output.is_some() {
+    let main_visible = app.panels.sessions || app.panels.events || app.panels.agents;
+    let output_height = if app.panels.detail && app.command_output.is_some() {
         (area.height / 3).clamp(10, 16)
-    } else if app.full_event_details_open() {
-        0
-    } else if app.event_details_open() {
-        8
     } else {
         0
     };
@@ -31,36 +27,26 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let input_height = (input_lines + 3)
         .clamp(COMPOSER_MIN_HEIGHT, COMPOSER_MAX_HEIGHT)
         .min(max_for_terminal);
-    let full_details = app.panels.detail && app.full_event_details_open();
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(if full_details {
-            [
-                Constraint::Length(1), // status bar
-                Constraint::Length(0), // hidden main panels
-                Constraint::Min(8),    // full event details
-                Constraint::Length(input_height),
-            ]
-        } else {
-            [
-                Constraint::Length(1), // status bar
-                if main_visible {
-                    Constraint::Min(6)
-                } else {
-                    Constraint::Length(0)
-                },
-                Constraint::Length(detail_height), // detail / command output
-                Constraint::Length(input_height),  // input (grows for multi-line)
-            ]
-        })
+        .constraints([
+            Constraint::Length(1), // status bar
+            if main_visible {
+                Constraint::Min(6)
+            } else {
+                Constraint::Length(0)
+            },
+            Constraint::Length(output_height), // command output
+            Constraint::Length(input_height),  // input (grows for multi-line)
+        ])
         .split(area);
 
     render_status(f, app, outer[0]);
 
     render_main_panels(f, app, outer[1]);
 
-    if app.panels.detail && (app.command_output.is_some() || app.event_details_open()) {
-        render_detail(f, app, outer[2]);
+    if app.panels.detail && app.command_output.is_some() {
+        render_command_output(f, app, outer[2]);
     }
     render_input(f, app, outer[3]);
 }
@@ -104,19 +90,39 @@ fn render_main_panels(f: &mut Frame, app: &mut App, area: Rect) {
 
     let sidebar_visible = app.panels.sessions || app.panels.agents;
     let events_visible = app.panels.events;
+    let details_visible = app.panels.detail && app.event_details_open();
 
-    match (sidebar_visible, events_visible) {
-        (false, false) => {
+    match (sidebar_visible, events_visible, details_visible) {
+        (false, false, false) => {
             app.events_view_height = 1;
         }
-        (false, true) => {
+        (false, true, false) => {
             render_events(f, app, area);
         }
-        (true, false) => {
+        (true, false, false) => {
             app.events_view_height = 1;
             render_sidebar(f, app, area);
         }
-        (true, true) => {
+        (false, false, true) => render_event_detail(f, app, area),
+        (true, false, true) => {
+            app.events_view_height = 1;
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(34), Constraint::Min(40)])
+                .split(area);
+            render_sidebar(f, app, cols[0]);
+            render_event_detail(f, app, cols[1]);
+        }
+        (false, true, true) => render_events_and_detail(f, app, area),
+        (true, true, true) => {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(34), Constraint::Min(40)])
+                .split(area);
+            render_sidebar(f, app, cols[0]);
+            render_events_and_detail(f, app, cols[1]);
+        }
+        (true, true, false) => {
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Length(34), Constraint::Min(40)])
@@ -124,6 +130,28 @@ fn render_main_panels(f: &mut Frame, app: &mut App, area: Rect) {
             render_sidebar(f, app, cols[0]);
             render_events(f, app, cols[1]);
         }
+    }
+}
+
+fn render_events_and_detail(f: &mut Frame, app: &mut App, area: Rect) {
+    let event_width = event_list_width_with_detail(area.width);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(event_width),
+            Constraint::Min(EVENT_DETAIL_MIN_WIDTH),
+        ])
+        .split(area);
+    render_events(f, app, cols[0]);
+    render_event_detail(f, app, cols[1]);
+}
+
+fn event_list_width_with_detail(width: u16) -> u16 {
+    let max_for_events = width.saturating_sub(EVENT_DETAIL_MIN_WIDTH);
+    if max_for_events >= EVENT_LIST_WITH_DETAIL_MIN_WIDTH {
+        EVENT_LIST_WITH_DETAIL_WIDTH.min(max_for_events)
+    } else {
+        EVENT_LIST_WITH_DETAIL_MIN_WIDTH.min(width)
     }
 }
 
@@ -158,14 +186,38 @@ fn render_sessions(f: &mut Frame, app: &App, area: Rect) {
         .collect();
     sessions.sort_by(|a, b| b.started_at.cmp(&a.started_at));
 
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(match app.tag_filter.as_deref() {
+            Some(tag) => format!(" Sessions ({}) · tag:{tag} ", sessions.len()),
+            None => format!(" Sessions ({}) ", sessions.len()),
+        })
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    if sessions.is_empty() {
+        let message = match app.tag_filter.as_deref() {
+            Some(tag) => format!(" No sessions tagged {tag} "),
+            None => " No sessions yet ".to_string(),
+        };
+        let para = Paragraph::new(message).style(Style::default().fg(Color::DarkGray));
+        f.render_widget(para, inner);
+        return;
+    }
+
     let items: Vec<ListItem> = sessions
         .iter()
-        .take(area.height.saturating_sub(2) as usize / 2)
+        .take(session_item_limit(inner.height))
         .map(|s| {
             let is_active = app.active_session.as_deref() == Some(s.session_id.as_str());
             let display = app.display_name(&s.session_id);
             let marker = if is_active { "▶ " } else { "  " };
-            let title_style = if is_active {
+            let style = if is_active {
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
@@ -175,39 +227,19 @@ fn render_sessions(f: &mut Frame, app: &App, area: Rect) {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
             };
-            let secondary_text = if s.event_count == 0 && s.last_topic.is_empty() {
-                "  (empty)".to_string()
-            } else {
-                format!("  {} · {} events", &s.last_topic, s.event_count)
-            };
-            let mut secondary_spans: Vec<Span> = vec![Span::styled(
-                secondary_text,
-                Style::default().fg(Color::DarkGray),
-            )];
-            let tag_style = Style::default().fg(Color::Magenta);
-            for tag in s.tags.iter().take(3) {
-                secondary_spans.push(Span::styled(format!(" [{tag}]"), tag_style));
-            }
-            if s.tags.len() > 3 {
-                secondary_spans.push(Span::styled(format!(" +{}", s.tags.len() - 3), tag_style));
-            }
-            ListItem::new(vec![
-                Line::from(vec![Span::raw(marker), Span::styled(display, title_style)]),
-                Line::from(secondary_spans),
-            ])
+            ListItem::new(Line::from(vec![
+                Span::raw(marker),
+                Span::styled(display, style),
+            ]))
         })
         .collect();
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(match app.tag_filter.as_deref() {
-                Some(tag) => format!(" Sessions ({}) · tag:{tag} ", sessions.len()),
-                None => format!(" Sessions ({}) ", sessions.len()),
-            })
-            .border_style(Style::default().fg(Color::DarkGray)),
-    );
-    f.render_widget(list, area);
+    let list = List::new(items);
+    f.render_widget(list, inner);
+}
+
+fn session_item_limit(inner_height: u16) -> usize {
+    inner_height as usize
 }
 
 fn render_events(f: &mut Frame, app: &mut App, area: Rect) {
@@ -216,10 +248,22 @@ fn render_events(f: &mut Frame, app: &mut App, area: Rect) {
     // Record viewport height so selection movement can keep the highlighted
     // event visible after terminal resizes.
     app.sync_events_viewport(inner.height);
+    let indices = app.active_session_event_indices();
+    let total = indices.len();
 
-    let title = match app.selected_event_index() {
-        Some(idx) => format!(" Events ({}/{}) ", idx + 1, app.events.len()),
-        None => " Events ".to_string(),
+    let title = match (app.active_session.as_deref(), app.selected_event_position()) {
+        (Some(session_id), Some(pos)) => {
+            format!(
+                " Events: {} ({}/{}) ",
+                app.display_name(session_id),
+                pos + 1,
+                total
+            )
+        }
+        (Some(session_id), None) => {
+            format!(" Events: {} ({}) ", app.display_name(session_id), total)
+        }
+        (None, _) => " Events: no active session ".to_string(),
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -231,30 +275,40 @@ fn render_events(f: &mut Frame, app: &mut App, area: Rect) {
     // Clamp scroll so the pane never goes blank when scrolled past the
     // oldest event. Belt + braces against any path that bumped
     // events_scroll without going through scroll_up.
-    let max_scroll = app.events.len().saturating_sub(height);
+    let max_scroll = total.saturating_sub(height);
     if (app.events_scroll as usize) > max_scroll {
         app.events_scroll = max_scroll as u16;
     }
     let scroll = app.events_scroll as usize;
 
     // The newest events sit at the end; auto-scroll keeps the bottom in view.
-    let end = app.events.len().saturating_sub(scroll);
+    let end = total.saturating_sub(scroll);
     let start = end.saturating_sub(height);
     let selected_idx = app.selected_event_index();
 
-    let items: Vec<ListItem> = app.events[start..end]
+    if indices.is_empty() {
+        let message = if app.active_session.is_some() {
+            " No events in selected session "
+        } else {
+            " Select a session with Tab or create one with Ctrl-N "
+        };
+        let para = Paragraph::new(message).style(Style::default().fg(Color::DarkGray));
+        f.render_widget(para, inner);
+        return;
+    }
+
+    let items: Vec<ListItem> = indices[start..end]
         .iter()
-        .enumerate()
-        .map(|(offset, e)| {
-            let idx = start + offset;
-            let selected = selected_idx == Some(idx);
+        .filter_map(|idx| {
+            let e = app.events.get(*idx)?;
+            let selected = selected_idx == Some(*idx);
             let bookmarked = app.bookmarks.contains_key(&e.event_id);
             let item = ListItem::new(format_event_line(e, selected, bookmarked));
-            if selected {
+            Some(if selected {
                 item.style(Style::default().add_modifier(Modifier::REVERSED))
             } else {
                 item
-            }
+            })
         })
         .collect();
 
@@ -272,7 +326,6 @@ fn format_event_line(
     } else {
         e.timestamp.clone()
     };
-    let session = short_id(&e.context.session_id, 12);
     let color = topic_color(&e.topic);
     let marker = if selected { "› " } else { "  " };
 
@@ -280,9 +333,7 @@ fn format_event_line(
         Span::styled(marker, Style::default().fg(Color::Yellow)),
         Span::styled(ts, Style::default().fg(Color::DarkGray)),
         Span::raw("  "),
-        Span::styled(format!("{:32}", e.topic), Style::default().fg(color)),
-        Span::raw("  "),
-        Span::styled(session, Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{:30}", e.topic), Style::default().fg(color)),
     ];
     if bookmarked {
         spans.push(Span::styled(" ★", Style::default().fg(Color::Yellow)));
@@ -351,7 +402,7 @@ fn render_agents(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(list, area);
 }
 
-fn render_detail(f: &mut Frame, app: &App, area: Rect) {
+fn render_command_output(f: &mut Frame, app: &App, area: Rect) {
     if let Some(out) = &app.command_output {
         let total_lines = out.lines().count() as u16;
         let visible = area.height.saturating_sub(2);
@@ -375,13 +426,16 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0));
         f.render_widget(para, area);
-        return;
     }
+}
 
-    let (idx, event) = match app.inspected_event_with_index() {
+fn render_event_detail(f: &mut Frame, app: &App, area: Rect) {
+    let (_idx, event) = match app.inspected_event_with_index() {
         Some(event) => event,
         None => return,
     };
+    let pos = app.inspected_event_position().unwrap_or(0);
+    let total = app.active_session_event_count();
 
     if app.full_event_details_open() {
         let text = redacted_event_json(event);
@@ -392,16 +446,16 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
         let title = if total_lines > visible {
             format!(
                 " Full event details ({}/{})  [line {}/{}, PgUp/PgDn or wheel · Left collapses · Esc closes] ",
-                idx + 1,
-                app.events.len(),
+                pos + 1,
+                total,
                 scroll + 1,
                 total_lines
             )
         } else {
             format!(
                 " Full event details ({}/{}) · Left collapses · Esc closes ",
-                idx + 1,
-                app.events.len()
+                pos + 1,
+                total
             )
         };
         let block = Block::default()
@@ -424,8 +478,8 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
         (
             format!(
                 " Event inspector ({}/{}) · Right expands · Esc closes ",
-                idx + 1,
-                app.events.len()
+                pos + 1,
+                total
             ),
             format!(
                 "topic:   {}\nevent:   {}\ntime:    {}\nsession: {}  ({})\nfrom:    {}\ndata:    {}",
@@ -461,11 +515,24 @@ fn redacted_event_json(e: &agora_core::envelope::Envelope) -> String {
 fn render_input(f: &mut Frame, app: &mut App, area: Rect) {
     let (base_title, prompt_char, border) = match app.mode {
         InputMode::Normal => {
-            let scope = match &app.active_session {
-                Some(sid) => format!("active: {}", app.display_name(sid)),
-                None => "no active session — submit creates one".into(),
-            };
-            (format!(" Compose · {scope} "), "›", Color::Yellow)
+            if let Some((_, _, question)) = app.active_interaction_request() {
+                let preview = if question.len() > 60 {
+                    format!("{}…", &question[..60])
+                } else {
+                    question
+                };
+                (
+                    format!(" Respond: {preview} · Enter sends · select another event to cancel "),
+                    "›",
+                    Color::Cyan,
+                )
+            } else {
+                let scope = match &app.active_session {
+                    Some(sid) => format!("active: {}", app.display_name(sid)),
+                    None => "no active session — submit creates one".into(),
+                };
+                (format!(" Compose · {scope} "), "›", Color::Yellow)
+            }
         }
         InputMode::NamingNew => (
             " Name new session (Enter to create · Esc to cancel) ".into(),
@@ -581,10 +648,23 @@ fn input_end_position(input: &str, content_width: u16) -> (u16, u16) {
     (row, col)
 }
 
-fn short_id(id: &str, n: usize) -> String {
-    if id.len() <= n {
-        id.to_string()
-    } else {
-        format!("{}…", &id[..n])
+#[cfg(test)]
+mod tests {
+    use super::{event_list_width_with_detail, session_item_limit};
+
+    #[test]
+    fn session_item_limit_uses_one_row_per_session() {
+        assert_eq!(session_item_limit(0), 0);
+        assert_eq!(session_item_limit(1), 1);
+        assert_eq!(session_item_limit(2), 2);
+        assert_eq!(session_item_limit(3), 3);
+        assert_eq!(session_item_limit(4), 4);
+    }
+
+    #[test]
+    fn event_list_stays_compact_when_detail_is_open() {
+        assert_eq!(event_list_width_with_detail(160), 46);
+        assert_eq!(event_list_width_with_detail(94), 46);
+        assert_eq!(event_list_width_with_detail(80), 32);
     }
 }

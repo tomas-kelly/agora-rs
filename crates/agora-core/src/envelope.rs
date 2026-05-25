@@ -122,12 +122,12 @@ mod tests {
 
     fn fixture() -> Envelope {
         Envelope::build(
-            "workspace.idea.submitted",
+            "workspace.event.submitted",
             "agora-console",
             0,
             "tok",
             "sess_abc",
-            serde_json::json!({ "idea": "build a thing" }),
+            serde_json::json!({ "text": "build a thing" }),
             Some("deadbeef".into()),
             vec!["src/main.rs".into()],
         )
@@ -142,7 +142,7 @@ mod tests {
         assert_eq!(decoded.event_id, env.event_id);
         assert_eq!(decoded.context.session_id, "sess_abc");
         assert_eq!(decoded.context.affected_files, vec!["src/main.rs"]);
-        assert_eq!(decoded.data["idea"], "build a thing");
+        assert_eq!(decoded.data["text"], "build a thing");
     }
 
     #[test]
