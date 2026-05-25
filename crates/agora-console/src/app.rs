@@ -208,6 +208,9 @@ pub struct App {
 
     pub tag_filter: Option<String>,
     pub bookmarks: HashMap<String, Option<String>>,
+    /// Topology-derived view of which topics are valid + what scopes the
+    /// human's actor token must carry to publish each one.
+    pub topology: agora_core::TopicCatalog,
     pub pending_action: Option<PendingAction>,
 }
 
@@ -218,6 +221,7 @@ impl App {
         bus_url: String,
         submit_topic: String,
         submit_field: String,
+        topology: agora_core::TopicCatalog,
     ) -> Self {
         Self {
             input: String::new(),
@@ -253,6 +257,7 @@ impl App {
             panels: PanelVisibility::default(),
             tag_filter: None,
             bookmarks: HashMap::new(),
+            topology,
             pending_action: None,
         }
     }
@@ -1690,18 +1695,45 @@ impl App {
             self.status_msg = Some("Submit topic cannot be empty".into());
             return Ok(());
         }
+
+        // Topology-aware validation. If the catalog is non-empty and the
+        // topic isn't in it, refuse — almost certainly a typo. (An empty
+        // catalog means we couldn't load the topology at startup; fall
+        // through to legacy behavior so we don't block the user.)
+        if !self.topology.known.is_empty() && !self.topology.knows(topic) {
+            let hint = match self.topology.matching(topic).first() {
+                Some(near) => format!(" Did you mean `{near}`?"),
+                None => String::new(),
+            };
+            self.status_msg = Some(format!(
+                "Unknown topic `{topic}` — not declared in topology.{hint}"
+            ));
+            return Ok(());
+        }
+
         let data = event_data_from_input(&input, &self.submit_field)?;
         let session_id = self
             .active_session
             .clone()
             .unwrap_or_else(|| format!("sess_{}", ulid::Ulid::new()));
-        let token = mint_actor_token(
-            "console-user",
-            &["workspace:read", "workspace:write"],
-            &session_id,
-            &self.signing_key,
-            900,
-        )?;
+
+        // Derive scopes from the topology so the token satisfies whatever
+        // subscribers declared as `required_scopes`. Fall back to the
+        // legacy read/write pair when the topology gave us nothing
+        // (e.g. publishing a topic with no subscribers).
+        let catalog_scopes: Vec<&str> = self
+            .topology
+            .scopes_for(topic)
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let fallback = ["workspace:read", "workspace:write"];
+        let scopes: &[&str] = if catalog_scopes.is_empty() {
+            &fallback
+        } else {
+            &catalog_scopes
+        };
+        let token = mint_actor_token("console-user", scopes, &session_id, &self.signing_key, 900)?;
         let env = Envelope::build(
             topic,
             "agora-console",

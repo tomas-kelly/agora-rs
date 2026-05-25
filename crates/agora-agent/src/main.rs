@@ -10,7 +10,8 @@
 //! publishes the response.
 //!
 //! Response handling:
-//! - If kiro returns valid JSON, that becomes the published event's `data`.
+//! - If kiro returns valid JSON, or valid JSON on the final non-empty line,
+//!   that becomes the published event's `data`.
 //! - Otherwise the response text is wrapped as `{"summary": "<text>"}`.
 //! - If the JSON contains `_topic`, that overrides the subscription's
 //!   default emit topic (the actual data is taken from `_data` if present,
@@ -22,12 +23,12 @@ use agora_core::{
     daemon::{Agent, DaemonConfig, DaemonRunner, Publisher},
     envelope::Envelope,
     manifest::{PublishedEvent, Subscription},
-    topics::direct_inbox_topic,
+    topics::{direct_inbox_topic, CODE_CHANGED},
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use clap::Parser;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use tracing::{info, warn};
 
@@ -176,6 +177,116 @@ fn resolve_key(key: &str, envelope: &Envelope) -> String {
     }
 }
 
+fn parse_agent_response(text: &str) -> serde_json::Value {
+    let trimmed = text.trim();
+    if let Ok(value) = serde_json::from_str(trimmed) {
+        return value;
+    }
+
+    for line in text
+        .lines()
+        .rev()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if let Ok(value) = serde_json::from_str(line) {
+            return value;
+        }
+    }
+
+    if let Some(value) = parse_fenced_json(text) {
+        return value;
+    }
+
+    serde_json::json!({ "summary": text })
+}
+
+fn parse_fenced_json(text: &str) -> Option<serde_json::Value> {
+    let mut parts = text.split("```");
+    parts.next();
+
+    let mut parsed = None;
+    while let Some(block) = parts.next() {
+        let content = strip_fence_language(block.trim());
+        if let Ok(value) = serde_json::from_str(content.trim()) {
+            parsed = Some(value);
+        }
+        parts.next();
+    }
+    parsed
+}
+
+fn strip_fence_language(block: &str) -> &str {
+    let Some((first, rest)) = block.split_once('\n') else {
+        return block;
+    };
+    match first.trim() {
+        "json" | "JSON" => rest,
+        _ => block,
+    }
+}
+
+fn output_topic_and_data(
+    parsed: serde_json::Value,
+    emit_topic: &str,
+) -> (String, serde_json::Value) {
+    if let Some(topic) = parsed.get("_topic").and_then(|v| v.as_str()) {
+        let mut data = parsed.get("_data").cloned().unwrap_or_else(|| {
+            let mut value = parsed.clone();
+            if let serde_json::Value::Object(ref mut object) = value {
+                object.remove("_topic");
+            }
+            value
+        });
+        remove_control_fields(&mut data);
+        return (topic.to_string(), data);
+    }
+
+    let mut data = parsed;
+    remove_control_fields(&mut data);
+    (emit_topic.to_string(), data)
+}
+
+fn remove_control_fields(value: &mut serde_json::Value) {
+    if let serde_json::Value::Object(object) = value {
+        object.remove("_topic");
+        object.remove("_data");
+    }
+}
+
+fn affected_files_for_output(topic: &str, data: &serde_json::Value) -> Option<Vec<String>> {
+    if topic != CODE_CHANGED {
+        return None;
+    }
+
+    for field in [
+        "changedFiles",
+        "affectedFiles",
+        "changed_files",
+        "affected_files",
+    ] {
+        if let Some(values) = data.get(field).and_then(|value| value.as_array()) {
+            return Some(string_array(values));
+        }
+    }
+
+    None
+}
+
+fn string_array(values: &[serde_json::Value]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    values
+        .iter()
+        .filter_map(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter_map(|value| {
+            let value = value.to_string();
+            seen.insert(value.clone()).then_some(value)
+        })
+        .collect()
+}
+
 #[async_trait]
 impl Agent for ConfigAgent {
     fn agent_name(&self) -> &str {
@@ -279,31 +390,14 @@ impl Agent for ConfigAgent {
             )
             .await;
 
-        // Parse as JSON, else wrap
-        let parsed: serde_json::Value = serde_json::from_str(&result.text)
-            .unwrap_or_else(|_| serde_json::json!({ "summary": result.text }));
+        let parsed = parse_agent_response(&result.text);
 
         if let Some(emit) = &sub.emit {
-            let (out_topic, mut out_data) =
-                if let Some(t) = parsed.get("_topic").and_then(|v| v.as_str()) {
-                    let data = parsed.get("_data").cloned().unwrap_or_else(|| {
-                        let mut v = parsed.clone();
-                        if let serde_json::Value::Object(ref mut o) = v {
-                            o.remove("_topic");
-                        }
-                        v
-                    });
-                    (t.to_string(), data)
-                } else {
-                    (emit.topic.clone(), parsed)
-                };
-
-            if let serde_json::Value::Object(ref mut o) = out_data {
-                o.remove("_topic");
-                o.remove("_data");
-            }
-
-            publisher.publish(&out_topic, out_data, None).await?;
+            let (out_topic, out_data) = output_topic_and_data(parsed, &emit.topic);
+            let affected_files = affected_files_for_output(&out_topic, &out_data);
+            publisher
+                .publish(&out_topic, out_data, affected_files)
+                .await?;
         }
 
         Ok(())
@@ -316,7 +410,10 @@ impl Agent for ConfigAgent {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_key, ConfigAgent};
+    use super::{
+        affected_files_for_output, output_topic_and_data, parse_agent_response, resolve_key,
+        ConfigAgent,
+    };
     use agora_core::{
         acp::MockAcpClient,
         agent_spec::{AgentSpec, EmitSpec, SubscriptionSpec},
@@ -413,5 +510,72 @@ mod tests {
         let env = envelope(serde_json::json!({}));
         // No closing `}}` — entire run passes through.
         assert!(agent.render_prompt("oops {{noend", &env).contains("oops"));
+    }
+
+    #[test]
+    fn parses_exact_json_response() {
+        let parsed = parse_agent_response(r#"{"summary":"ok"}"#);
+        assert_eq!(parsed["summary"], "ok");
+    }
+
+    #[test]
+    fn parses_json_from_final_non_empty_line() {
+        let parsed = parse_agent_response(
+            "I checked the files first.\n\n{\"summary\":\"done\",\"changedFiles\":[\"src/lib.rs\"]}",
+        );
+        assert_eq!(parsed["summary"], "done");
+        assert_eq!(parsed["changedFiles"][0], "src/lib.rs");
+    }
+
+    #[test]
+    fn parses_last_fenced_json_as_development_fallback() {
+        let parsed = parse_agent_response(
+            "Result:\n```json\n{\"summary\":\"fenced\",\"status\":\"succeeded\"}\n```\n",
+        );
+        assert_eq!(parsed["summary"], "fenced");
+        assert_eq!(parsed["status"], "succeeded");
+    }
+
+    #[test]
+    fn wraps_plain_text_response() {
+        let parsed = parse_agent_response("plain notes only");
+        assert_eq!(parsed["summary"], "plain notes only");
+    }
+
+    #[test]
+    fn routes_topic_override_and_strips_control_fields() {
+        let parsed = serde_json::json!({
+            "_topic": "test.failed",
+            "_data": {
+                "summary": "failed",
+                "_topic": "ignored",
+                "_data": {}
+            }
+        });
+
+        let (topic, data) = output_topic_and_data(parsed, "test.passed");
+
+        assert_eq!(topic, "test.failed");
+        assert_eq!(data["summary"], "failed");
+        assert!(data.get("_topic").is_none());
+        assert!(data.get("_data").is_none());
+    }
+
+    #[test]
+    fn extracts_changed_files_for_code_changed() {
+        let data = serde_json::json!({
+            "summary": "changed",
+            "changedFiles": ["src/lib.rs", " src/main.rs ", "", "src/lib.rs", 7]
+        });
+
+        let files = affected_files_for_output("code.changed", &data).unwrap();
+
+        assert_eq!(files, vec!["src/lib.rs", "src/main.rs"]);
+    }
+
+    #[test]
+    fn ignores_changed_files_for_other_topics() {
+        let data = serde_json::json!({ "changedFiles": ["src/lib.rs"] });
+        assert!(affected_files_for_output("test.passed", &data).is_none());
     }
 }

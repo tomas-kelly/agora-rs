@@ -34,6 +34,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::mpsc;
+use tracing::warn;
 
 #[derive(Debug, Clone, Args)]
 pub struct ConsoleArgs {
@@ -41,6 +42,12 @@ pub struct ConsoleArgs {
     bus_url: String,
     #[arg(long, default_value = ".kiro/session_token")]
     key_path: String,
+    /// Topology file. Used to validate submit topics and derive
+    /// actor-token scopes from the topology's `required_scopes`.
+    /// If the file is missing the console still runs, but submits
+    /// fall back to the legacy hardcoded scopes and accept any topic.
+    #[arg(long, default_value = "agents.local.json")]
+    config: std::path::PathBuf,
     /// Topic used when plain composer text is submitted
     #[arg(long, default_value = "workspace.event.submitted")]
     submit_topic: String,
@@ -60,12 +67,28 @@ pub async fn run(args: ConsoleArgs) -> Result<()> {
     );
     let signing_key = load_signing_key(&args.key_path)?;
 
+    // Best-effort topology load. If the file is absent or unparseable we
+    // run with an empty catalog (legacy fall-through behavior) rather
+    // than refusing to start — the console is still useful for read-only
+    // inspection of a swarm whose topology we don't have on disk.
+    let topology = match agora_core::TopologySnapshot::load(&args.config) {
+        Ok(snap) => snap.topic_catalog(),
+        Err(e) => {
+            warn!(
+                "Could not load topology from {} ({e}); submits will skip topic validation",
+                args.config.display()
+            );
+            agora_core::TopicCatalog::default()
+        }
+    };
+
     let mut app = App::new(
         bus.clone(),
         signing_key,
         args.bus_url.clone(),
         args.submit_topic.clone(),
         args.submit_field.clone(),
+        topology,
     );
 
     let (tx, mut rx) = mpsc::channel::<AppEvent>(256);

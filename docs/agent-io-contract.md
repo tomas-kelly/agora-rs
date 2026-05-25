@@ -123,7 +123,14 @@ Return exactly one JSON object. No markdown fences. No prose after the JSON.
 Agents should return exactly one JSON object as their final response. The object
 is parsed by `agora-agent`.
 
-Do not return markdown fences. Do not append prose after the JSON object.
+For production prompts, prefer a single JSON object with no markdown fences and
+no prose after it. During development, `agora-agent` parses responses in this
+order:
+
+1. The whole response as JSON.
+2. The final non-empty line as JSON.
+3. The last parseable fenced JSON block.
+4. Plain text wrapped as `{ "summary": "<response text>" }`.
 
 ### Single-route Output
 
@@ -170,9 +177,8 @@ Routing rules:
 5. Else use the full response object after removing control fields.
 6. `_topic` must be declared in `publishes[]`.
 
-The current implementation supports `_topic` and `_data`. Strict validation of
-`_topic` against `publishes[]` is the intended contract and should be enforced
-before treating arbitrary topologies as production safe.
+`Publisher::publish` enforces this at runtime: undeclared output topics are
+rejected and the event is not published.
 
 ### Plain Text Output
 
@@ -213,6 +219,10 @@ Allowed `status` values:
 - `no_op`
 
 `summary` should always be present. Other fields are topic-specific.
+
+For `code.changed`, `changedFiles` is also copied into the envelope context as
+`affectedFiles`. A `code.changed` event must include at least one non-empty file
+path in `changedFiles` (or `affectedFiles`) or the runtime rejects the publish.
 
 ## Human Interaction
 

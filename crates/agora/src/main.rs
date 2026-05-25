@@ -80,6 +80,13 @@ enum Cmd {
         bus_url: String,
         #[arg(long, default_value = ".kiro/session_token")]
         key_path: String,
+        /// Topology file. Used to reject unknown topics and derive
+        /// actor-token scopes. Pass `--no-topology` to skip both.
+        #[arg(long, default_value = "agents.local.json")]
+        config: std::path::PathBuf,
+        /// Skip topology-aware validation and scope derivation.
+        #[arg(long)]
+        no_topology: bool,
     },
     /// List sessions seen in the event stream
     Sessions {
@@ -586,7 +593,23 @@ async fn main() -> Result<()> {
             session_id,
             bus_url,
             key_path,
+            config,
+            no_topology,
         } => {
+            let catalog = if no_topology {
+                agora_core::TopicCatalog::default()
+            } else {
+                match agora_core::TopologySnapshot::load(&config) {
+                    Ok(snap) => snap.topic_catalog(),
+                    Err(e) => {
+                        warn!(
+                            "Could not load topology from {} ({e}); falling back to legacy scopes",
+                            config.display()
+                        );
+                        agora_core::TopicCatalog::default()
+                    }
+                }
+            };
             submit_event(
                 &topic,
                 &data,
@@ -594,6 +617,7 @@ async fn main() -> Result<()> {
                 session_id.as_deref(),
                 &bus_url,
                 &key_path,
+                &catalog,
             )
             .await
         }
@@ -1640,23 +1664,42 @@ async fn submit_event(
     session_id: Option<&str>,
     bus_url: &str,
     key_path: &str,
+    catalog: &agora_core::TopicCatalog,
 ) -> Result<()> {
     let topic = topic.trim();
     if topic.is_empty() {
         bail!("event topic cannot be empty");
     }
+
+    // Topology-aware validation. Empty catalog → skip (legacy fallback).
+    if !catalog.known.is_empty() && !catalog.knows(topic) {
+        let hint = match catalog.matching(topic).first() {
+            Some(near) => format!(" Did you mean `{near}`?"),
+            None => String::new(),
+        };
+        bail!("Unknown topic `{topic}` — not declared in topology.{hint} Use --no-topology to override.");
+    }
+
     let data = event_data_from_input(data, text_field)?;
     let signing_key = load_signing_key(key_path)?;
     let session_id = session_id
         .map(String::from)
         .unwrap_or_else(|| format!("sess_{}", ulid::Ulid::new()));
-    let token = mint_actor_token(
-        "cli-user",
-        &["workspace:read", "workspace:write"],
-        &session_id,
-        &signing_key,
-        900,
-    )?;
+
+    // Derive scopes from the catalog, falling back to legacy read/write
+    // when subscribers haven't declared any (or topology was skipped).
+    let catalog_scopes: Vec<&str> = catalog
+        .scopes_for(topic)
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let fallback = ["workspace:read", "workspace:write"];
+    let scopes: &[&str] = if catalog_scopes.is_empty() {
+        &fallback
+    } else {
+        &catalog_scopes
+    };
+    let token = mint_actor_token("cli-user", scopes, &session_id, &signing_key, 900)?;
 
     let bus = Bus::connect(bus_url).await?;
     let envelope = Envelope::build(

@@ -11,6 +11,7 @@ pub mod manifest;
 pub mod tags;
 pub mod tokens;
 pub mod topics;
+pub mod topology;
 
 pub use agent_spec::{AgentSpec, EmitSpec, PublishedEventSpec, SubscriptionSpec};
 pub use bookmark::{validate_bookmark_label, BookmarkEvent};
@@ -20,3 +21,4 @@ pub use human::{HumanInteractionRequest, HumanInteractionResponse};
 pub use manifest::{AgentManifest, AgentStatus, PublishedEvent, Subscription};
 pub use tags::{validate_tag, MAX_TAGS_PER_SESSION};
 pub use topics::*;
+pub use topology::{TopicCatalog, TopologySnapshot};
