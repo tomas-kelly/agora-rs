@@ -40,8 +40,9 @@ cargo run -p agora -- doctor
 ```
 
 `doctor` checks `nats-server` and `kiro-cli` on PATH, the signing key, that
-the topology validates, and (if the swarm is running) that NATS + JetStream
-are healthy. Non-zero exit on any failure, so it's safe to chain into scripts.
+the topology validates, and (if the swarm is running) that NATS, JetStream,
+durable consumers, and the agent registry are healthy. Non-zero exit on any
+failure, so it's safe to chain into scripts.
 
 This builds the workspace and mints `.kiro/session_token`, the HS256 secret
 that signs every actor token on the bus. **Every publish path needs it** —

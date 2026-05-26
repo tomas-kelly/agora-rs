@@ -17,7 +17,7 @@ use tracing::{info, warn};
 
 use agora_core::{
     bookmark::{validate_bookmark_label, BookmarkEvent},
-    bus::{AgentRegistryRecord, Bus},
+    bus::{AgentRegistryRecord, Bus, EventStreamHealth},
     envelope::Envelope,
     event_data_from_input,
     manifest::{AgentManifest, AgentStatus},
@@ -1253,18 +1253,52 @@ async fn doctor(config_path: &std::path::Path, key_path: &str) -> Result<()> {
         match Bus::connect(bus_url).await {
             Ok(bus) => {
                 ok("NATS bus", &format!("reachable at {bus_url}"));
-                match bus.js.get_stream(agora_core::topics::EVENT_STREAM).await {
-                    Ok(stream) => {
-                        let info = stream.cached_info();
+                match bus.event_stream_health().await {
+                    Ok(health) => {
                         ok(
                             "JetStream",
                             &format!(
-                                "stream {} present ({} subjects, {} messages)",
-                                info.config.name,
-                                info.config.subjects.len(),
-                                info.state.messages
+                                "stream {} present ({} subjects, {} messages, {} consumers)",
+                                health.name,
+                                health.subjects.len(),
+                                health.messages,
+                                health.consumers.len()
                             ),
                         );
+
+                        let missing_subjects = missing_stream_subjects(&health);
+                        if !missing_subjects.is_empty() {
+                            warn(
+                                "stream subjects",
+                                &format!(
+                                    "missing configured subjects: {}",
+                                    missing_subjects.join(", ")
+                                ),
+                            );
+                            warnings += 1;
+                        }
+
+                        let pending = total_consumer_pending(&health);
+                        let ack_pending = total_consumer_ack_pending(&health);
+                        let redelivered = total_consumer_redelivered(&health);
+                        if ack_pending == 0 && redelivered == 0 {
+                            ok(
+                                "JetStream consumers",
+                                &format!(
+                                    "{} durable consumers; {pending} pending; no ack backlog or redeliveries",
+                                    health.consumers.len()
+                                ),
+                            );
+                        } else {
+                            warn(
+                                "JetStream consumers",
+                                &format!(
+                                    "{} durable consumers; {pending} pending; {ack_pending} ack pending; {redelivered} redelivered",
+                                    health.consumers.len()
+                                ),
+                            );
+                            warnings += 1;
+                        }
                     }
                     Err(e) => {
                         warn(
@@ -1456,6 +1490,38 @@ fn unhealthy_registry_count(records: &[AgentRegistryRecord], topology: &Topology
             )
         })
         .count()
+}
+
+fn missing_stream_subjects(health: &EventStreamHealth) -> Vec<String> {
+    EVENT_STREAM_SUBJECTS
+        .iter()
+        .filter(|subject| !health.subjects.iter().any(|present| present == **subject))
+        .map(|subject| (*subject).to_string())
+        .collect()
+}
+
+fn total_consumer_pending(health: &EventStreamHealth) -> u64 {
+    health
+        .consumers
+        .iter()
+        .map(|consumer| consumer.pending)
+        .sum()
+}
+
+fn total_consumer_ack_pending(health: &EventStreamHealth) -> usize {
+    health
+        .consumers
+        .iter()
+        .map(|consumer| consumer.ack_pending)
+        .sum()
+}
+
+fn total_consumer_redelivered(health: &EventStreamHealth) -> usize {
+    health
+        .consumers
+        .iter()
+        .map(|consumer| consumer.redelivered)
+        .sum()
 }
 
 fn registry_prune_candidates(
@@ -2431,14 +2497,8 @@ async fn show_info(config_path: &Path, bus_url: Option<&str>, json: bool) -> Res
 
     if let Ok(bus) = Bus::connect(bus_url).await {
         bus_state["reachable"] = serde_json::json!(true);
-        if let Ok(stream) = bus.js.get_stream(EVENT_STREAM).await {
-            let info = stream.cached_info();
-            stream_state = serde_json::json!({
-                "name": info.config.name,
-                "subjects": info.config.subjects,
-                "messages": info.state.messages,
-                "bytes": info.state.bytes,
-            });
+        if let Ok(health) = bus.event_stream_health().await {
+            stream_state = serde_json::to_value(&health)?;
         }
         if let Ok(records) = bus.read_agent_registry_records().await {
             registry_state = serde_json::json!({
@@ -2505,7 +2565,31 @@ async fn show_info(config_path: &Path, bus_url: Option<&str>, json: bool) -> Res
         }
     );
     if let Some(messages) = value["stream"]["messages"].as_u64() {
-        println!("stream:    {EVENT_STREAM} ({messages} messages)");
+        let consumers = value["stream"]["consumers"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0);
+        let pending: u64 = value["stream"]["consumers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|consumer| consumer["pending"].as_u64())
+            .sum();
+        let ack_pending: u64 = value["stream"]["consumers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|consumer| consumer["ackPending"].as_u64())
+            .sum();
+        let redelivered: u64 = value["stream"]["consumers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|consumer| consumer["redelivered"].as_u64())
+            .sum();
+        println!(
+            "stream:    {EVENT_STREAM} ({messages} messages, {consumers} consumers, {pending} pending, {ack_pending} ack pending, {redelivered} redelivered)"
+        );
     }
     if let Some(entries) = value["registry"]["entries"].as_u64() {
         println!(

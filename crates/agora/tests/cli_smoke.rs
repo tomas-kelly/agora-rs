@@ -4,6 +4,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+use agora_core::{
+    bus::Bus,
+    daemon::{Agent, DaemonConfig, DaemonRunner, Publisher},
+    envelope::Envelope,
+    manifest::{PublishedEvent, Subscription},
+    tokens::{load_signing_key, verify_actor_token},
+    topics::{consumer_name, CODE_CHANGED, WORKSPACE_EVENT_SUBMITTED},
+};
+use async_trait::async_trait;
+
 struct ChildGuard(Child);
 
 impl Drop for ChildGuard {
@@ -14,9 +24,11 @@ impl Drop for ChildGuard {
 }
 
 #[test]
-#[ignore = "starts an isolated local nats-server and exercises mutating CLI commands"]
 fn cli_mutating_commands_work_against_isolated_nats() {
-    let nats = which("nats-server");
+    let Some(nats) = which("nats-server") else {
+        eprintln!("skipping CLI smoke test: nats-server is not on PATH");
+        return;
+    };
     let temp = tempfile::tempdir().expect("tempdir");
     let port = free_port();
     let bus_url = format!("nats://127.0.0.1:{port}");
@@ -180,11 +192,219 @@ fn cli_mutating_commands_work_against_isolated_nats() {
     assert_eq!(submitted["data"]["text"], "Build smoke path");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_drives_mock_agent_and_preserves_event_context() {
+    let Some(nats) = which("nats-server") else {
+        eprintln!("skipping mock-agent integration test: nats-server is not on PATH");
+        return;
+    };
+    let temp = tempfile::tempdir().expect("tempdir");
+    let port = free_port();
+    let bus_url = format!("nats://127.0.0.1:{port}");
+    let store_dir = temp.path().join("nats-store");
+    let key_path = temp.path().join("session_token");
+    let topology_path = temp.path().join("topology.json");
+    let session_id = "sess_mock_agent";
+
+    let mut child = Command::new(nats)
+        .args(["-js", "-p", &port.to_string(), "-sd"])
+        .arg(&store_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start nats-server");
+    wait_for_nats(&mut child, &bus_url);
+    let _guard = ChildGuard(child);
+
+    run_ok(["bootstrap", "--key-path", key_path.to_str().unwrap()]);
+    std::fs::write(
+        &topology_path,
+        serde_json::json!({
+            "agents": [
+                {
+                    "name": "mock-coder",
+                    "publishes": [
+                        { "topic": CODE_CHANGED, "required_scopes": ["workspace:write"] }
+                    ],
+                    "subscriptions": [
+                        {
+                            "topic": WORKSPACE_EVENT_SUBMITTED,
+                            "required_scopes": ["workspace:submit"],
+                            "emit": { "topic": CODE_CHANGED, "required_scopes": ["workspace:write"] }
+                        }
+                    ]
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .expect("write topology");
+
+    let runner = tokio::spawn(
+        DaemonRunner::new(
+            MockChangeAgent,
+            DaemonConfig {
+                bus_url: bus_url.clone(),
+                key_path: key_path.clone(),
+            },
+        )
+        .run(),
+    );
+
+    let bus = Bus::connect(&bus_url).await.expect("connect bus");
+    wait_for_consumer(
+        &bus,
+        &consumer_name("mock-coder", WORKSPACE_EVENT_SUBMITTED),
+    )
+    .await;
+
+    let rejected = run([
+        "submit",
+        "workspace.event.typo",
+        "bad topic",
+        "--session-id",
+        session_id,
+        "--bus-url",
+        &bus_url,
+        "--key-path",
+        key_path.to_str().unwrap(),
+        "--config",
+        topology_path.to_str().unwrap(),
+    ]);
+    assert!(
+        !rejected.status.success(),
+        "unknown topology topic was accepted"
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("Unknown topic"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+
+    run_ok([
+        "submit",
+        WORKSPACE_EVENT_SUBMITTED,
+        "Build from integration",
+        "--session-id",
+        session_id,
+        "--bus-url",
+        &bus_url,
+        "--key-path",
+        key_path.to_str().unwrap(),
+        "--config",
+        topology_path.to_str().unwrap(),
+    ]);
+
+    let changed = wait_for_event(&bus, session_id, CODE_CHANGED).await;
+    assert_eq!(changed.sender.agent_name, "mock-coder");
+    assert_eq!(changed.context.affected_files, vec!["src/lib.rs"]);
+    assert_eq!(changed.data["changedFiles"][0], "src/lib.rs");
+
+    let submitted = wait_for_event(&bus, session_id, WORKSPACE_EVENT_SUBMITTED).await;
+    let key = load_signing_key(&key_path).expect("load key");
+    let claims =
+        verify_actor_token(&submitted.security.actor_token, &key).expect("verify submitted token");
+    assert!(claims.has_scope("workspace:submit"));
+    assert_eq!(claims.sid, session_id);
+
+    let health = bus.event_stream_health().await.expect("stream health");
+    let consumer = health
+        .consumers
+        .iter()
+        .find(|consumer| consumer.name == consumer_name("mock-coder", WORKSPACE_EVENT_SUBMITTED))
+        .expect("mock durable consumer");
+    assert_eq!(consumer.filter_subject, WORKSPACE_EVENT_SUBMITTED);
+    assert_eq!(consumer.redelivered, 0);
+
+    runner.abort();
+}
+
+struct MockChangeAgent;
+
+#[async_trait]
+impl Agent for MockChangeAgent {
+    fn agent_name(&self) -> &str {
+        "mock-coder"
+    }
+
+    fn port(&self) -> u16 {
+        4101
+    }
+
+    fn capabilities(&self) -> Vec<String> {
+        vec!["mock".into(), "code".into()]
+    }
+
+    fn subscriptions(&self) -> Vec<Subscription> {
+        vec![Subscription {
+            topic: WORKSPACE_EVENT_SUBMITTED.into(),
+            description: "Integration test input".into(),
+            required_scopes: vec!["workspace:submit".into()],
+        }]
+    }
+
+    fn published_events(&self) -> Vec<PublishedEvent> {
+        vec![PublishedEvent {
+            topic: CODE_CHANGED.into(),
+            description: "Mock code change".into(),
+            required_scopes: vec!["workspace:write".into()],
+        }]
+    }
+
+    async fn on_event(&mut self, envelope: Envelope, publisher: Publisher) -> anyhow::Result<()> {
+        let changed_files = vec!["src/lib.rs".to_string()];
+        publisher
+            .publish(
+                CODE_CHANGED,
+                serde_json::json!({
+                    "summary": format!("mock handled {}", envelope.event_id),
+                    "changedFiles": changed_files,
+                }),
+                Some(vec!["src/lib.rs".to_string()]),
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+async fn wait_for_consumer(bus: &Bus, name: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if bus
+            .event_stream_health()
+            .await
+            .map(|health| {
+                health
+                    .consumers
+                    .iter()
+                    .any(|consumer| consumer.name == name)
+            })
+            .unwrap_or(false)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("consumer {name} did not appear");
+}
+
+async fn wait_for_event(bus: &Bus, session_id: &str, topic: &str) -> Envelope {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let events = bus.read_all_events().await.expect("read events");
+        if let Some(event) = events
+            .into_iter()
+            .find(|event| event.context.session_id == session_id && event.topic == topic)
+        {
+            return event;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("event {topic} did not appear in session {session_id}");
+}
+
 fn run_ok<const N: usize>(args: [&str; N]) -> Output {
-    let output = Command::new(env!("CARGO_BIN_EXE_agora"))
-        .args(args)
-        .output()
-        .expect("run agora");
+    let output = run(args);
     assert!(
         output.status.success(),
         "agora failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -193,6 +413,13 @@ fn run_ok<const N: usize>(args: [&str; N]) -> Output {
         String::from_utf8_lossy(&output.stderr)
     );
     output
+}
+
+fn run<const N: usize>(args: [&str; N]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_agora"))
+        .args(args)
+        .output()
+        .expect("run agora")
 }
 
 fn free_port() -> u16 {
@@ -224,14 +451,12 @@ fn wait_for_nats(child: &mut Child, bus_url: &str) {
     panic!("nats-server did not become ready");
 }
 
-fn which(binary: &str) -> String {
-    let path = Command::new("which").arg(binary).output().expect("which");
-    assert!(
-        path.status.success(),
-        "`{binary}` is required for ignored CLI smoke test"
-    );
-    String::from_utf8(path.stdout)
-        .expect("which utf8")
-        .trim()
-        .to_string()
+fn which(binary: &str) -> Option<String> {
+    let path = Command::new("which").arg(binary).output().ok()?;
+    path.status.success().then(|| {
+        String::from_utf8(path.stdout)
+            .expect("which utf8")
+            .trim()
+            .to_string()
+    })
 }

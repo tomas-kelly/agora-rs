@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use async_nats::jetstream::{self, consumer::pull, stream, AckKind};
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
+use serde::Serialize;
 use std::time::Duration;
 use tracing::{debug, warn};
 
@@ -16,6 +17,31 @@ pub struct AgentRegistryRecord {
     pub key: String,
     pub manifest: Option<AgentManifest>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventStreamHealth {
+    pub name: String,
+    pub subjects: Vec<String>,
+    pub messages: u64,
+    pub bytes: u64,
+    pub consumers: Vec<ConsumerHealth>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsumerHealth {
+    pub name: String,
+    pub filter_subject: String,
+    pub ack_wait_secs: u64,
+    pub max_deliver: i64,
+    pub delivered_stream_sequence: u64,
+    pub acknowledged_stream_sequence: u64,
+    pub pending: u64,
+    pub ack_pending: usize,
+    pub redelivered: usize,
+    pub waiting: usize,
 }
 
 pub struct Bus {
@@ -97,6 +123,41 @@ impl Bus {
             .await
             .context("Raw publish failed")?;
         Ok(())
+    }
+
+    pub async fn event_stream_health(&self) -> Result<EventStreamHealth> {
+        let stream = self.js.get_stream(EVENT_STREAM).await?;
+        let info = stream.cached_info();
+        let name = info.config.name.clone();
+        let subjects = info.config.subjects.clone();
+        let messages = info.state.messages;
+        let bytes = info.state.bytes;
+
+        let mut consumers = stream.consumers();
+        let mut consumer_health = Vec::new();
+        while let Some(info) = consumers.try_next().await? {
+            consumer_health.push(ConsumerHealth {
+                name: info.name,
+                filter_subject: info.config.filter_subject,
+                ack_wait_secs: info.config.ack_wait.as_secs(),
+                max_deliver: info.config.max_deliver,
+                delivered_stream_sequence: info.delivered.stream_sequence,
+                acknowledged_stream_sequence: info.ack_floor.stream_sequence,
+                pending: info.num_pending,
+                ack_pending: info.num_ack_pending,
+                redelivered: info.num_redelivered,
+                waiting: info.num_waiting,
+            });
+        }
+        consumer_health.sort_by(|a, b| a.name.cmp(&b.name));
+
+        Ok(EventStreamHealth {
+            name,
+            subjects,
+            messages,
+            bytes,
+            consumers: consumer_health,
+        })
     }
 
     /// Create (or get existing) durable pull consumer for a topic, then call

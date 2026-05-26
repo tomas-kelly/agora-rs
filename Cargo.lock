@@ -15,6 +15,7 @@ dependencies = [
  "agora-console",
  "agora-core",
  "anyhow",
+ "async-trait",
  "bytes",
  "chrono",
  "clap",
