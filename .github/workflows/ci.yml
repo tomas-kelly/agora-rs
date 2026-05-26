@@ -24,8 +24,17 @@ jobs:
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
 
+      - name: Install nats-server
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nats-server
+          nats-server -v
+
       - name: cargo fmt
         run: cargo fmt --all -- --check
+
+      - name: cargo check
+        run: cargo check --workspace --all-targets
 
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
