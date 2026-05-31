@@ -13,7 +13,7 @@ use agora_core::{
 use anyhow::Result;
 use serde::Deserialize;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -89,6 +89,26 @@ pub struct SessionInfo {
     pub deleted: bool,
     pub deleted_at: Option<String>,
     pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingInteraction {
+    pub event_id: String,
+    pub session_id: String,
+    pub agent_name: String,
+    pub kind: String,
+    pub question: String,
+    pub timestamp: String,
+}
+
+impl PendingInteraction {
+    pub fn kind_label(&self) -> &'static str {
+        if self.kind == "tool_approval" {
+            "tool approval"
+        } else {
+            "input"
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,6 +368,9 @@ impl App {
         if event.topic != HUMAN_INTERACTION_REQUEST {
             return None;
         }
+        if !self.is_pending_interaction(&event.event_id) {
+            return None;
+        }
         let question = event
             .data
             .get("question")
@@ -359,6 +382,83 @@ impl App {
             event.context.session_id.clone(),
             question,
         ))
+    }
+
+    pub fn pending_interactions(&self) -> Vec<PendingInteraction> {
+        pending_interactions_from_events(&self.events, &self.sessions)
+    }
+
+    pub fn pending_interaction_count(&self) -> usize {
+        self.pending_interactions().len()
+    }
+
+    pub fn first_pending_interaction(&self) -> Option<PendingInteraction> {
+        let pending = self.pending_interactions();
+        if let Some(active_session) = self.active_session.as_deref() {
+            if let Some(item) = pending
+                .iter()
+                .find(|item| item.session_id == active_session)
+                .cloned()
+            {
+                return Some(item);
+            }
+        }
+        pending.into_iter().next()
+    }
+
+    pub fn pending_count_for_session(&self, session_id: &str) -> usize {
+        self.pending_interactions()
+            .iter()
+            .filter(|item| item.session_id == session_id)
+            .count()
+    }
+
+    pub fn pending_count_for_agent(&self, agent_name: &str) -> usize {
+        self.pending_interactions()
+            .iter()
+            .filter(|item| item.agent_name == agent_name)
+            .count()
+    }
+
+    pub fn is_pending_interaction(&self, event_id: &str) -> bool {
+        self.pending_interactions()
+            .iter()
+            .any(|item| item.event_id == event_id)
+    }
+
+    pub fn jump_to_pending_interaction(&mut self) -> bool {
+        let Some(target) = self.first_pending_interaction() else {
+            self.status_msg = Some("No pending human input or tool approvals.".into());
+            return false;
+        };
+        let Some(idx) = self
+            .events
+            .iter()
+            .position(|event| event.event_id == target.event_id)
+        else {
+            self.status_msg =
+                Some("Pending request is no longer in the local event buffer.".into());
+            return false;
+        };
+
+        self.active_session = Some(target.session_id.clone());
+        self.selected_event = Some(idx);
+        self.inspected_event = Some(idx);
+        self.full_event_details = false;
+        self.command_output = None;
+        self.output_scroll = 0;
+        self.auto_scroll = false;
+        self.panels.sessions = true;
+        self.panels.events = true;
+        self.panels.detail = true;
+        self.ensure_selected_event_visible();
+        self.status_msg = Some(format!(
+            "Responding to {} from {} in {}",
+            target.kind_label(),
+            target.agent_name,
+            self.display_name(&target.session_id)
+        ));
+        true
     }
 
     pub fn take_pending_action(&mut self) -> Option<PendingAction> {
@@ -1111,6 +1211,7 @@ impl App {
             "agents" => self.cmd_agents(),
             "status" => self.cmd_status(rest),
             "history" => self.cmd_history(rest),
+            "pending" => self.cmd_pending(rest),
             "panel" | "panels" | "toggle" => self.cmd_panel(rest),
             "submit" => self.cmd_submit(rest).await,
             "clear" => self.cmd_clear(),
@@ -1195,6 +1296,7 @@ impl App {
              \x20\x20!agents                Agents seen in active session\n\
              \x20\x20!status <agent>        Agent's manifest + activity in active session\n\
              \x20\x20!history <agent>       Full conversation: received · prompts · responses · published\n\
+             \x20\x20!pending [next]        Show pending input/tool approvals, or jump to the next one\n\
              \x20\x20!panel <name>          Toggle sessions, events, agents, detail, or all\n\
              \x20\x20!submit <topic> <data> Publish an arbitrary event (JSON or text)\n\
              \x20\x20!copy                  Copy command output (or selected event) to clipboard\n\
@@ -1204,9 +1306,9 @@ impl App {
              \x20\x20!exit | !quit          Quit (same as Esc)\n\
              \n\
              DIRECT MESSAGES:\n\
-             \x20\x20@agent <msg>           Steering message  (Tab completes the agent name)\n\
-             \x20\x20/steer @agent <msg>    Same as @\n\
-             \x20\x20/queue @agent <msg>    Queue behind agent's current event\n\
+             \x20\x20@agent <msg>           Steering message in the active session\n\
+             \x20\x20/steer @agent <msg>    Same as @ (Tab completes the agent name)\n\
+             \x20\x20/queue @agent <msg>    Queue in the active session\n\
              \n\
              Plain text is published as the configured submit topic.\n\
              \n\
@@ -1689,6 +1791,38 @@ impl App {
         self.set_output(out);
     }
 
+    fn cmd_pending(&mut self, rest: &str) {
+        let arg = rest.trim();
+        if arg == "next" || arg == "jump" {
+            self.jump_to_pending_interaction();
+            return;
+        }
+
+        let pending = self.pending_interactions();
+        if pending.is_empty() {
+            self.status_msg = Some("No pending human input or tool approvals.".into());
+            return;
+        }
+
+        let mut out = format!(
+            "Pending human input / tool approvals ({})\n\n",
+            pending.len()
+        );
+        for item in pending {
+            out.push_str(&format!(
+                "{}  {}  {} in {}\n",
+                time_only(&item.timestamp),
+                item.kind_label(),
+                item.agent_name,
+                self.display_name(&item.session_id)
+            ));
+            push_indented(&mut out, &item.question, "  ");
+            out.push('\n');
+        }
+        out.push_str("Run !pending next to jump to the first pending request.\n");
+        self.set_output(out);
+    }
+
     async fn submit_event(&mut self, topic: &str, input: String) -> Result<()> {
         let topic = topic.trim();
         if topic.is_empty() {
@@ -1799,10 +1933,12 @@ impl App {
             return Ok(());
         }
 
-        let session_id = self
-            .active_session
-            .clone()
-            .unwrap_or_else(|| format!("sess_{}", ulid::Ulid::new()));
+        let Some(session_id) = self.active_session.clone() else {
+            self.status_msg = Some(
+                "Direct messages require an active session. Create/select a session first.".into(),
+            );
+            return Ok(());
+        };
         let token = mint_actor_token(
             "console-user",
             &["agent:message"],
@@ -1819,6 +1955,7 @@ impl App {
             serde_json::json!({
                 "messageType": msg_type,
                 "recipient": agent,
+                "sessionId": session_id,
                 "message": message,
             }),
             None,
@@ -1917,6 +2054,76 @@ impl App {
         );
         self.bus.publish(&env).await
     }
+}
+
+fn response_correlation_id(event: &Envelope) -> Option<&str> {
+    event
+        .data
+        .get("correlationId")
+        .or_else(|| event.data.get("correlation_id"))
+        .and_then(|v| v.as_str())
+}
+
+fn pending_interactions_from_events(
+    events: &[Envelope],
+    sessions: &BTreeMap<String, SessionInfo>,
+) -> Vec<PendingInteraction> {
+    let mut pending = Vec::new();
+    let mut resolved = HashSet::new();
+
+    for event in events {
+        if event.topic == HUMAN_INTERACTION_RESPONSE {
+            if let Some(correlation_id) = response_correlation_id(event) {
+                resolved.insert(correlation_id.to_string());
+                pending.retain(|item: &PendingInteraction| item.event_id != correlation_id);
+            }
+            continue;
+        }
+
+        if event.topic != HUMAN_INTERACTION_REQUEST {
+            continue;
+        }
+        if resolved.contains(&event.event_id) {
+            continue;
+        }
+        if sessions
+            .get(&event.context.session_id)
+            .is_some_and(|session| session.deleted)
+        {
+            continue;
+        }
+
+        pending.push(PendingInteraction {
+            event_id: event.event_id.clone(),
+            session_id: event.context.session_id.clone(),
+            agent_name: event.sender.agent_name.clone(),
+            kind: event
+                .data
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("input")
+                .to_string(),
+            question: event_question(event),
+            timestamp: event.timestamp.clone(),
+        });
+    }
+
+    pending
+}
+
+fn event_question(event: &Envelope) -> String {
+    event
+        .data
+        .get("question")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            event
+                .data
+                .pointer("/details/toolCall/title")
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or("?")
+        .to_string()
 }
 
 fn short_id(id: &str, n: usize) -> String {
@@ -2026,7 +2233,9 @@ fn topic_matches(pattern: &str, topic: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::topic_matches;
+    use super::{pending_interactions_from_events, topic_matches, SessionInfo};
+    use agora_core::{topics::*, Envelope};
+    use std::collections::BTreeMap;
 
     #[test]
     fn nats_wildcard_matching() {
@@ -2040,5 +2249,69 @@ mod tests {
         assert!(!topic_matches("*.changed", "code.changed.again"));
         assert!(!topic_matches("workspace.event.submitted", "code.changed"));
         assert!(topic_matches(">", "anything.goes.here"));
+    }
+
+    #[test]
+    fn pending_interactions_track_unanswered_requests() {
+        let request = envelope(
+            HUMAN_INTERACTION_REQUEST,
+            "backend-coder",
+            "sess_1",
+            serde_json::json!({
+                "kind": "tool_approval",
+                "question": "Approve cargo test?",
+            }),
+        );
+        let pending =
+            pending_interactions_from_events(std::slice::from_ref(&request), &BTreeMap::new());
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].agent_name, "backend-coder");
+        assert_eq!(pending[0].session_id, "sess_1");
+        assert_eq!(pending[0].kind_label(), "tool approval");
+
+        let response = envelope(
+            HUMAN_INTERACTION_RESPONSE,
+            "agora-console",
+            "sess_1",
+            serde_json::json!({
+                "correlationId": request.event_id,
+                "answer": "allow-once",
+            }),
+        );
+        let pending = pending_interactions_from_events(&[request, response], &BTreeMap::new());
+
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn pending_interactions_ignore_deleted_sessions() {
+        let request = envelope(
+            HUMAN_INTERACTION_REQUEST,
+            "quality-assurance",
+            "sess_deleted",
+            serde_json::json!({ "question": "Need input" }),
+        );
+        let mut sessions = BTreeMap::new();
+        sessions.insert(
+            "sess_deleted".into(),
+            SessionInfo {
+                session_id: "sess_deleted".into(),
+                started_at: "2026-05-30T00:00:00Z".into(),
+                last_topic: String::new(),
+                event_count: 0,
+                deleted: true,
+                deleted_at: Some("2026-05-30T00:01:00Z".into()),
+                tags: vec![],
+            },
+        );
+
+        let pending = pending_interactions_from_events(&[request], &sessions);
+
+        assert!(pending.is_empty());
+    }
+
+    fn envelope(topic: &str, sender: &str, session_id: &str, data: serde_json::Value) -> Envelope {
+        Envelope::build(topic, sender, 0, "tok", session_id, data, None, vec![])
     }
 }

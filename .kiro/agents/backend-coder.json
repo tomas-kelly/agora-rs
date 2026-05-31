@@ -1,7 +1,7 @@
 {
   "name": "backend-coder",
-  "description": "Implements Rust backend/runtime changes for Agora, including agora-core, supervisor, agents, and NATS integration.",
-  "prompt": "You are the backend-coder agent for the Agora Rust agent-swarm project. Implement scoped Rust changes in the backend/runtime crates. Preserve existing APIs unless a change is necessary and justified. Prefer small, testable changes, use cargo fmt, and run focused cargo tests/checks when possible. When responding to Agora, prefer compact JSON with summary, filesChanged, testsRun, risks, and next.",
+  "description": "Implements backend, service, data, infrastructure, and integration changes for submitted work.",
+  "prompt": "You are the backend-coder agent for a generic event-driven workspace. Follow .kiro/agents/backend-coder.md as your operating workflow for every event. Implement scoped backend/service/data/infrastructure changes using the active project's existing patterns. Preserve existing APIs unless a change is necessary and justified. Prefer small, testable changes and run focused checks when possible. When responding to the runtime, emit exactly one final JSON object that matches the workflow and docs/agent-io-contract.md.",
   "tools": [
     "read",
     "write",
@@ -17,8 +17,22 @@
       "allowedPaths": [
         "Cargo.toml",
         "Cargo.lock",
+        "package.json",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "pyproject.toml",
+        "requirements*.txt",
+        "go.mod",
+        "go.sum",
         "README.md",
         "agents.local.json",
+        "docs/**",
+        "examples/**",
+        "src/**",
+        "tests/**",
+        "apps/**",
+        "packages/**",
         "scripts/**",
         "crates/**",
         "./*.json"
@@ -34,7 +48,15 @@
         "cargo fmt --all",
         "cargo check .*",
         "cargo test .*",
-        "cargo clippy .*"
+        "cargo clippy .*",
+        "npm .*",
+        "pnpm .*",
+        "yarn .*",
+        "bun .*",
+        "go test .*",
+        "python -m pytest .*",
+        "pytest .*",
+        "make .*"
       ],
       "deniedCommands": [
         "rm .*",
@@ -47,10 +69,21 @@
     }
   },
   "resources": [
+    "file://../../.kiro/agents/backend-coder.md",
+    "file://../../docs/agent-io-contract.md",
     "file://../../README.md",
     "file://../../Cargo.toml",
+    "file://../../package.json",
+    "file://../../pyproject.toml",
+    "file://../../go.mod",
+    "file://../../docs/**",
     "file://../../agents.local.json",
-    "file://../../crates/**/*.rs"
+    "file://../../src/**",
+    "file://../../crates/**",
+    "file://../../apps/**",
+    "file://../../packages/**",
+    "file://../../examples/**",
+    "file://../../tests/**"
   ],
   "includeMcpJson": true,
   "keyboardShortcut": "ctrl+b",

@@ -40,7 +40,7 @@ use tracing::warn;
 pub struct ConsoleArgs {
     #[arg(long, default_value = "nats://127.0.0.1:4222")]
     bus_url: String,
-    #[arg(long, default_value = ".kiro/session_token")]
+    #[arg(long, default_value = ".agora/session_token")]
     key_path: String,
     /// Topology file. Used to validate submit topics and derive
     /// actor-token scopes from the topology's `required_scopes`.

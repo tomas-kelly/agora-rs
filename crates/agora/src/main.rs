@@ -4,10 +4,12 @@ mod supervisor;
 mod watch;
 
 use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -18,6 +20,7 @@ use tracing::{info, warn};
 use agora_core::{
     bookmark::{validate_bookmark_label, BookmarkEvent},
     bus::{AgentRegistryRecord, Bus, EventStreamHealth},
+    command::split_command_line,
     envelope::Envelope,
     event_data_from_input,
     manifest::{AgentManifest, AgentStatus},
@@ -32,10 +35,10 @@ use agora_core::{
 };
 use config::TopologyConfig;
 use lifecycle::{
-    expected_processes, legacy_swarm_processes, log_path_for_target, print_logs,
+    expected_processes, legacy_swarm_processes, log_path_for_target, parse_since, print_logs,
     print_process_stats, print_process_table, print_process_top, process_for_target,
     process_metrics, restart_agent, runtime_statuses, status_for, stop_legacy_swarm_processes,
-    stop_runtime, write_pid, LogOptions, ProcessState, RuntimeProcessStatus,
+    stop_runtime, LogOptions, ProcessState, RuntimeProcess, RuntimeProcessStatus,
 };
 use supervisor::Supervisor;
 
@@ -74,11 +77,11 @@ enum Cmd {
         /// Field name used when DATA is plain text
         #[arg(long, default_value = "text")]
         field: String,
-        #[arg(long)]
+        #[arg(long = "sessionId")]
         session_id: Option<String>,
         #[arg(long, default_value = "nats://127.0.0.1:4222")]
         bus_url: String,
-        #[arg(long, default_value = ".kiro/session_token")]
+        #[arg(long, default_value = ".agora/session_token")]
         key_path: String,
         /// Topology file. Used to reject unknown topics and derive
         /// actor-token scopes. Pass `--no-topology` to skip both.
@@ -131,6 +134,8 @@ enum Cmd {
         since: Option<String>,
         #[arg(short = 't', long)]
         timestamps: bool,
+        #[arg(long)]
+        bus_url: Option<String>,
         #[arg(long, default_value = "agents.local.json")]
         config: std::path::PathBuf,
     },
@@ -195,7 +200,7 @@ enum Cmd {
     /// Show an agent manifest and optional session activity
     Status {
         agent: String,
-        #[arg(long)]
+        #[arg(long = "sessionId")]
         session_id: Option<String>,
         #[arg(long, default_value = "nats://127.0.0.1:4222")]
         bus_url: String,
@@ -203,28 +208,30 @@ enum Cmd {
     /// Show an agent's event and telemetry history in one session
     History {
         agent: String,
-        #[arg(long)]
+        #[arg(long = "sessionId")]
         session_id: String,
         #[arg(long, default_value = "nats://127.0.0.1:4222")]
         bus_url: String,
     },
     /// Send a direct steering or queue message to an agent
     Message {
+        #[arg(long)]
         agent: String,
         #[arg(required = true, num_args = 1..)]
         message: Vec<String>,
-        #[arg(long)]
-        session_id: Option<String>,
-        #[arg(long, default_value = "steer")]
+        /// Existing Agora session id to scope the message to
+        #[arg(long = "sessionId")]
+        session_id: String,
+        #[arg(long, default_value = "steering")]
         message_type: String,
         #[arg(long, default_value = "nats://127.0.0.1:4222")]
         bus_url: String,
-        #[arg(long, default_value = ".kiro/session_token")]
+        #[arg(long, default_value = ".agora/session_token")]
         key_path: String,
     },
     /// Print events from the AGORA_EVENTS stream
     Replay {
-        #[arg(long)]
+        #[arg(long = "sessionId")]
         session_id: Option<String>,
         #[arg(long)]
         json: bool,
@@ -233,7 +240,7 @@ enum Cmd {
     },
     /// Bootstrap the signing key
     Bootstrap {
-        #[arg(long, default_value = ".kiro/session_token")]
+        #[arg(long, default_value = ".agora/session_token")]
         key_path: String,
     },
     /// Inspect and clean the agent registry
@@ -245,7 +252,7 @@ enum Cmd {
     Doctor {
         #[arg(long, default_value = "agents.local.json")]
         config: std::path::PathBuf,
-        #[arg(long, default_value = ".kiro/session_token")]
+        #[arg(long, default_value = ".agora/session_token")]
         key_path: String,
     },
     /// Manage event bookmarks
@@ -261,7 +268,7 @@ enum Cmd {
         answer: Option<String>,
         #[arg(long, default_value = "nats://127.0.0.1:4222")]
         bus_url: String,
-        #[arg(long, default_value = ".kiro/session_token")]
+        #[arg(long, default_value = ".agora/session_token")]
         key_path: String,
     },
 }
@@ -273,26 +280,26 @@ enum BookmarkCmd {
         event_id: String,
         #[arg(long)]
         label: Option<String>,
-        #[arg(long)]
+        #[arg(long = "sessionId")]
         session_id: Option<String>,
         #[arg(long, default_value = "nats://127.0.0.1:4222")]
         bus_url: String,
-        #[arg(long, default_value = ".kiro/session_token")]
+        #[arg(long, default_value = ".agora/session_token")]
         key_path: String,
     },
     /// Remove a bookmark from an event
     Remove {
         event_id: String,
-        #[arg(long)]
+        #[arg(long = "sessionId")]
         session_id: Option<String>,
         #[arg(long, default_value = "nats://127.0.0.1:4222")]
         bus_url: String,
-        #[arg(long, default_value = ".kiro/session_token")]
+        #[arg(long, default_value = ".agora/session_token")]
         key_path: String,
     },
     /// List bookmarked events
     Ls {
-        #[arg(long)]
+        #[arg(long = "sessionId")]
         session_id: Option<String>,
         #[arg(long)]
         json: bool,
@@ -303,12 +310,18 @@ enum BookmarkCmd {
 
 #[derive(Debug, Clone, Args)]
 struct EventArgs {
-    #[arg(long)]
+    /// Session id/name, agent name, or topic pattern to show
+    target: Option<String>,
+    #[arg(long = "sessionId")]
     session_id: Option<String>,
     #[arg(long)]
     agent: Option<String>,
     #[arg(long)]
     topic: Option<String>,
+    #[arg(long = "tail", visible_alias = "lines")]
+    tail: Option<usize>,
+    #[arg(long)]
+    since: Option<String>,
     #[arg(short = 'f', long)]
     follow: bool,
     #[arg(long)]
@@ -347,7 +360,7 @@ enum SessionCmd {
         name: String,
         #[arg(long, default_value = "nats://127.0.0.1:4222")]
         bus_url: String,
-        #[arg(long, default_value = ".kiro/session_token")]
+        #[arg(long, default_value = ".agora/session_token")]
         key_path: String,
     },
     /// Rename an existing session
@@ -356,7 +369,7 @@ enum SessionCmd {
         name: String,
         #[arg(long, default_value = "nats://127.0.0.1:4222")]
         bus_url: String,
-        #[arg(long, default_value = ".kiro/session_token")]
+        #[arg(long, default_value = ".agora/session_token")]
         key_path: String,
     },
     /// Hide a session from default lists without erasing its events
@@ -364,7 +377,7 @@ enum SessionCmd {
         session_id: String,
         #[arg(long, default_value = "nats://127.0.0.1:4222")]
         bus_url: String,
-        #[arg(long, default_value = ".kiro/session_token")]
+        #[arg(long, default_value = ".agora/session_token")]
         key_path: String,
     },
     /// Add a tag to a session
@@ -373,7 +386,7 @@ enum SessionCmd {
         label: String,
         #[arg(long, default_value = "nats://127.0.0.1:4222")]
         bus_url: String,
-        #[arg(long, default_value = ".kiro/session_token")]
+        #[arg(long, default_value = ".agora/session_token")]
         key_path: String,
     },
     /// Remove a tag from a session
@@ -382,7 +395,7 @@ enum SessionCmd {
         label: String,
         #[arg(long, default_value = "nats://127.0.0.1:4222")]
         bus_url: String,
-        #[arg(long, default_value = ".kiro/session_token")]
+        #[arg(long, default_value = ".agora/session_token")]
         key_path: String,
     },
     /// Inspect a session
@@ -437,7 +450,7 @@ enum AgentCmd {
     /// Show one agent's manifest and optional session activity
     Status {
         agent: String,
-        #[arg(long)]
+        #[arg(long = "sessionId")]
         session_id: Option<String>,
         #[arg(long, default_value = "nats://127.0.0.1:4222")]
         bus_url: String,
@@ -445,7 +458,7 @@ enum AgentCmd {
     /// Show one agent's event and telemetry history in one session
     History {
         agent: String,
-        #[arg(long)]
+        #[arg(long = "sessionId")]
         session_id: String,
         #[arg(long, default_value = "nats://127.0.0.1:4222")]
         bus_url: String,
@@ -480,16 +493,18 @@ enum AgentCmd {
     },
     /// Send a direct steering or queue message
     Message {
+        #[arg(long)]
         agent: String,
         #[arg(required = true, num_args = 1..)]
         message: Vec<String>,
-        #[arg(long)]
-        session_id: Option<String>,
-        #[arg(long, default_value = "steer")]
+        /// Existing Agora session id to scope the message to
+        #[arg(long = "sessionId")]
+        session_id: String,
+        #[arg(long, default_value = "steering")]
         message_type: String,
         #[arg(long, default_value = "nats://127.0.0.1:4222")]
         bus_url: String,
-        #[arg(long, default_value = ".kiro/session_token")]
+        #[arg(long, default_value = ".agora/session_token")]
         key_path: String,
     },
 }
@@ -743,7 +758,7 @@ async fn main() -> Result<()> {
                 send_message(
                     &agent,
                     &message.join(" "),
-                    session_id.as_deref(),
+                    &session_id,
                     &message_type,
                     &bus_url,
                     &key_path,
@@ -785,19 +800,22 @@ async fn main() -> Result<()> {
             follow,
             since,
             timestamps,
+            bus_url,
             config,
         } => {
             let cfg = TopologyConfig::load(config)?;
-            print_logs(
-                &cfg,
-                target.as_deref(),
-                &LogOptions {
-                    tail,
-                    follow,
-                    since,
-                    timestamps,
-                },
-            )
+            let options = LogOptions {
+                tail,
+                follow,
+                since,
+                timestamps,
+            };
+            match target.as_deref() {
+                Some(target) if log_path_for_target(&cfg, target).is_none() => {
+                    show_event_logs(target, &cfg, &options, bus_url.as_deref()).await
+                }
+                _ => print_logs(&cfg, target.as_deref(), &options),
+            }
         }
         Cmd::Events(args) => show_events(&args).await,
         Cmd::Watch(args) => watch::run_watch(&args).await,
@@ -866,7 +884,7 @@ async fn main() -> Result<()> {
             send_message(
                 &agent,
                 &message.join(" "),
-                session_id.as_deref(),
+                &session_id,
                 &message_type,
                 &bus_url,
                 &key_path,
@@ -1160,29 +1178,60 @@ async fn doctor(config_path: &std::path::Path, key_path: &str) -> Result<()> {
         }
     };
 
-    // 3. kiro-cli on PATH (only if any agent will use it)
-    let uses_kiro = topology
-        .as_ref()
-        .map(|t| {
-            let default = t.default_acp.as_str();
-            t.agents
-                .iter()
-                .any(|a| a.acp.as_deref().unwrap_or(default) == "kiro")
-        })
-        .unwrap_or(true);
-    if uses_kiro {
-        match which::which("kiro-cli") {
-            Ok(p) => ok("kiro-cli", &format!("found at {}", p.display())),
-            Err(_) => {
-                fail(
-                    "kiro-cli",
-                    "not on PATH but topology uses kiro ACP. Install kiro-cli and run `kiro-cli login`",
-                );
-                failures += 1;
+    // 3. ACP subprocess command(s) on PATH, only for stdio-backed agents.
+    if let Some(topology) = topology.as_ref() {
+        let default_acp = topology.default_acp.as_str();
+        let mut checked = 0usize;
+        for agent in &topology.agents {
+            if agent.acp.as_deref().unwrap_or(default_acp) != "stdio" {
+                continue;
+            }
+            checked += 1;
+            let command = agent.acp_command.as_deref().unwrap_or_default();
+            match split_command_line(command) {
+                Ok(parts) if !parts.is_empty() => {
+                    let program = &parts[0];
+                    match which::which(program) {
+                        Ok(path) => ok(
+                            "ACP command",
+                            &format!("{}: `{program}` found at {}", agent.name, path.display()),
+                        ),
+                        Err(_) => {
+                            fail(
+                                "ACP command",
+                                &format!(
+                                    "{}: `{program}` from acp_command is not on PATH",
+                                    agent.name
+                                ),
+                            );
+                            failures += 1;
+                        }
+                    }
+                }
+                Ok(_) => {
+                    fail(
+                        "ACP command",
+                        &format!("{}: acp_command is empty", agent.name),
+                    );
+                    failures += 1;
+                }
+                Err(err) => {
+                    fail(
+                        "ACP command",
+                        &format!(
+                            "{}: cannot parse acp_command `{command}`: {err:#}",
+                            agent.name
+                        ),
+                    );
+                    failures += 1;
+                }
             }
         }
+        if checked == 0 {
+            ok("ACP commands", "not required (topology uses mock ACP)");
+        }
     } else {
-        ok("kiro-cli", "not required (topology uses mock ACP)");
+        ok("ACP commands", "skipped because topology did not load");
     }
 
     let legacy_publishers = legacy_swarm_processes();
@@ -1588,8 +1637,8 @@ async fn run_swarm(config_path: std::path::PathBuf) -> Result<()> {
     std::fs::create_dir_all(&cfg.log_dir)?;
     std::fs::create_dir_all(&cfg.pid_dir)?;
     ensure_signing_key(&default_key_path())?;
-    let supervisor_pid = std::path::Path::new(&cfg.pid_dir).join("agora.pid");
-    let _pid_guard = PidFileGuard::write(supervisor_pid)?;
+    let supervisor = process_for_target(&cfg, "agora")?;
+    let _pid_guard = PidFileGuard::claim(supervisor)?;
 
     let shutdown = CancellationToken::new();
     let mut sup = Supervisor::new(shutdown.clone());
@@ -1678,13 +1727,6 @@ fn start_detached(config_path: std::path::PathBuf) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(5);
 
     while Instant::now() < deadline {
-        if let Some(exit) = child.try_wait()? {
-            bail!(
-                "detached supervisor exited early with {exit}; see {}",
-                log_path.display()
-            );
-        }
-
         let started = status_for(supervisor.clone());
         if started.state == ProcessState::Running && started.pid == Some(child_pid) {
             println!(
@@ -1694,6 +1736,23 @@ fn start_detached(config_path: std::path::PathBuf) -> Result<()> {
             println!("Logs: {}", log_path.display());
             println!("Stop: agora stop --config {}", config_path.display());
             return Ok(());
+        }
+        if started.state == ProcessState::Running {
+            let pid = started
+                .pid
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            bail!(
+                "agora supervisor is already running as pid {pid}; stop it with `agora stop --config {}`",
+                config_path.display()
+            );
+        }
+
+        if let Some(exit) = child.try_wait()? {
+            bail!(
+                "detached supervisor exited early with {exit}; see {}",
+                log_path.display()
+            );
         }
 
         std::thread::sleep(Duration::from_millis(100));
@@ -1706,20 +1765,63 @@ fn start_detached(config_path: std::path::PathBuf) -> Result<()> {
     )
 }
 
+#[derive(Debug)]
 struct PidFileGuard {
     path: std::path::PathBuf,
+    pid: u32,
 }
 
 impl PidFileGuard {
-    fn write(path: std::path::PathBuf) -> Result<Self> {
-        write_pid(&path, std::process::id())?;
-        Ok(Self { path })
+    fn claim(process: RuntimeProcess) -> Result<Self> {
+        let path = process.pid_file.clone();
+        let pid = std::process::id();
+        loop {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            match options.open(&path) {
+                Ok(mut file) => {
+                    writeln!(file, "{pid}")?;
+                    return Ok(Self { path, pid });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let status = status_for(process.clone());
+                    match status.state {
+                        ProcessState::Running => {
+                            let existing = status
+                                .pid
+                                .map(|pid| pid.to_string())
+                                .unwrap_or_else(|| "unknown".to_string());
+                            bail!("{} is already running as pid {existing}", process.name);
+                        }
+                        ProcessState::StalePid | ProcessState::NotStarted => {
+                            std::fs::remove_file(&path).with_context(|| {
+                                format!("remove stale pid file {}", path.display())
+                            })?;
+                            continue;
+                        }
+                    }
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| format!("claim pid file {}", path.display()));
+                }
+            }
+        }
     }
 }
 
 impl Drop for PidFileGuard {
     fn drop(&mut self) {
-        std::fs::remove_file(&self.path).ok();
+        let own_pid = self.pid.to_string();
+        let should_remove = std::fs::read_to_string(&self.path)
+            .map(|raw| raw.trim() == own_pid)
+            .unwrap_or(false);
+        if should_remove {
+            std::fs::remove_file(&self.path).ok();
+        }
     }
 }
 
@@ -2144,23 +2246,22 @@ async fn show_history(agent_name: &str, session_id: &str, bus_url: &str) -> Resu
 async fn send_message(
     agent: &str,
     message: &str,
-    session_id: Option<&str>,
+    session_id: &str,
     message_type: &str,
     bus_url: &str,
     key_path: &str,
 ) -> Result<()> {
-    if message_type != "steer" && message_type != "queue" {
-        bail!("--message-type must be 'steer' or 'queue'");
-    }
+    let message_type = match message_type {
+        "steer" | "steering" => "steering",
+        "queue" => "queue",
+        _ => bail!("--message-type must be 'steering' (or 'steer') or 'queue'"),
+    };
 
-    let session_id = session_id
-        .map(String::from)
-        .unwrap_or_else(|| format!("sess_{}", ulid::Ulid::new()));
     let signing_key = load_signing_key(key_path)?;
     let token = mint_actor_token(
         "cli-user",
         &["agent:message"],
-        &session_id,
+        session_id,
         &signing_key,
         900,
     )?;
@@ -2170,10 +2271,11 @@ async fn send_message(
         "agora-cli",
         0,
         token,
-        session_id.clone(),
+        session_id.to_string(),
         serde_json::json!({
             "messageType": message_type,
             "recipient": agent,
+            "sessionId": session_id,
             "message": message,
         }),
         None,
@@ -2209,21 +2311,60 @@ async fn replay(session_id: &Option<String>, bus_url: &str, json: bool) -> Resul
 
 async fn show_events(args: &EventArgs) -> Result<()> {
     let bus = Bus::connect(&args.bus_url).await?;
+    let live = if args.follow {
+        Some(subscribe_event_stream(&bus).await?)
+    } else {
+        None
+    };
     let events = bus.read_all_events().await?;
+    let filter = resolve_event_filter(args, &events)?;
 
-    for event in events.iter().filter(|event| event_matches(event, args)) {
-        print_event(event, args.json)?;
+    let matching: Vec<_> = events
+        .iter()
+        .filter(|event| event_matches(event, &filter))
+        .collect();
+    let start = filter
+        .tail
+        .map(|tail| matching.len().saturating_sub(tail))
+        .unwrap_or(0);
+
+    for event in &matching[start..] {
+        print_event(event, filter.json)?;
     }
 
-    if args.follow {
-        follow_events(&bus, args.clone()).await?;
+    if let Some(live) = live {
+        let seen = events
+            .iter()
+            .map(|event| event.event_id.clone())
+            .collect::<HashSet<_>>();
+        follow_events(live, filter, seen).await?;
     }
 
     Ok(())
 }
 
-async fn follow_events(bus: &Bus, args: EventArgs) -> Result<()> {
-    let (tx, mut rx) = mpsc::channel::<Envelope>(256);
+async fn show_event_logs(
+    target: &str,
+    cfg: &TopologyConfig,
+    options: &LogOptions,
+    bus_url: Option<&str>,
+) -> Result<()> {
+    show_events(&EventArgs {
+        target: Some(target.to_string()),
+        session_id: None,
+        agent: None,
+        topic: None,
+        tail: Some(options.tail),
+        since: options.since.clone(),
+        follow: options.follow,
+        json: false,
+        bus_url: bus_url.unwrap_or(&cfg.bus_url).to_string(),
+    })
+    .await
+}
+
+async fn subscribe_event_stream(bus: &Bus) -> Result<mpsc::Receiver<Envelope>> {
+    let (tx, rx) = mpsc::channel::<Envelope>(256);
 
     for subject in EVENT_STREAM_SUBJECTS {
         let mut sub = bus
@@ -2243,38 +2384,131 @@ async fn follow_events(bus: &Bus, args: EventArgs) -> Result<()> {
         });
     }
     drop(tx);
+    Ok(rx)
+}
 
-    while let Some(event) = rx.recv().await {
-        if event_matches(&event, &args) {
-            print_event(&event, args.json)?;
+async fn follow_events(
+    mut rx: mpsc::Receiver<Envelope>,
+    filter: EventFilter,
+    mut seen: HashSet<String>,
+) -> Result<()> {
+    loop {
+        tokio::select! {
+            event = rx.recv() => {
+                let Some(event) = event else {
+                    return Ok(());
+                };
+                if !seen.insert(event.event_id.clone()) {
+                    continue;
+                }
+                if event_matches(&event, &filter) {
+                    print_event(&event, filter.json)?;
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                return Ok(());
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EventFilter {
+    session_id: Option<String>,
+    agent: Option<String>,
+    topic: Option<String>,
+    since: Option<DateTime<Utc>>,
+    tail: Option<usize>,
+    json: bool,
+}
+
+fn resolve_event_filter(args: &EventArgs, events: &[Envelope]) -> Result<EventFilter> {
+    let mut session_id = args.session_id.clone();
+    let mut agent = args.agent.clone();
+    let mut topic = args.topic.clone();
+
+    if let Some(target) = args.target.as_deref() {
+        if session_id.is_some() || agent.is_some() || topic.is_some() {
+            bail!("TARGET cannot be combined with --sessionId, --agent, or --topic");
+        }
+        if target.starts_with("sess_") {
+            session_id = Some(target.to_string());
+        } else if let Some((matched_session_id, _)) = build_sessions(events)
+            .iter()
+            .find(|(_, session)| session.name.as_deref() == Some(target))
+        {
+            session_id = Some(matched_session_id.clone());
+        } else if events.iter().any(|event| event.sender.agent_name == target) {
+            agent = Some(target.to_string());
+        } else if target.contains('.') || target.contains('*') || target.contains('>') {
+            topic = Some(target.to_string());
+        } else {
+            bail!(
+                "event target `{target}` was not found as a session id/name, agent name, or topic pattern"
+            );
         }
     }
 
-    Ok(())
+    let since = args
+        .since
+        .as_deref()
+        .map(parse_since)
+        .transpose()
+        .with_context(|| {
+            format!(
+                "invalid --since value `{}`; use RFC3339 or a duration like 10m, 2h, 1d",
+                args.since.as_deref().unwrap_or_default()
+            )
+        })?;
+
+    Ok(EventFilter {
+        session_id,
+        agent,
+        topic,
+        since,
+        tail: args.tail,
+        json: args.json,
+    })
 }
 
-fn event_matches(event: &Envelope, args: &EventArgs) -> bool {
-    if args
+fn event_matches(event: &Envelope, filter: &EventFilter) -> bool {
+    if filter
         .session_id
         .as_deref()
         .is_some_and(|session_id| event.context.session_id != session_id)
     {
         return false;
     }
-    if args
+    if filter
         .agent
         .as_deref()
         .is_some_and(|agent| event.sender.agent_name != agent)
     {
         return false;
     }
-    if let Some(topic) = args.topic.as_deref() {
+    if let Some(topic) = filter.topic.as_deref() {
         if topic.contains('*') || topic.contains('>') {
             return topic_matches(topic, &event.topic);
         }
-        return event.topic == topic;
+        if event.topic != topic {
+            return false;
+        }
+    }
+    if let Some(since) = filter.since.as_ref() {
+        let Some(timestamp) = event_timestamp(event) else {
+            return false;
+        };
+        if timestamp < *since {
+            return false;
+        }
     }
     true
+}
+
+fn event_timestamp(event: &Envelope) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(&event.timestamp)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&Utc))
 }
 
 fn print_event(event: &Envelope, json: bool) -> Result<()> {
@@ -2524,6 +2758,7 @@ async fn show_info(config_path: &Path, bus_url: Option<&str>, json: bool) -> Res
             "logDir": &cfg.log_dir,
             "agents": cfg.agents.len(),
             "defaultAcp": &cfg.default_acp,
+            "defaultAcpTimeoutSecs": cfg.default_acp_timeout_secs,
         },
         "bus": bus_state,
         "stream": stream_state,
@@ -2548,9 +2783,10 @@ async fn show_info(config_path: &Path, bus_url: Option<&str>, json: bool) -> Res
     println!("pid dir:   {}", cfg.pid_dir);
     println!("log dir:   {}", cfg.log_dir);
     println!(
-        "agents:    {} configured, default ACP {}",
+        "agents:    {} configured, default ACP {} ({}s timeout)",
         cfg.agents.len(),
-        cfg.default_acp
+        cfg.default_acp,
+        cfg.default_acp_timeout_secs
     );
     println!(
         "processes: {running}/{} running, {stale_pid} stale pid",
@@ -2925,6 +3161,65 @@ mod tests {
         Envelope::build(topic, "test", 0, "tok", session_id, data, None, vec![])
     }
 
+    fn event_args(target: Option<&str>) -> EventArgs {
+        EventArgs {
+            target: target.map(ToString::to_string),
+            session_id: None,
+            agent: None,
+            topic: None,
+            tail: None,
+            since: None,
+            follow: false,
+            json: false,
+            bus_url: "nats://127.0.0.1:4222".to_string(),
+        }
+    }
+
+    fn test_supervisor_process(root: &std::path::Path) -> RuntimeProcess {
+        RuntimeProcess {
+            name: "agora".to_string(),
+            kind: "supervisor",
+            pid_file: root.join("agora.pid"),
+            log_file: None,
+        }
+    }
+
+    #[test]
+    fn pid_guard_refuses_existing_live_supervisor_pid() {
+        let temp = tempfile::tempdir().unwrap();
+        let process = test_supervisor_process(temp.path());
+        std::fs::write(&process.pid_file, format!("{}\n", std::process::id())).unwrap();
+
+        let err = PidFileGuard::claim(process.clone()).unwrap_err();
+
+        assert!(err.to_string().contains("already running"));
+        assert_eq!(
+            std::fs::read_to_string(&process.pid_file).unwrap().trim(),
+            std::process::id().to_string()
+        );
+    }
+
+    #[test]
+    fn pid_guard_replaces_stale_pid_and_removes_only_its_own_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let process = test_supervisor_process(temp.path());
+        std::fs::write(&process.pid_file, "999999999\n").unwrap();
+
+        let guard = PidFileGuard::claim(process.clone()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&process.pid_file).unwrap().trim(),
+            std::process::id().to_string()
+        );
+
+        std::fs::write(&process.pid_file, "123\n").unwrap();
+        drop(guard);
+
+        assert_eq!(
+            std::fs::read_to_string(&process.pid_file).unwrap().trim(),
+            "123"
+        );
+    }
+
     #[test]
     fn session_deleted_marks_summary_without_erasing_history() {
         let events = vec![
@@ -2952,5 +3247,52 @@ mod tests {
         assert_eq!(summary.last_topic, WORKSPACE_EVENT_SUBMITTED);
         assert!(summary.deleted);
         assert!(summary.deleted_at.is_some());
+    }
+
+    #[test]
+    fn positional_event_target_resolves_session_name() {
+        let events = vec![
+            event(
+                SESSION_NAMED,
+                "sess_named",
+                serde_json::json!({ "name": "Task manager" }),
+            ),
+            event(
+                WORKSPACE_EVENT_SUBMITTED,
+                "sess_named",
+                serde_json::json!({ "text": "build it" }),
+            ),
+            event(
+                WORKSPACE_EVENT_SUBMITTED,
+                "sess_other",
+                serde_json::json!({ "text": "skip it" }),
+            ),
+        ];
+
+        let filter = resolve_event_filter(&event_args(Some("Task manager")), &events).unwrap();
+        assert_eq!(filter.session_id.as_deref(), Some("sess_named"));
+        assert!(event_matches(&events[1], &filter));
+        assert!(!event_matches(&events[2], &filter));
+    }
+
+    #[test]
+    fn positional_event_target_can_be_topic_pattern() {
+        let events = vec![
+            event(
+                WORKSPACE_EVENT_SUBMITTED,
+                "sess_topic",
+                serde_json::json!({ "text": "build it" }),
+            ),
+            event(
+                "code.changed",
+                "sess_topic",
+                serde_json::json!({ "summary": "done" }),
+            ),
+        ];
+
+        let filter = resolve_event_filter(&event_args(Some("code.>")), &events).unwrap();
+        assert_eq!(filter.topic.as_deref(), Some("code.>"));
+        assert!(!event_matches(&events[0], &filter));
+        assert!(event_matches(&events[1], &filter));
     }
 }

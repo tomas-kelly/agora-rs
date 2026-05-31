@@ -52,18 +52,29 @@ pub fn render(f: &mut Frame, app: &mut App) {
 }
 
 fn render_status(f: &mut Frame, app: &App, area: Rect) {
+    let pending_count = app.pending_interaction_count();
     let left = format!(
-        " agora console │ {} │ events:{} telemetry:{} sessions:{} agents:{} ",
+        " agora console │ {} │ events:{} telemetry:{} sessions:{} agents:{} pending:{} ",
         app.bus_url,
         app.events.len(),
         app.telemetry.len(),
         app.sessions.len(),
         app.agents.len(),
+        pending_count,
     );
-    let right = app
+    let base_status = app
         .status_msg
         .clone()
         .unwrap_or_else(|| "Esc to quit".into());
+    let right = match app.first_pending_interaction() {
+        Some(item) => format!(
+            "{} needed: {} in {} · {base_status}",
+            item.kind_label(),
+            item.agent_name,
+            app.display_name(&item.session_id)
+        ),
+        None => base_status,
+    };
 
     let line = Line::from(vec![
         Span::styled(
@@ -215,6 +226,7 @@ fn render_sessions(f: &mut Frame, app: &App, area: Rect) {
         .take(session_item_limit(inner.height))
         .map(|s| {
             let is_active = app.active_session.as_deref() == Some(s.session_id.as_str());
+            let pending = app.pending_count_for_session(&s.session_id);
             let display = app.display_name(&s.session_id);
             let marker = if is_active { "▶ " } else { "  " };
             let style = if is_active {
@@ -230,6 +242,16 @@ fn render_sessions(f: &mut Frame, app: &App, area: Rect) {
             ListItem::new(Line::from(vec![
                 Span::raw(marker),
                 Span::styled(display, style),
+                if pending > 0 {
+                    Span::styled(
+                        format!("  ?{pending}"),
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    Span::raw("")
+                },
             ]))
         })
         .collect();
@@ -303,7 +325,8 @@ fn render_events(f: &mut Frame, app: &mut App, area: Rect) {
             let e = app.events.get(*idx)?;
             let selected = selected_idx == Some(*idx);
             let bookmarked = app.bookmarks.contains_key(&e.event_id);
-            let item = ListItem::new(format_event_line(e, selected, bookmarked));
+            let pending = app.is_pending_interaction(&e.event_id);
+            let item = ListItem::new(format_event_line(e, selected, bookmarked, pending));
             Some(if selected {
                 item.style(Style::default().add_modifier(Modifier::REVERSED))
             } else {
@@ -320,6 +343,7 @@ fn format_event_line(
     e: &agora_core::envelope::Envelope,
     selected: bool,
     bookmarked: bool,
+    pending: bool,
 ) -> Line<'static> {
     let ts = if e.timestamp.len() >= 19 {
         e.timestamp[11..19].to_string()
@@ -337,6 +361,14 @@ fn format_event_line(
     ];
     if bookmarked {
         spans.push(Span::styled(" ★", Style::default().fg(Color::Yellow)));
+    }
+    if pending {
+        spans.push(Span::styled(
+            " ?",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ));
     }
     Line::from(spans)
 }
@@ -372,6 +404,7 @@ fn render_agents(f: &mut Frame, app: &App, area: Rect) {
         .agents
         .values()
         .map(|a| {
+            let pending = app.pending_count_for_agent(&a.agent_name);
             let (icon, color) = match a.observed_status() {
                 AgentStatus::Ready => ("●", Color::Green),
                 AgentStatus::Busy => ("◐", Color::Yellow),
@@ -387,8 +420,26 @@ fn render_agents(f: &mut Frame, app: &App, area: Rect) {
                         a.agent_name.clone(),
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
+                    if pending > 0 {
+                        Span::styled(
+                            format!("  ?{pending}"),
+                            Style::default()
+                                .fg(Color::Magenta)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                    } else {
+                        Span::raw("")
+                    },
                 ]),
-                Line::from(format!("   :{} · {}", a.port, a.capabilities.join(","))),
+                Line::from(if pending > 0 {
+                    format!(
+                        "   :{} · {} · needs input",
+                        a.port,
+                        a.capabilities.join(",")
+                    )
+                } else {
+                    format!("   :{} · {}", a.port, a.capabilities.join(","))
+                }),
             ])
         })
         .collect();

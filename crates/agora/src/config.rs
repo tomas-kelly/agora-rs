@@ -55,6 +55,12 @@ pub struct TopologyConfig {
     /// Default ACP mode for agents that don't override it.
     #[serde(default = "default_acp", alias = "default_acp")]
     pub default_acp: String,
+    /// Default timeout, in seconds, for stdio ACP requests.
+    #[serde(
+        default = "default_acp_timeout_secs",
+        alias = "default_acp_timeout_secs"
+    )]
+    pub default_acp_timeout_secs: u64,
     pub agents: Vec<AgentSpec>,
 }
 
@@ -69,6 +75,9 @@ fn default_log_dir() -> String {
 }
 fn default_acp() -> String {
     "mock".into()
+}
+fn default_acp_timeout_secs() -> u64 {
+    300
 }
 
 impl TopologyConfig {
@@ -87,6 +96,9 @@ impl TopologyConfig {
     pub fn validate(&self) -> Result<()> {
         if self.agents.is_empty() {
             bail!("topology has no agents");
+        }
+        if self.default_acp_timeout_secs == 0 {
+            bail!("default ACP timeout must be greater than zero");
         }
 
         // 1. Agent names must be unique.
@@ -130,30 +142,26 @@ impl TopologyConfig {
             }
         }
 
-        // 3. kiro_command required when the agent will use the kiro backend.
+        // 3. acp_command required when the agent will use the stdio backend.
         let default_acp = self.default_acp.as_str();
         for agent in &self.agents {
             let mode = agent.acp.as_deref().unwrap_or(default_acp);
             match mode {
-                "mock" | "kiro" => {}
+                "mock" | "stdio" => {}
                 other => bail!(
                     "agent `{}` has unsupported acp mode `{}`",
                     agent.name,
                     other
                 ),
             }
-            if mode == "kiro"
-                && agent
-                    .kiro_command
-                    .as_deref()
-                    .unwrap_or("")
-                    .trim()
-                    .is_empty()
-            {
+            if mode == "stdio" && agent.acp_command.as_deref().unwrap_or("").trim().is_empty() {
                 bail!(
-                    "agent `{}` uses kiro ACP but has no `kiro_command`",
+                    "agent `{}` uses stdio ACP but has no `acp_command`",
                     agent.name
                 );
+            }
+            if agent.acp_timeout_secs == Some(0) {
+                bail!("agent `{}` has an ACP timeout of zero seconds", agent.name);
             }
         }
 
@@ -274,18 +282,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_kiro_without_command() {
+    fn rejects_stdio_without_command() {
         let err = parse(&format!(
             r#"{{
                 "name": "t", {MINIMAL_NATS},
-                "default_acp": "kiro",
+                "default_acp": "stdio",
                 "agents": [
                     {{ "name": "a", "port": 1, "subscriptions": [] }}
                 ]
             }}"#
         ))
         .unwrap_err();
-        assert!(err.to_string().contains("kiro"));
+        assert!(err.to_string().contains("stdio"));
     }
 
     #[test]
@@ -300,6 +308,35 @@ mod tests {
         ))
         .unwrap_err();
         assert!(err.to_string().contains("unsupported acp"));
+    }
+
+    #[test]
+    fn rejects_zero_default_acp_timeout() {
+        let err = parse(&format!(
+            r#"{{
+                "name": "t", {MINIMAL_NATS},
+                "default_acp_timeout_secs": 0,
+                "agents": [
+                    {{ "name": "a", "port": 1, "subscriptions": [] }}
+                ]
+            }}"#
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("timeout"));
+    }
+
+    #[test]
+    fn rejects_zero_agent_acp_timeout() {
+        let err = parse(&format!(
+            r#"{{
+                "name": "t", {MINIMAL_NATS},
+                "agents": [
+                    {{ "name": "a", "port": 1, "acp_timeout_secs": 0, "subscriptions": [] }}
+                ]
+            }}"#
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("timeout"));
     }
 
     #[test]
@@ -322,11 +359,12 @@ mod tests {
     }
 
     #[test]
-    fn local_topology_wires_workspace_kiro_agents() {
+    fn local_topology_wires_workspace_acp_agents() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let topology = TopologyConfig::load(root.join("agents.local.json")).unwrap();
 
-        assert_eq!(topology.default_acp, "kiro");
+        assert_eq!(topology.default_acp, "stdio");
+        assert_eq!(topology.default_acp_timeout_secs, 300);
 
         let expected = [
             "backend-coder",
@@ -346,19 +384,69 @@ mod tests {
         assert_eq!(actual, expected);
 
         for agent in &topology.agents {
-            let command = agent.kiro_command.as_deref().unwrap_or_default();
+            let command = agent.acp_command.as_deref().unwrap_or_default();
             assert!(
                 command.contains(&format!("--agent {}", agent.name)),
-                "{} has unexpected kiro_command: {command}",
+                "{} has unexpected acp_command: {command}",
+                agent.name
+            );
+            let workflow_path = root.join("agents").join(format!("{}.md", agent.name));
+            assert!(
+                workflow_path.exists(),
+                "{} has no matching workflow markdown",
+                agent.name
+            );
+
+            let agent_config_path = root.join("agents").join(format!("{}.json", agent.name));
+            assert!(
+                agent_config_path.exists(),
+                "{} has no matching workspace ACP config",
+                agent.name
+            );
+            let agent_config = std::fs::read_to_string(&agent_config_path).unwrap();
+            assert!(
+                agent_config.contains(&format!("agents/{}.md", agent.name)),
+                "{} ACP config does not include its workflow doc",
                 agent.name
             );
             assert!(
-                root.join(".kiro/agents")
-                    .join(format!("{}.json", agent.name))
-                    .exists(),
-                "{} has no matching workspace Kiro config",
+                agent_config.contains("docs/agent-io-contract.md"),
+                "{} ACP config does not include the I/O contract",
                 agent.name
             );
+
+            for subscription in &agent.subscriptions {
+                assert!(
+                    subscription
+                        .prompt_template
+                        .contains(&format!("agents/{}.md", agent.name)),
+                    "{} subscription {} does not reference its workflow",
+                    agent.name,
+                    subscription.topic
+                );
+                assert!(
+                    subscription
+                        .prompt_template
+                        .contains("docs/agent-io-contract.md"),
+                    "{} subscription {} does not reference the I/O contract",
+                    agent.name,
+                    subscription.topic
+                );
+            }
+            if agent
+                .subscriptions
+                .iter()
+                .any(|sub| sub.prompt_template.contains("agent.noop"))
+            {
+                assert!(
+                    agent
+                        .publishes
+                        .iter()
+                        .any(|published| published.topic == "agent.noop"),
+                    "{} references agent.noop without declaring it",
+                    agent.name
+                );
+            }
         }
     }
 }

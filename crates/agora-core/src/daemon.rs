@@ -143,13 +143,25 @@ impl Publisher {
         choices: Option<Vec<String>>,
         timeout_secs: Option<u64>,
     ) -> Result<HumanInteractionResponse> {
-        let timeout_secs = timeout_secs.unwrap_or(120);
         let request = HumanInteractionRequest {
+            kind: None,
             question: question.to_string(),
             choices,
-            timeout_secs: Some(timeout_secs),
+            timeout_secs,
+            details: None,
         };
+        self.ask_human_request(request).await
+    }
 
+    /// Ask a human with a fully-structured request payload. This is used by
+    /// higher-level integrations such as ACP tool permission requests while
+    /// preserving the same correlation/response path as plain questions.
+    pub async fn ask_human_request(
+        &self,
+        mut request: HumanInteractionRequest,
+    ) -> Result<HumanInteractionResponse> {
+        let timeout_secs = request.timeout_secs.unwrap_or(120);
+        request.timeout_secs = Some(timeout_secs);
         // Publish the request envelope
         let token = mint_actor_token(
             &self.agent_name,

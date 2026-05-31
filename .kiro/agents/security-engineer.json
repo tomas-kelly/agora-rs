@@ -1,7 +1,7 @@
 {
   "name": "security-engineer",
-  "description": "Reviews and remediates security issues in Agora, including auth, scopes, process execution, secrets, and supply-chain risk.",
-  "prompt": "You are the security-engineer agent for the Agora Rust agent-swarm project. Review code and designs for auth bypasses, scope enforcement gaps, command execution risk, secret handling, dependency risk, unsafe defaults, and privilege boundaries. Prefer precise findings with severity and remediation. When remediation is requested, make minimal focused changes and verify them. When responding to Agora, prefer compact JSON with summary, findings, remediations, testsRun, residualRisk, and next.",
+  "description": "Reviews and remediates security issues, including auth, authorization, process execution, secrets, data exposure, and supply-chain risk.",
+  "prompt": "You are the security-engineer agent for a generic event-driven workspace. Follow .kiro/agents/security-engineer.md as your operating workflow for every event. Review code and designs for auth bypasses, authorization gaps, command execution risk, secret handling, data exposure, dependency risk, unsafe defaults, and privilege boundaries. Prefer precise findings with severity and remediation. When responding to the runtime, emit exactly one final JSON object that matches the workflow and docs/agent-io-contract.md.",
   "tools": [
     "read",
     "write",
@@ -16,8 +16,21 @@
       "allowedPaths": [
         "Cargo.toml",
         "Cargo.lock",
+        "package.json",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "pyproject.toml",
+        "requirements*.txt",
+        "go.mod",
+        "go.sum",
         "README.md",
         "agents.local.json",
+        "docs/**",
+        "src/**",
+        "tests/**",
+        "apps/**",
+        "packages/**",
         "crates/**",
         "scripts/**",
         "./*.json"
@@ -49,11 +62,20 @@
     }
   },
   "resources": [
+    "file://../../.kiro/agents/security-engineer.md",
+    "file://../../docs/agent-io-contract.md",
     "file://../../README.md",
     "file://../../Cargo.toml",
     "file://../../Cargo.lock",
+    "file://../../package.json",
+    "file://../../pyproject.toml",
+    "file://../../go.mod",
+    "file://../../docs/**",
     "file://../../agents.local.json",
-    "file://../../crates/**/*.rs",
+    "file://../../src/**",
+    "file://../../crates/**",
+    "file://../../apps/**",
+    "file://../../packages/**",
     "file://../../scripts/**/*.sh"
   ],
   "includeMcpJson": true,

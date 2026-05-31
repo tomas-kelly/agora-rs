@@ -8,7 +8,7 @@ use std::{
 
 const ALGORITHM: jsonwebtoken::Algorithm = jsonwebtoken::Algorithm::HS256;
 const ISSUER: &str = "agora";
-const DEFAULT_TOKEN_PATH: &str = ".kiro/session_token";
+const DEFAULT_TOKEN_PATH: &str = ".agora/session_token";
 pub const DEFAULT_TTL_SECS: u64 = 15 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -34,6 +34,25 @@ fn cli_mutating_commands_work_against_isolated_nats() {
     let bus_url = format!("nats://127.0.0.1:{port}");
     let store_dir = temp.path().join("nats-store");
     let key_path = temp.path().join("session_token");
+    let topology_path = temp.path().join("topology.json");
+
+    std::fs::write(
+        &topology_path,
+        serde_json::json!({
+            "name": "cli-smoke",
+            "busUrl": bus_url,
+            "nats": { "command": "nats-server -js" },
+            "agents": [
+                {
+                    "name": "product-manager",
+                    "port": 4100,
+                    "subscriptions": []
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .expect("write topology");
 
     let mut child = Command::new(nats)
         .args(["-js", "-p", &port.to_string(), "-sd"])
@@ -78,20 +97,48 @@ fn cli_mutating_commands_work_against_isolated_nats() {
         "submit",
         "workspace.event.submitted",
         "Build smoke path",
-        "--session-id",
+        "--sessionId",
         &session_id,
         "--bus-url",
         &bus_url,
         "--key-path",
         key_path.to_str().unwrap(),
     ]);
-    run_ok([
+    let missing_session = run(["message", "--agent", "product-manager", "unscoped"]);
+    assert!(
+        !missing_session.status.success(),
+        "message without --sessionId should fail"
+    );
+    assert!(
+        String::from_utf8_lossy(&missing_session.stderr).contains("--sessionId"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&missing_session.stderr)
+    );
+    let legacy_session_flag = run([
         "message",
+        "--agent",
         "product-manager",
-        "hello",
-        "agent",
         "--session-id",
         &session_id,
+        "legacy",
+    ]);
+    assert!(
+        !legacy_session_flag.status.success(),
+        "legacy --session-id should be rejected for message"
+    );
+    assert!(
+        String::from_utf8_lossy(&legacy_session_flag.stderr).contains("--session-id"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&legacy_session_flag.stderr)
+    );
+    run_ok([
+        "message",
+        "--agent",
+        "product-manager",
+        "--sessionId",
+        &session_id,
+        "hello",
+        "agent",
         "--bus-url",
         &bus_url,
         "--key-path",
@@ -102,15 +149,62 @@ fn cli_mutating_commands_work_against_isolated_nats() {
     let sessions = String::from_utf8(sessions.stdout).unwrap();
     assert!(sessions.contains("Renamed Smoke"));
 
-    let replay = run_ok(["replay", "--session-id", &session_id, "--bus-url", &bus_url]);
+    let replay = run_ok(["replay", "--sessionId", &session_id, "--bus-url", &bus_url]);
     let replay = String::from_utf8(replay.stdout).unwrap();
     assert!(replay.contains("workspace.event.submitted"));
     assert!(replay.contains("agent.inbox.product-manager"));
 
-    let events = run_ok(["events", "--session-id", &session_id, "--bus-url", &bus_url]);
+    let events = run_ok(["events", "--sessionId", &session_id, "--bus-url", &bus_url]);
     let events = String::from_utf8(events.stdout).unwrap();
     assert!(events.contains("workspace.event.submitted"));
     assert!(events.contains("agent.inbox.product-manager"));
+
+    let event_json = run_ok([
+        "events",
+        "--json",
+        "--sessionId",
+        &session_id,
+        "--bus-url",
+        &bus_url,
+    ]);
+    let event_json = String::from_utf8(event_json.stdout).unwrap();
+    let inbox_event: serde_json::Value = event_json
+        .lines()
+        .find(|line| line.contains("agent.inbox.product-manager"))
+        .map(|line| serde_json::from_str(line).unwrap())
+        .expect("agent inbox event");
+    assert_eq!(inbox_event["context"]["sessionId"], session_id);
+    assert_eq!(inbox_event["data"]["sessionId"], session_id);
+
+    let events_positional = run_ok(["events", &session_id, "--tail", "2", "--bus-url", &bus_url]);
+    let events_positional = String::from_utf8(events_positional.stdout).unwrap();
+    assert!(events_positional.contains(&session_id));
+
+    let events_named = run_ok([
+        "events",
+        "Renamed Smoke",
+        "--tail",
+        "4",
+        "--bus-url",
+        &bus_url,
+    ]);
+    let events_named = String::from_utf8(events_named.stdout).unwrap();
+    assert!(events_named.contains("workspace.event.submitted"));
+    assert!(events_named.contains("agent.inbox.product-manager"));
+
+    let session_logs = run_ok([
+        "logs",
+        "Renamed Smoke",
+        "--tail",
+        "4",
+        "--bus-url",
+        &bus_url,
+        "--config",
+        topology_path.to_str().unwrap(),
+    ]);
+    let session_logs = String::from_utf8(session_logs.stdout).unwrap();
+    assert!(session_logs.contains("workspace.event.submitted"));
+    assert!(session_logs.contains("agent.inbox.product-manager"));
 
     let session_ls = run_ok(["session", "ls", "--bus-url", &bus_url]);
     let session_ls = String::from_utf8(session_ls.stdout).unwrap();
@@ -158,11 +252,45 @@ fn cli_mutating_commands_work_against_isolated_nats() {
     assert!(session_ls_deleted.contains("Renamed Smoke"));
     assert!(session_ls_deleted.contains("deleted"));
 
+    let deleted_inspect = run_ok([
+        "session",
+        "inspect",
+        &session_id,
+        "--json",
+        "--bus-url",
+        &bus_url,
+    ]);
+    let deleted_inspect: serde_json::Value =
+        serde_json::from_slice(&deleted_inspect.stdout).unwrap();
+    assert_eq!(deleted_inspect["summary"]["deleted"], true);
+    assert_eq!(deleted_inspect["summary"]["name"], "Renamed Smoke");
+    assert!(deleted_inspect["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["topic"] == "workspace.event.submitted"));
+
+    let deleted_history = run_ok([
+        "session",
+        "history",
+        &session_id,
+        "--json",
+        "--bus-url",
+        &bus_url,
+    ]);
+    let deleted_history: serde_json::Value =
+        serde_json::from_slice(&deleted_history.stdout).unwrap();
+    assert!(deleted_history["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["topic"] == "agent.inbox.product-manager"));
+
     // --json replay: NDJSON output with camelCase keys
     let replay_json = run_ok([
         "replay",
         "--json",
-        "--session-id",
+        "--sessionId",
         &session_id,
         "--bus-url",
         &bus_url,
@@ -262,7 +390,7 @@ async fn submit_drives_mock_agent_and_preserves_event_context() {
         "submit",
         "workspace.event.typo",
         "bad topic",
-        "--session-id",
+        "--sessionId",
         session_id,
         "--bus-url",
         &bus_url,
@@ -285,7 +413,7 @@ async fn submit_drives_mock_agent_and_preserves_event_context() {
         "submit",
         WORKSPACE_EVENT_SUBMITTED,
         "Build from integration",
-        "--session-id",
+        "--sessionId",
         session_id,
         "--bus-url",
         &bus_url,

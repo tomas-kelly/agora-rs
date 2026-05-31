@@ -348,6 +348,7 @@ pub fn stop_runtime(cfg: &TopologyConfig, target: Option<&str>, force: bool) -> 
     }
 
     let processes = expected_processes(cfg);
+    let mut changed = false;
     let supervisor = processes
         .iter()
         .find(|process| process.name == "agora")
@@ -357,6 +358,7 @@ pub fn stop_runtime(cfg: &TopologyConfig, target: Option<&str>, force: bool) -> 
         let status = status_for(supervisor.clone());
         if status.state == ProcessState::Running {
             stop_process(&supervisor, force, true)?;
+            changed = true;
             wait_for_all_stopped(&processes, Duration::from_secs(10));
         }
     }
@@ -368,7 +370,12 @@ pub fn stop_runtime(cfg: &TopologyConfig, target: Option<&str>, force: bool) -> 
         let status = status_for(process.clone());
         if status.state != ProcessState::NotStarted {
             stop_process(process, force, true)?;
+            changed = true;
         }
+    }
+
+    if !changed {
+        println!("agora runtime `{}` is not running", cfg.name);
     }
 
     Ok(())
@@ -456,6 +463,7 @@ pub fn legacy_swarm_processes() -> Vec<LegacyProcess> {
     }
 }
 
+#[cfg(test)]
 pub fn write_pid(path: &Path, pid: u32) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -596,7 +604,7 @@ fn follow_log_file(path: &Path, since: Option<DateTime<Utc>>, timestamps: bool) 
     }
 }
 
-fn parse_since(value: &str) -> Result<DateTime<Utc>> {
+pub fn parse_since(value: &str) -> Result<DateTime<Utc>> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
         return Ok(dt.with_timezone(&Utc));
     }
@@ -787,4 +795,105 @@ fn parse_legacy_process(line: &str) -> Option<LegacyProcess> {
         pid,
         command: command.trim().to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{NatsConfig, TelemetryConfig};
+    use agora_core::agent_spec::AgentSpec;
+    use std::collections::BTreeSet;
+
+    fn topology(root: &Path, name: &str) -> TopologyConfig {
+        let runtime_dir = root.join(".agora").join(name);
+        TopologyConfig {
+            name: name.to_string(),
+            bus_url: "nats://127.0.0.1:4222".to_string(),
+            pid_dir: runtime_dir.join("pids").display().to_string(),
+            log_dir: runtime_dir.join("logs").display().to_string(),
+            nats: NatsConfig {
+                command: "nats-server -js".to_string(),
+                log_file: runtime_dir.join("logs/nats.log").display().to_string(),
+            },
+            telemetry: TelemetryConfig {
+                enabled: true,
+                log_file: runtime_dir
+                    .join("logs/telemetry.jsonl")
+                    .display()
+                    .to_string(),
+            },
+            default_acp: "mock".to_string(),
+            default_acp_timeout_secs: 300,
+            agents: vec![AgentSpec {
+                name: "worker".to_string(),
+                port: 4100,
+                capabilities: vec![],
+                acp_command: None,
+                acp: None,
+                acp_timeout_secs: None,
+                subscriptions: vec![],
+                publishes: vec![],
+            }],
+        }
+    }
+
+    #[test]
+    fn configs_in_one_workspace_can_keep_runtime_registries_separate() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg_a = topology(temp.path(), "alpha");
+        let cfg_b = topology(temp.path(), "beta");
+
+        let pids_a = expected_processes(&cfg_a)
+            .into_iter()
+            .map(|process| process.pid_file)
+            .collect::<BTreeSet<_>>();
+        let pids_b = expected_processes(&cfg_b)
+            .into_iter()
+            .map(|process| process.pid_file)
+            .collect::<BTreeSet<_>>();
+        assert!(pids_a.is_disjoint(&pids_b));
+
+        let logs_a = expected_processes(&cfg_a)
+            .into_iter()
+            .filter_map(|process| process.log_file)
+            .collect::<BTreeSet<_>>();
+        let logs_b = expected_processes(&cfg_b)
+            .into_iter()
+            .filter_map(|process| process.log_file)
+            .collect::<BTreeSet<_>>();
+        assert!(logs_a.is_disjoint(&logs_b));
+    }
+
+    #[test]
+    fn stale_pid_files_are_reported_and_removed_for_target_stop() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = topology(temp.path(), "alpha");
+        let process = process_for_target(&cfg, "worker").unwrap();
+        write_pid(&process.pid_file, 999_999_999).unwrap();
+
+        let status = status_for(process.clone());
+        assert_eq!(status.pid, Some(999_999_999));
+        assert_eq!(status.state, ProcessState::StalePid);
+
+        stop_runtime(&cfg, Some("worker"), false).unwrap();
+        assert!(!process.pid_file.exists());
+    }
+
+    #[test]
+    fn stop_runtime_uses_only_the_selected_config_registry() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg_a = topology(temp.path(), "alpha");
+        let cfg_b = topology(temp.path(), "beta");
+        let process_a = process_for_target(&cfg_a, "worker").unwrap();
+        let process_b = process_for_target(&cfg_b, "worker").unwrap();
+
+        write_pid(&process_a.pid_file, 999_999_998).unwrap();
+        write_pid(&process_b.pid_file, 999_999_999).unwrap();
+
+        stop_runtime(&cfg_a, Some("worker"), false).unwrap();
+
+        assert!(!process_a.pid_file.exists());
+        assert!(process_b.pid_file.exists());
+        assert_eq!(status_for(process_b).state, ProcessState::StalePid);
+    }
 }

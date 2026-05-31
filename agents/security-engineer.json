@@ -1,0 +1,84 @@
+{
+  "name": "security-engineer",
+  "description": "Reviews and remediates security issues, including auth, authorization, process execution, secrets, data exposure, and supply-chain risk.",
+  "prompt": "You are the security-engineer agent for a generic event-driven workspace. Follow agents/security-engineer.md as your operating workflow for every event. Review code and designs for auth bypasses, authorization gaps, command execution risk, secret handling, data exposure, dependency risk, unsafe defaults, and privilege boundaries. Prefer precise findings with severity and remediation. When responding to the runtime, emit exactly one final JSON object that matches the workflow and docs/agent-io-contract.md.",
+  "tools": [
+    "read",
+    "write",
+    "shell"
+  ],
+  "allowedTools": [
+    "read",
+    "shell"
+  ],
+  "toolsSettings": {
+    "write": {
+      "allowedPaths": [
+        "Cargo.toml",
+        "Cargo.lock",
+        "package.json",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "pyproject.toml",
+        "requirements*.txt",
+        "go.mod",
+        "go.sum",
+        "README.md",
+        "agents.local.json",
+        "docs/**",
+        "src/**",
+        "tests/**",
+        "apps/**",
+        "packages/**",
+        "crates/**",
+        "scripts/**",
+        "./*.json"
+      ]
+    },
+    "shell": {
+      "allowedCommands": [
+        "pwd",
+        "ls .*",
+        "rg .*",
+        "git status",
+        "git diff .*",
+        "cargo audit.*",
+        "cargo deny.*",
+        "cargo check .*",
+        "cargo test .*",
+        "cargo clippy .*"
+      ],
+      "deniedCommands": [
+        "rm .*",
+        "git reset .*",
+        "git checkout .*",
+        "git clean .*",
+        "git push .*",
+        "curl .* | .*",
+        "wget .* | .*"
+      ],
+      "autoAllowReadonly": true
+    }
+  },
+  "resources": [
+    "file://../../agents/security-engineer.md",
+    "file://../../docs/agent-io-contract.md",
+    "file://../../README.md",
+    "file://../../Cargo.toml",
+    "file://../../Cargo.lock",
+    "file://../../package.json",
+    "file://../../pyproject.toml",
+    "file://../../go.mod",
+    "file://../../docs/**",
+    "file://../../agents.local.json",
+    "file://../../src/**",
+    "file://../../crates/**",
+    "file://../../apps/**",
+    "file://../../packages/**",
+    "file://../../scripts/**/*.sh"
+  ],
+  "includeMcpJson": true,
+  "keyboardShortcut": "ctrl+e",
+  "welcomeMessage": "Ready to review security boundaries and remediation risk."
+}

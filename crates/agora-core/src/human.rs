@@ -3,11 +3,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HumanInteractionRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     pub question: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub choices: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,9 +29,11 @@ mod tests {
     #[test]
     fn request_round_trips() {
         let req = HumanInteractionRequest {
+            kind: None,
             question: "Pick a color".into(),
             choices: Some(vec!["red".into(), "blue".into()]),
             timeout_secs: Some(60),
+            details: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let decoded: HumanInteractionRequest = serde_json::from_str(&json).unwrap();
@@ -39,13 +45,38 @@ mod tests {
     #[test]
     fn request_omits_none_fields() {
         let req = HumanInteractionRequest {
+            kind: None,
             question: "Yes or no?".into(),
             choices: None,
             timeout_secs: None,
+            details: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("choices"));
         assert!(!json.contains("timeoutSecs"));
+        assert!(!json.contains("kind"));
+        assert!(!json.contains("details"));
+    }
+
+    #[test]
+    fn request_supports_structured_tool_approval_details() {
+        let req = HumanInteractionRequest {
+            kind: Some("tool_approval".into()),
+            question: "Approve tool call?".into(),
+            choices: Some(vec!["allow-once".into(), "reject-once".into()]),
+            timeout_secs: Some(300),
+            details: Some(serde_json::json!({
+                "toolCall": {
+                    "toolCallId": "call_1",
+                    "title": "Run cargo test"
+                }
+            })),
+        };
+
+        let json = serde_json::to_value(&req).unwrap();
+
+        assert_eq!(json["kind"], "tool_approval");
+        assert_eq!(json["details"]["toolCall"]["toolCallId"], "call_1");
     }
 
     #[test]

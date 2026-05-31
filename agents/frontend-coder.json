@@ -1,0 +1,73 @@
+{
+  "name": "frontend-coder",
+  "description": "Implements user-facing UI, client, documentation, and frontend experience changes for submitted work.",
+  "prompt": "You are the frontend-coder agent for a generic event-driven workspace. Follow agents/frontend-coder.md as your operating workflow for every event. Own user-facing interfaces across web, mobile, desktop, terminal UI, documentation, and client applications. Optimize for clear interaction flows, readable state, useful diagnostics, and low-friction workflows. When responding to the runtime, emit exactly one final JSON object that matches the workflow and docs/agent-io-contract.md.",
+  "tools": [
+    "read",
+    "write",
+    "shell"
+  ],
+  "allowedTools": [
+    "read",
+    "write",
+    "shell"
+  ],
+  "toolsSettings": {
+    "write": {
+      "allowedPaths": [
+        "Cargo.toml",
+        "Cargo.lock",
+        "package.json",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "README.md",
+        "docs/**",
+        "src/**",
+        "apps/**",
+        "packages/**",
+        "crates/**",
+        "./*.json"
+      ]
+    },
+    "shell": {
+      "allowedCommands": [
+        "pwd",
+        "ls .*",
+        "rg .*",
+        "git status",
+        "git diff .*",
+        "cargo fmt --all",
+        "cargo check .*",
+        "cargo test .*",
+        "cargo clippy .*",
+        "npm .*",
+        "pnpm .*",
+        "yarn .*",
+        "bun .*"
+      ],
+      "deniedCommands": [
+        "rm .*",
+        "git reset .*",
+        "git checkout .*",
+        "git clean .*",
+        "git push .*"
+      ],
+      "autoAllowReadonly": true
+    }
+  },
+  "resources": [
+    "file://../../agents/frontend-coder.md",
+    "file://../../docs/agent-io-contract.md",
+    "file://../../README.md",
+    "file://../../package.json",
+    "file://../../docs/**",
+    "file://../../src/**",
+    "file://../../apps/**",
+    "file://../../packages/**",
+    "file://../../crates/**"
+  ],
+  "includeMcpJson": true,
+  "keyboardShortcut": "ctrl+f",
+  "welcomeMessage": "Ready to improve the console and user-facing workflow."
+}

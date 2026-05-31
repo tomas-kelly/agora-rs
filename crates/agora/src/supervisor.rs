@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -126,6 +126,7 @@ impl Supervisor {
     }
 
     pub async fn start_all(&mut self, topology_path: &str, cfg: &TopologyConfig) -> Result<()> {
+        ensure_runtime_binaries_current(cfg)?;
         self.start_nats(&cfg.nats, &cfg.log_dir, &cfg.pid_dir, &cfg.bus_url)
             .await?;
         self.start_telemetry(&cfg.telemetry, &cfg.bus_url, &cfg.log_dir, &cfg.pid_dir)
@@ -260,7 +261,7 @@ fn binary_spec(
 ) -> Result<ProcessSpec> {
     let sibling = std::env::current_exe()
         .ok()
-        .map(|path| path.with_file_name(bin_name))
+        .map(|path| path.with_file_name(format!("{bin_name}{}", std::env::consts::EXE_SUFFIX)))
         .filter(|path| path.exists());
 
     let (command, full_args) = match sibling {
@@ -287,6 +288,67 @@ fn binary_spec(
         log_file: PathBuf::from(log_file),
         pid_file: Path::new(pid_dir).join(format!("{bin_name}.pid")),
     })
+}
+
+fn ensure_runtime_binaries_current(cfg: &TopologyConfig) -> Result<()> {
+    if cfg.telemetry.enabled {
+        ensure_runtime_binary_current("daemon-telemetry")?;
+    }
+    if !cfg.agents.is_empty() {
+        ensure_runtime_binary_current("agora-agent")?;
+    }
+    Ok(())
+}
+
+fn ensure_runtime_binary_current(bin_name: &str) -> Result<()> {
+    let Some((sibling, profile)) = cargo_target_sibling(bin_name) else {
+        return Ok(());
+    };
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .context("resolve workspace root")?;
+    if !workspace_root.join("Cargo.toml").exists() {
+        return Ok(());
+    }
+
+    let mut args = vec!["build", "-p", bin_name];
+    if profile == "release" {
+        args.push("--release");
+    }
+    info!("Ensuring {bin_name} is built: cargo {}", args.join(" "));
+    let status = std::process::Command::new("cargo")
+        .args(&args)
+        .current_dir(workspace_root)
+        .status()
+        .with_context(|| format!("build {bin_name}"))?;
+    if !status.success() {
+        bail!("cargo {} failed with {status}", args.join(" "));
+    }
+    if !sibling.exists() {
+        bail!(
+            "cargo build succeeded but {} was not produced",
+            sibling.display()
+        );
+    }
+    Ok(())
+}
+
+fn cargo_target_sibling(bin_name: &str) -> Option<(PathBuf, &'static str)> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let profile = dir.file_name()?.to_str()?;
+    let profile = match profile {
+        "debug" => "debug",
+        "release" => "release",
+        _ => return None,
+    };
+    if dir.parent()?.file_name()?.to_str()? != "target" {
+        return None;
+    }
+
+    let bin = format!("{bin_name}{}", std::env::consts::EXE_SUFFIX);
+    Some((dir.join(bin), profile))
 }
 
 fn spawn_process(spec: &ProcessSpec) -> Result<Child> {

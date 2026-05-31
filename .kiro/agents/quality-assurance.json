@@ -1,7 +1,7 @@
 {
   "name": "quality-assurance",
-  "description": "Validates Agora changes through test planning, automated checks, regression analysis, and focused bug reports.",
-  "prompt": "You are the quality-assurance agent for the Agora Rust agent-swarm project. Validate changes with focused tests, regression checks, reproducible bug reports, and clear pass/fail criteria. Prefer evidence over assertion. When implementation is needed for tests or test harnesses, keep changes minimal and scoped. When responding to Agora, prefer compact JSON with summary, checksRun, passed, failed, reproduction, coverageGaps, and next.",
+  "description": "Validates submitted changes through test planning, automated checks, regression analysis, and focused bug reports.",
+  "prompt": "You are the quality-assurance agent for a generic event-driven workspace. Follow .kiro/agents/quality-assurance.md as your operating workflow for every event. Validate changes with focused tests, regression checks, reproducible bug reports, and clear pass/fail criteria. Infer the project stack from manifests and docs. Prefer evidence over assertion. When responding to the runtime, emit exactly one final JSON object that matches the workflow and docs/agent-io-contract.md.",
   "tools": [
     "read",
     "write",
@@ -16,7 +16,20 @@
       "allowedPaths": [
         "Cargo.toml",
         "Cargo.lock",
+        "package.json",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "pyproject.toml",
+        "requirements*.txt",
+        "go.mod",
+        "go.sum",
         "README.md",
+        "docs/**",
+        "src/**",
+        "tests/**",
+        "apps/**",
+        "packages/**",
         "crates/**",
         "scripts/**",
         "./*.json"
@@ -32,7 +45,15 @@
         "cargo fmt --all",
         "cargo check .*",
         "cargo test .*",
-        "cargo clippy .*"
+        "cargo clippy .*",
+        "npm .*",
+        "pnpm .*",
+        "yarn .*",
+        "bun .*",
+        "go test .*",
+        "python -m pytest .*",
+        "pytest .*",
+        "make .*"
       ],
       "deniedCommands": [
         "rm .*",
@@ -45,10 +66,21 @@
     }
   },
   "resources": [
+    "file://../../.kiro/agents/quality-assurance.md",
+    "file://../../docs/agent-io-contract.md",
     "file://../../README.md",
     "file://../../Cargo.toml",
+    "file://../../package.json",
+    "file://../../pyproject.toml",
+    "file://../../go.mod",
+    "file://../../docs/**",
     "file://../../agents.local.json",
-    "file://../../crates/**/*.rs"
+    "file://../../src/**",
+    "file://../../crates/**",
+    "file://../../apps/**",
+    "file://../../packages/**",
+    "file://../../examples/**",
+    "file://../../tests/**"
   ],
   "includeMcpJson": true,
   "keyboardShortcut": "ctrl+q",

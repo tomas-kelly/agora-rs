@@ -4,13 +4,13 @@
 //! agora-agent --config agents.local.json --agent architect-daemon
 //! ```
 //!
-//! Reads its `AgentSpec` from the topology file, opens a kiro-cli (or mock)
-//! ACP session, subscribes to its declared topics, renders the configured
-//! prompt template against each inbound envelope, ships it to ACP, and
-//! publishes the response.
+//! Reads its `AgentSpec` from the topology file, opens a configured ACP
+//! subprocess (or mock) session, subscribes to its declared topics, renders the
+//! configured prompt template against each inbound envelope, ships it to ACP,
+//! and publishes the response.
 //!
 //! Response handling:
-//! - If kiro returns valid JSON, or valid JSON on the final non-empty line,
+//! - If ACP returns valid JSON, or valid JSON on the final non-empty line,
 //!   that becomes the published event's `data`.
 //! - Otherwise the response text is wrapped as `{"summary": "<text>"}`.
 //! - If the JSON contains `_topic`, that overrides the subscription's
@@ -18,19 +18,28 @@
 //!   otherwise from the whole response minus `_topic`).
 
 use agora_core::{
-    acp::{AcpClient, KiroAcpClient, MockAcpClient},
+    acp::{
+        AcpClient, AcpPermissionDecision, AcpPermissionHandler, AcpPermissionOption,
+        AcpPermissionRequest, MockAcpClient, StdioAcpClient, DEFAULT_ACP_CALL_TIMEOUT,
+    },
     agent_spec::{AgentSpec, SubscriptionSpec},
     daemon::{Agent, DaemonConfig, DaemonRunner, Publisher},
     envelope::Envelope,
+    human::HumanInteractionRequest,
     manifest::{PublishedEvent, Subscription},
-    topics::{direct_inbox_topic, CODE_CHANGED},
+    topics::{direct_inbox_topic, CODE_CHANGED, HUMAN_INTERACTION_REQUEST},
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use clap::Parser;
-use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::{
+    collections::{BTreeSet, HashMap},
+    path::PathBuf,
+    time::Duration,
+};
 use tracing::{info, warn};
+
+const MAX_HUMAN_TURNS_PER_EVENT: usize = 3;
 
 #[derive(Parser)]
 #[command(name = "agora-agent")]
@@ -41,12 +50,15 @@ struct Args {
     /// Agent name (must match an entry in `agents[]` of the topology)
     #[arg(long)]
     agent: String,
-    /// Override ACP backend: "mock" or "kiro". Falls back to topology `default_acp`, then "mock".
+    /// Override ACP backend: "mock" or "stdio". Falls back to topology `default_acp`, then "mock".
     #[arg(long)]
     acp: Option<String>,
+    /// Override the ACP request timeout in seconds.
+    #[arg(long = "acpTimeoutSecs")]
+    acp_timeout_secs: Option<u64>,
     #[arg(long, default_value = "nats://127.0.0.1:4222")]
     bus_url: String,
-    #[arg(long, default_value = ".kiro/session_token")]
+    #[arg(long, default_value = ".agora/session_token")]
     key_path: String,
 }
 
@@ -76,25 +88,41 @@ async fn main() -> Result<()> {
         .or_else(|| topology.get("defaultAcp"))
         .and_then(|v| v.as_str())
         .unwrap_or("mock");
+    let topology_default_acp_timeout_secs = topology
+        .get("default_acp_timeout_secs")
+        .or_else(|| topology.get("defaultAcpTimeoutSecs"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(|| DEFAULT_ACP_CALL_TIMEOUT.as_secs());
     let acp_mode = args
         .acp
         .clone()
         .or_else(|| spec.acp.clone())
         .unwrap_or_else(|| topology_default_acp.to_string());
+    let acp_timeout_secs = args
+        .acp_timeout_secs
+        .or(spec.acp_timeout_secs)
+        .unwrap_or(topology_default_acp_timeout_secs);
+    if acp_timeout_secs == 0 {
+        anyhow::bail!("ACP timeout must be greater than zero seconds");
+    }
 
     let acp: Box<dyn AcpClient> = match acp_mode.as_str() {
         "mock" => Box::new(MockAcpClient::new(&spec.name)),
-        "kiro" => {
+        "stdio" => {
             let cmd = spec
-                .kiro_command
+                .acp_command
                 .clone()
-                .ok_or_else(|| anyhow!("agent `{}` has no `kiro_command`", spec.name))?;
-            Box::new(KiroAcpClient::new(&spec.name, &cmd))
+                .ok_or_else(|| anyhow!("agent `{}` has no `acp_command`", spec.name))?;
+            Box::new(StdioAcpClient::new_with_timeout(
+                &spec.name,
+                &cmd,
+                Duration::from_secs(acp_timeout_secs),
+            ))
         }
         other => anyhow::bail!("unknown acp mode: {other}"),
     };
 
-    info!(agent = %spec.name, mode = %acp_mode, "starting");
+    info!(agent = %spec.name, mode = %acp_mode, acp_timeout_secs, "starting");
 
     let agent = ConfigAgent::new(spec, acp);
     let config = DaemonConfig {
@@ -287,6 +315,183 @@ fn string_array(values: &[serde_json::Value]) -> Vec<String> {
         .collect()
 }
 
+struct PublisherPermissionHandler {
+    publisher: Publisher,
+}
+
+#[async_trait]
+impl AcpPermissionHandler for PublisherPermissionHandler {
+    async fn request_permission(
+        &mut self,
+        request: AcpPermissionRequest,
+    ) -> Result<AcpPermissionDecision> {
+        let title = tool_call_title(&request.tool_call);
+        let options = permission_choice_labels(&request.options);
+        let question = format!(
+            "Approve ACP tool call `{title}`? Reply with one of: {}",
+            options.join(", ")
+        );
+        let response = self
+            .publisher
+            .ask_human_request(HumanInteractionRequest {
+                kind: Some("tool_approval".into()),
+                question,
+                choices: Some(options),
+                timeout_secs: Some(300),
+                details: Some(serde_json::json!({
+                    "acpSessionId": request.acp_session_id,
+                    "toolCall": request.tool_call,
+                    "options": request.options.iter().map(|option| {
+                        serde_json::json!({
+                            "optionId": option.option_id.clone(),
+                            "name": option.name.clone(),
+                            "kind": option.kind.clone(),
+                        })
+                    }).collect::<Vec<_>>(),
+                })),
+            })
+            .await?;
+
+        Ok(permission_decision_from_answer(
+            &response.answer,
+            &request.options,
+        ))
+    }
+}
+
+fn tool_call_title(tool_call: &serde_json::Value) -> String {
+    tool_call
+        .get("title")
+        .or_else(|| tool_call.pointer("/toolCall/title"))
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            tool_call
+                .get("toolCallId")
+                .or_else(|| tool_call.get("tool_call_id"))
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or("tool call")
+        .to_string()
+}
+
+fn permission_choice_labels(options: &[AcpPermissionOption]) -> Vec<String> {
+    if options.is_empty() {
+        return vec!["cancel".into()];
+    }
+
+    options
+        .iter()
+        .map(|option| {
+            if option.name.is_empty() || option.name == option.option_id {
+                option.option_id.clone()
+            } else {
+                format!("{} ({})", option.option_id, option.name)
+            }
+        })
+        .collect()
+}
+
+fn permission_decision_from_answer(
+    answer: &str,
+    options: &[AcpPermissionOption],
+) -> AcpPermissionDecision {
+    let normalized = normalize_permission_answer(answer);
+    if normalized.is_empty() || normalized == "timeout" || normalized == "cancel" {
+        return AcpPermissionDecision::Cancelled;
+    }
+
+    for option in options {
+        let option_id = normalize_permission_answer(&option.option_id);
+        let name = normalize_permission_answer(&option.name);
+        let kind = normalize_permission_answer(&option.kind);
+        if normalized == option_id || normalized == name || normalized == kind {
+            return AcpPermissionDecision::Selected {
+                option_id: option.option_id.clone(),
+            };
+        }
+    }
+
+    let wants_allow = matches!(
+        normalized.as_str(),
+        "y" | "yes" | "allow" | "approve" | "approved" | "ok" | "okay"
+    );
+    let wants_reject = matches!(
+        normalized.as_str(),
+        "n" | "no" | "reject" | "deny" | "denied" | "decline" | "declined"
+    );
+    let desired_kind = if wants_allow {
+        Some("allow")
+    } else if wants_reject {
+        Some("reject")
+    } else {
+        None
+    };
+
+    if let Some(desired_kind) = desired_kind {
+        if let Some(option) = options.iter().find(|option| {
+            normalize_permission_answer(&option.kind).starts_with(desired_kind)
+                || normalize_permission_answer(&option.option_id).starts_with(desired_kind)
+        }) {
+            return AcpPermissionDecision::Selected {
+                option_id: option.option_id.clone(),
+            };
+        }
+    }
+
+    AcpPermissionDecision::Cancelled
+}
+
+fn normalize_permission_answer(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches(|ch| ch == '[' || ch == ']')
+        .to_ascii_lowercase()
+        .replace([' ', '_'], "-")
+}
+
+fn human_request_from_output(data: serde_json::Value) -> HumanInteractionRequest {
+    let question = data
+        .get("question")
+        .and_then(|v| v.as_str())
+        .or_else(|| data.get("summary").and_then(|v| v.as_str()))
+        .unwrap_or("The agent needs input to continue.")
+        .to_string();
+    let choices = data.get("choices").and_then(|value| {
+        value.as_array().map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+    });
+    let timeout_secs = data
+        .get("timeoutSecs")
+        .or_else(|| data.get("timeout_secs"))
+        .and_then(|v| v.as_u64());
+    let kind = data.get("kind").and_then(|v| v.as_str()).map(String::from);
+    let details = data.get("details").cloned().or_else(|| {
+        Some(serde_json::json!({
+            "source": "agent_output",
+            "payload": data,
+        }))
+    });
+
+    HumanInteractionRequest {
+        kind,
+        question,
+        choices,
+        timeout_secs,
+        details,
+    }
+}
+
+fn human_response_prompt(response: &agora_core::HumanInteractionResponse) -> String {
+    format!(
+        "Human response received for correlationId {}.\n\nAnswer:\n{}\n\nContinue the original Agora task in this same session. Return exactly one final JSON object according to your workflow and docs/agent-io-contract.md. No markdown fences. No prose after the JSON.",
+        response.correlation_id, response.answer
+    )
+}
+
 #[async_trait]
 impl Agent for ConfigAgent {
     fn agent_name(&self) -> &str {
@@ -371,11 +576,15 @@ impl Agent for ConfigAgent {
         if self.acp.session_load(&session_id).await.is_err() {
             self.acp.session_new(&session_id).await?;
         }
-        let result = self
+        let mut permission_handler = PublisherPermissionHandler {
+            publisher: publisher.clone(),
+        };
+        let mut result = self
             .acp
             .session_prompt(
                 &session_id,
                 &[serde_json::json!({ "type": "text", "text": rendered })],
+                Some(&mut permission_handler),
             )
             .await?;
 
@@ -390,14 +599,68 @@ impl Agent for ConfigAgent {
             )
             .await;
 
-        let parsed = parse_agent_response(&result.text);
+        let Some(emit) = &sub.emit else {
+            return Ok(());
+        };
 
-        if let Some(emit) = &sub.emit {
+        let mut human_turns = 0;
+        loop {
+            let parsed = parse_agent_response(&result.text);
             let (out_topic, out_data) = output_topic_and_data(parsed, &emit.topic);
+
+            if out_topic == HUMAN_INTERACTION_REQUEST {
+                if human_turns >= MAX_HUMAN_TURNS_PER_EVENT {
+                    anyhow::bail!(
+                        "{} requested human input more than {} times for one event",
+                        self.spec.name,
+                        MAX_HUMAN_TURNS_PER_EVENT
+                    );
+                }
+                human_turns += 1;
+                let request = human_request_from_output(out_data);
+                let response = publisher.ask_human_request(request).await?;
+                let followup = human_response_prompt(&response);
+                let _ = publisher
+                    .emit_telemetry(
+                        "INFO",
+                        "human_response_received",
+                        serde_json::json!({
+                            "triggerEventId": envelope.event_id,
+                            "correlationId": response.correlation_id,
+                            "respondedBy": response.responded_by,
+                            "answer": response.answer,
+                        }),
+                    )
+                    .await;
+
+                result = self
+                    .acp
+                    .session_prompt(
+                        &session_id,
+                        &[serde_json::json!({ "type": "text", "text": followup })],
+                        Some(&mut permission_handler),
+                    )
+                    .await?;
+
+                let _ = publisher
+                    .emit_telemetry(
+                        "INFO",
+                        "response_received",
+                        serde_json::json!({
+                            "triggerEventId": envelope.event_id,
+                            "response": result.text,
+                            "afterHumanInput": true,
+                        }),
+                    )
+                    .await;
+                continue;
+            }
+
             let affected_files = affected_files_for_output(&out_topic, &out_data);
             publisher
                 .publish(&out_topic, out_data, affected_files)
                 .await?;
+            break;
         }
 
         Ok(())
@@ -411,13 +674,15 @@ impl Agent for ConfigAgent {
 #[cfg(test)]
 mod tests {
     use super::{
-        affected_files_for_output, output_topic_and_data, parse_agent_response, resolve_key,
+        affected_files_for_output, human_request_from_output, human_response_prompt,
+        output_topic_and_data, parse_agent_response, permission_decision_from_answer, resolve_key,
         ConfigAgent,
     };
     use agora_core::{
-        acp::MockAcpClient,
+        acp::{AcpPermissionDecision, AcpPermissionOption, MockAcpClient},
         agent_spec::{AgentSpec, EmitSpec, SubscriptionSpec},
         envelope::Envelope,
+        human::HumanInteractionResponse,
     };
 
     fn spec_with_sub(template: &str) -> AgentSpec {
@@ -425,8 +690,9 @@ mod tests {
             name: "test-agent".into(),
             port: 1234,
             capabilities: vec![],
-            kiro_command: None,
+            acp_command: None,
             acp: None,
+            acp_timeout_secs: None,
             publishes: vec![],
             subscriptions: vec![SubscriptionSpec {
                 topic: "workspace.event.submitted".into(),
@@ -577,5 +843,66 @@ mod tests {
     fn ignores_changed_files_for_other_topics() {
         let data = serde_json::json!({ "changedFiles": ["src/lib.rs"] });
         assert!(affected_files_for_output("test.passed", &data).is_none());
+    }
+
+    #[test]
+    fn maps_human_tool_approval_answers_to_acp_options() {
+        let options = vec![
+            AcpPermissionOption {
+                option_id: "allow-once".into(),
+                name: "Allow once".into(),
+                kind: "allow_once".into(),
+            },
+            AcpPermissionOption {
+                option_id: "reject-once".into(),
+                name: "Reject".into(),
+                kind: "reject_once".into(),
+            },
+        ];
+
+        assert_eq!(
+            permission_decision_from_answer("allow", &options),
+            AcpPermissionDecision::Selected {
+                option_id: "allow-once".into()
+            }
+        );
+        assert_eq!(
+            permission_decision_from_answer("reject-once", &options),
+            AcpPermissionDecision::Selected {
+                option_id: "reject-once".into()
+            }
+        );
+        assert_eq!(
+            permission_decision_from_answer("[timeout]", &options),
+            AcpPermissionDecision::Cancelled
+        );
+    }
+
+    #[test]
+    fn builds_human_request_from_agent_output() {
+        let request = human_request_from_output(serde_json::json!({
+            "question": "Which API shape should we use?",
+            "choices": ["REST", "GraphQL"],
+            "timeoutSecs": 90,
+            "details": { "reason": "product ambiguity" }
+        }));
+
+        assert_eq!(request.question, "Which API shape should we use?");
+        assert_eq!(request.choices.unwrap(), vec!["REST", "GraphQL"]);
+        assert_eq!(request.timeout_secs, Some(90));
+        assert_eq!(request.details.unwrap()["reason"], "product ambiguity");
+    }
+
+    #[test]
+    fn formats_human_response_followup_prompt() {
+        let prompt = human_response_prompt(&HumanInteractionResponse {
+            correlation_id: "evt_1".into(),
+            answer: "Use REST".into(),
+            responded_by: "agora-console".into(),
+        });
+
+        assert!(prompt.contains("evt_1"));
+        assert!(prompt.contains("Use REST"));
+        assert!(prompt.contains("Return exactly one final JSON object"));
     }
 }

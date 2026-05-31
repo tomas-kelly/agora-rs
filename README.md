@@ -19,8 +19,8 @@ crates/
 
 - Rust + Cargo (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
 - `nats-server` on PATH (`brew install nats-server`)
-- `kiro-cli` on PATH and logged in (`kiro-cli login`) — `agents.local.json`
-  uses the Kiro ACP backend by default
+- The ACP-compatible stdio client configured in `agents.local.json`, currently
+  `kiro-cli acp`, available on PATH and logged in.
 
 ## Running the swarm
 
@@ -39,12 +39,12 @@ Verify your environment any time with:
 cargo run -p agora -- doctor
 ```
 
-`doctor` checks `nats-server` and `kiro-cli` on PATH, the signing key, that
-the topology validates, and (if the swarm is running) that NATS, JetStream,
-durable consumers, and the agent registry are healthy. Non-zero exit on any
-failure, so it's safe to chain into scripts.
+`doctor` checks `nats-server`, each configured ACP command, the signing key,
+that the topology validates, and (if the swarm is running) that NATS,
+JetStream, durable consumers, and the agent registry are healthy. Non-zero
+exit on any failure, so it's safe to chain into scripts.
 
-This builds the workspace and mints `.kiro/session_token`, the HS256 secret
+This builds the workspace and mints `.agora/session_token`, the HS256 secret
 that signs every actor token on the bus. **Every publish path needs it** —
 the `submit` CLI, the TUI console, and every `agora-agent` process. `agora start`
 also creates the default key if it is missing, but running bootstrap up front
@@ -56,7 +56,7 @@ keeps `doctor`, `submit`, and `console` happy before the supervisor starts.
 cargo run -p agora -- start --config agents.local.json
 ```
 
-Boots NATS + all six Kiro-backed agent processes from the topology. Leave
+Boots NATS + all six ACP-backed agent processes from the topology. Leave
 this terminal running; `Ctrl-C` stops the whole swarm.
 
 To run it in the background:
@@ -115,8 +115,9 @@ The top-level commands mirror the Docker-style workflow for local operations:
 ```bash
 cargo run -p agora -- ps
 cargo run -p agora -- logs backend-coder -f --tail 200
+cargo run -p agora -- logs "Task manager" --tail 200
 cargo run -p agora -- inspect backend-coder
-cargo run -p agora -- events --follow --session-id sess_<id>
+cargo run -p agora -- events sess_<id> --follow
 cargo run -p agora -- stats
 cargo run -p agora -- top backend-coder
 cargo run -p agora -- info
@@ -140,9 +141,9 @@ Core commands:
 | `agora stop [target]` | Stop the whole runtime or one managed process. |
 | `agora restart <agent>` | Restart one agent while `agora start` owns the swarm. |
 | `agora status <agent>` | Print one agent manifest and optional session activity. |
-| `agora history <agent> --session-id <id>` | Show one agent's event and telemetry timeline in a session. |
-| `agora message <agent> <text...>` | Send a steering or queue message to an agent inbox. |
-| `agora bootstrap` | Mint the local signing key at `.kiro/session_token`. |
+| `agora history <agent> --sessionId <id>` | Show one agent's event and telemetry timeline in a session. |
+| `agora message --agent <agent> --sessionId <id> <text...>` | Send a session-scoped steering or queue message to an agent inbox. |
+| `agora bootstrap` | Mint the local signing key at `.agora/session_token`. |
 | `agora doctor` | Run environment, topology, key, process, bus, and registry checks. |
 | `agora version` | Print CLI version metadata. |
 
@@ -169,12 +170,16 @@ cargo run -p agora -- logs backend-coder --tail 200
 cargo run -p agora -- logs backend-coder --follow
 cargo run -p agora -- logs backend-coder --since 10m --timestamps
 cargo run -p agora -- logs telemetry-jsonl --tail 50
+cargo run -p agora -- logs "Task manager" --tail 50 --follow
 ```
 
 Targets include `agora`, `nats`, `daemon-telemetry`, every configured agent
 name, and `telemetry-jsonl`. `--lines` is accepted as an alias for `--tail`.
 `--since` accepts RFC3339 timestamps or durations like `10m`, `2h`, or `1d`,
-and applies to log lines with parseable timestamps.
+and applies to log lines with parseable timestamps. If the target is not a
+known process log target, `logs` treats it as an event target and prints the
+matching session/event stream from JetStream. Use `--bus-url` to override the
+topology bus when tailing events.
 
 ### Events and sessions
 
@@ -182,12 +187,19 @@ and applies to log lines with parseable timestamps.
 
 ```bash
 cargo run -p agora -- events
-cargo run -p agora -- events --session-id sess_<id>
+cargo run -p agora -- events sess_<id>
+cargo run -p agora -- events "Task manager"
+cargo run -p agora -- events --sessionId sess_<id>
 cargo run -p agora -- events --agent backend-coder
 cargo run -p agora -- events --topic 'code.>'
+cargo run -p agora -- events 'code.>' --tail 20
 cargo run -p agora -- events --json
 cargo run -p agora -- events --follow
 ```
+
+The optional positional target resolves to a session id, session name, agent
+name, or topic pattern. `--tail` limits backlog output before follow mode
+begins, and `--since` accepts the same RFC3339/duration forms as `logs`.
 
 Session helpers operate on the same event stream:
 
@@ -216,10 +228,10 @@ Agent helpers are aliases over the top-level commands, scoped to one agent:
 cargo run -p agora -- agents
 cargo run -p agora -- agent ls
 cargo run -p agora -- agent inspect backend-coder --json
-cargo run -p agora -- agent status backend-coder --session-id sess_<id>
-cargo run -p agora -- agent history backend-coder --session-id sess_<id>
-cargo run -p agora -- agent message backend-coder "focus on the failing test"
-cargo run -p agora -- agent message backend-coder "queue this after current work" --message-type queue
+cargo run -p agora -- agent status backend-coder --sessionId sess_<id>
+cargo run -p agora -- agent history backend-coder --sessionId sess_<id>
+cargo run -p agora -- agent message --agent backend-coder --sessionId sess_<id> "focus on the failing test"
+cargo run -p agora -- agent message --agent backend-coder --sessionId sess_<id> --message-type queue "queue this after current work"
 cargo run -p agora -- agent restart backend-coder
 cargo run -p agora -- agent stop backend-coder
 ```
@@ -277,8 +289,17 @@ expands it into the full event-details view, `Left` collapses/closes it, and
 `Esc` hides it. Live-tail mode has no inspector panel. `End` returns to the live
 tail and hides the inspector. Agents sit below Sessions in the left sidebar.
 
+Pending human input and ACP tool approvals are surfaced as
+`human.interaction.request` events. The status bar shows the pending count,
+Sessions and Agents display `?N` badges, and the matching event row is marked
+with `?`. Select the request and press Enter to open it; the composer switches
+to response mode and sends `human.interaction.response` back to the same
+session. Config-driven agents resume their same ACP session after the response,
+then continue toward their final output event. `!pending` lists all unresolved
+requests and `!pending next` jumps to the first one.
+
 `!history backend-coder` replaces the Event inspector with a scrollable
-conversation timeline — inbound events the agent received, prompts sent to Kiro,
+conversation timeline — inbound events the agent received, prompts sent to ACP,
 responses received, and outbound events published — all interleaved by
 timestamp. PgUp/PgDn or mouse-wheel scroll the output, `!page` dumps it into
 `$PAGER`, and `!copy` puts it on the clipboard.
@@ -296,6 +317,7 @@ timestamp. PgUp/PgDn or mouse-wheel scroll the output, `!page` dumps it into
 | `!agents` | List agents seen in the active session (with status + event counts) |
 | `!status <agent>` | Manifest + per-session activity for that agent |
 | `!history <agent>` | Full conversation timeline for that agent in the active session: events received, prompts sent to ACP, responses received, events published |
+| `!pending [next]` | List pending human input/tool approvals, or jump to the first pending request |
 | `!panel <name>` | Toggle `sessions`, `events`, `agents`, `detail`, or `all` panels |
 | `!copy` | Copy command output (or selected event detail) to system clipboard |
 | `!editor` | Compose input in `$EDITOR` — drops the TUI, opens your editor with current input, returns when you save and quit |
@@ -309,9 +331,9 @@ timestamp. PgUp/PgDn or mouse-wheel scroll the output, `!page` dumps it into
 |---|---|
 | Plain text + `Enter` | Submit as the console's configured submit topic, `workspace.event.submitted` by default |
 | `!submit <topic> <data>` | Publish a one-off event from the console; data may be JSON or text |
-| `@agent <msg>` + `Enter` | Direct message to that agent's inbox |
-| `/steer @agent <msg>` | Steering message (preempts current work) |
-| `/queue @agent <msg>` | Queue behind agent's current event |
+| `@agent <msg>` + `Enter` | Direct message to that agent's inbox in the active session |
+| `/steer @agent <msg>` | Steering message in the active session |
+| `/queue @agent <msg>` | Queue behind agent's current event in the active session |
 
 **Keys**
 
@@ -379,6 +401,14 @@ workspace.event.submitted
         → [security-engineer] → security.scan.clean | security.alert.found
           → [backend-coder] / [frontend-coder] → code.changed  (repair loop)
 ```
+
+Each configured ACP agent has a workflow playbook in `agents/*.md`.
+Those files define the events the agent consumes, realistic operating steps,
+branching outputs such as `human.interaction.request` or `agent.noop`, and the
+final JSON shape expected by `agora-agent`.
+
+Runtime delivery and retry semantics are documented in
+[`docs/runtime-guarantees.md`](docs/runtime-guarantees.md).
 
 ## Troubleshooting
 
@@ -454,7 +484,7 @@ cargo run -p agora -- bootstrap
    ┌──────────────┐   publish │   subscribe (durable pull consumer per topic)
    │ agora console│ ──────────┤            ┌────────────────────────────┐
    │ (TUI)        │           ├──────────► │ agora-agent (one per spec) │
-   └──────────────┘           │            │   ├─ Mock or Kiro ACP      │
+   └──────────────┘           │            │   ├─ Mock or stdio ACP    │
                               │            │   ├─ render prompt         │
    ┌──────────────┐  publish  │            │   ├─ session_prompt(...)   │
    │ agora submit │ ──────────┤            │   ├─ parse response JSON   │
@@ -531,7 +561,7 @@ agent handling requests JetStream redelivery; invalid envelopes are terminated.
 
 ### Security (actor tokens)
 
-Short-lived HS256 JWTs signed with a cluster-local secret (`.kiro/session_token`).
+Short-lived HS256 JWTs signed with a cluster-local secret (`.agora/session_token`).
 The TUI/CLI mints a token per session. Agent inbound subscriptions enforce the
 declared `required_scopes`, and child events are minted with the declared scopes
 for their output topic. Verify with `agora_core::tokens::verify_actor_token`.
@@ -539,8 +569,8 @@ for their output topic. Verify with `agora_core::tokens::verify_actor_token`.
 ## Adding a new agent
 
 Most agents are declared in `agents.local.json` and run through the generic
-`agora-agent` process. The local topology starts the six workspace Kiro agents
-from `.kiro/agents`: `product-manager`, `system-architect`, `backend-coder`,
+`agora-agent` process. The local topology starts the six workspace ACP agents
+from `agents`: `product-manager`, `system-architect`, `backend-coder`,
 `frontend-coder`, `security-engineer`, and `quality-assurance`.
 
 Agents should follow the prompt/response contract in
@@ -550,8 +580,9 @@ agents return exactly one JSON object; `agora-agent` validates, envelopes, and
 publishes the resulting event.
 
 1. Add an `agents[]` entry with subscriptions, publish declarations, and prompt templates.
-2. Set `acp` or rely on `default_acp` (`kiro` for the checked-in local topology, `mock` for smoke tests).
-3. Include every output topic in either `publishes[]` or a subscription `emit`.
+2. Set `acp` or rely on `default_acp` (`stdio` for the checked-in local topology, `mock` for smoke tests).
+3. Tune ACP call duration with topology `default_acp_timeout_secs` or per-agent `acp_timeout_secs` when a client needs longer turns.
+4. Include every output topic in either `publishes[]` or a subscription `emit`.
 
 For custom Rust behavior, implement `agora_core::daemon::Agent` in a new crate
 and call `DaemonRunner::new(daemon, config).run().await` from its `main`.

@@ -39,8 +39,9 @@ Each agent is declared in a topology JSON file, usually `agents.local.json`.
   "name": "example-agent",
   "port": 4010,
   "capabilities": ["example", "planning"],
-  "acp": "kiro",
-  "kiro_command": "kiro-cli acp --agent example-agent --trust-all-tools",
+  "acp": "stdio",
+  "acp_command": "your-acp-client acp --agent example-agent",
+  "acp_timeout_secs": 300,
   "publishes": [
     {
       "topic": "example.plan.created",
@@ -68,10 +69,12 @@ Rules:
 3. `subscriptions[].required_scopes` declares the scopes required on inbound
    events.
 4. `subscriptions[].prompt_template` renders the prompt sent to ACP.
-5. `subscriptions[].emit.topic` is the default output topic for that input.
-6. `publishes[]` declares every topic the agent may publish, including
+5. `acp_timeout_secs` can override the topology default for agents with long
+   turns; omit it to use `default_acp_timeout_secs`.
+6. `subscriptions[].emit.topic` is the default output topic for that input.
+7. `publishes[]` declares every topic the agent may publish, including
    branch topics used through `_topic`.
-7. Every topic referenced by the topology must be covered by
+8. Every topic referenced by the topology must be covered by
    `EVENT_STREAM_SUBJECTS` in `agora-core/src/topics.rs`.
 
 ## Prompt Input
@@ -230,9 +233,44 @@ Agents that need operator input should publish `human.interaction.request`
 through the runtime API, not by inventing an ad hoc topic.
 
 For agents using `agora-agent`, this means returning an output that routes to
-an allowed human-interaction topic only if the topology declares it. Custom Rust
-agents can call `Publisher::ask_human(...)`, which publishes the request and
-waits for a matching `human.interaction.response`.
+an allowed human-interaction topic. The runner publishes the request, waits for
+a matching `human.interaction.response`, and sends the answer back into the
+same ACP session so the agent can continue and produce its final event. Custom
+Rust agents can call `Publisher::ask_human(...)`, which uses the same request /
+response event pair.
+
+ACP tool approvals use the same event pair. When an ACP backend calls
+`session/request_permission`, `agora-agent` publishes a
+`human.interaction.request` with `kind: "tool_approval"` and structured
+`details.toolCall` / `details.options`, waits for the operator response, and
+then returns the selected ACP permission option. To allow this path to run, do
+not launch ACP agents with a blanket trust flag such as `--trust-all-tools`.
+
+Tool approval response answers should match an ACP `optionId` such as
+`allow-once` or `reject-once`. The runtime also accepts short operator answers
+such as `allow`, `approve`, `reject`, or `deny` and maps them to the matching
+ACP option when available.
+
+## No-Op Events
+
+Agents that receive an event but have no in-scope work should publish
+`agent.noop` only if the topology declares it in `publishes[]`.
+
+Use this when an event is intentionally ignored, for example a frontend coder
+receiving a design with backend-only tasks. Do not publish `code.changed` with
+an empty `changedFiles` array; `code.changed` requires at least one real changed
+file so QA and security are not asked to review empty work.
+
+Recommended payload:
+
+```json
+{
+  "status": "no_op",
+  "summary": "No frontend work required.",
+  "reason": "The design contains no frontend tasks.",
+  "checkedScope": ["frontendTasks"]
+}
+```
 
 ## Direct Messages
 
@@ -248,9 +286,13 @@ The payload shape is:
 {
   "messageType": "steering",
   "recipient": "example-agent",
+  "sessionId": "sess_...",
   "message": "Focus on the failing test first."
 }
 ```
+
+Direct messages must always be scoped to a concrete session id. The session id
+is present both in the envelope context and in `data.sessionId`.
 
 Supported message types today are `steering` and `queue`. The exact scheduling
 semantics are runtime behavior; agents should treat the message as additional
@@ -360,5 +402,7 @@ Before relying on a topology in production:
 - Prompts list the allowed output topics.
 - Prompts require exactly one final JSON object.
 - Branching agents document their allowed `_topic` values.
+- No-op branches use `agent.noop`; they do not publish empty `code.changed`
+  events.
 - Downstream agents document the fields they expect in `data`.
 - Tests or smoke checks validate the happy path and at least one failure path.

@@ -11,14 +11,15 @@
     "enabled": true,
     "log_file": ".agora/logs/telemetry.jsonl"
   },
-  "default_acp": "kiro",
+  "default_acp": "stdio",
+  "default_acp_timeout_secs": 300,
 
   "agents": [
     {
       "name": "product-manager",
       "port": 4001,
       "capabilities": ["product", "requirements", "acceptance-criteria", "release-scope"],
-      "kiro_command": "kiro-cli acp --agent product-manager --trust-all-tools",
+      "acp_command": "kiro-cli acp --agent product-manager",
       "publishes": [
         { "topic": "product.requirements.defined", "required_scopes": ["workspace:read", "workspace:write"] },
         { "topic": "human.interaction.request",    "required_scopes": ["workspace:read", "workspace:write"] }
@@ -27,7 +28,7 @@
         {
           "topic": "workspace.event.submitted",
           "required_scopes": ["workspace:read"],
-          "prompt_template": "Agora session {{session_id}}. You are the product manager for the Agora project.\n\nInput event: {{data}}\n\nProcess:\n1. Use the `read` tool on relevant repo files (README.md, CHANGELOG.md, agents.local.json) to ground your requirements in what already exists.\n2. Decide product intent, target users, non-goals, acceptance criteria, release scope, and risks.\n\nOutput contract: emit EXACTLY ONE JSON object on the FINAL LINE of your reply. No markdown fences. No prose after it. Shape:\n{\"summary\": <one-line string>, \"users\": [<string>], \"goals\": [<string>], \"nonGoals\": [<string>], \"acceptanceCriteria\": [<string>], \"releaseScope\": [<string>], \"risks\": [<string>]}\n\nThis JSON is consumed by an automated downstream agent. Anything you say before it can be reasoning or notes; only the last line is parsed. Keep fields concrete and actionable.",
+          "prompt_template": "Agora session {{session_id}}. Agent: product-manager.\n\nFollow agents/product-manager.md and docs/agent-io-contract.md.\n\nInput event:\n- id: {{event_id}}\n- topic: {{topic}}\n- data: {{data}}\n\nTask: turn the submitted event into concrete product requirements for the requested product, system, or active workspace. Read relevant project docs, docs/agent-io-contract.md, agents.local.json, and any named files before deciding scope. Do not reject a request only because it is not about the active workspace; if the request is standalone, scope it as the desired product/system outcome. If critical target, user, or constraint input is missing, route to human.interaction.request with _topic/_data. Otherwise publish product.requirements.defined.\n\nFinal line must be exactly one JSON object. For ready requirements use fields: status, summary, sourceEvent, users, problem, goals, nonGoals, userStories, acceptanceCriteria, releaseScope, risks, openQuestions, handoffNotes. For blocked requests use {\"_topic\":\"human.interaction.request\",\"_data\":{...}}. No markdown fences. No prose after JSON.",
           "emit": { "topic": "product.requirements.defined", "required_scopes": ["workspace:read", "workspace:write"] }
         }
       ]
@@ -37,7 +38,7 @@
       "name": "system-architect",
       "port": 4002,
       "capabilities": ["architecture", "design", "contracts", "reliability"],
-      "kiro_command": "kiro-cli acp --agent system-architect --trust-all-tools",
+      "acp_command": "kiro-cli acp --agent system-architect",
       "publishes": [
         { "topic": "workspace.design.finalized", "required_scopes": ["workspace:read", "workspace:write"] },
         { "topic": "human.interaction.request", "required_scopes": ["workspace:read", "workspace:write"] }
@@ -46,7 +47,7 @@
         {
           "topic": "product.requirements.defined",
           "required_scopes": ["workspace:read"],
-          "prompt_template": "Agora session {{session_id}}. You are the system architect for the Agora Rust workspace.\n\nRequirements: {{data}}\n\nProcess:\n1. Use the `read` tool on the affected crates (crates/agora-core/src/*.rs, crates/agora/src/*.rs, crates/agora-agent/src/*.rs, crates/agora-console/src/*.rs) to understand the current architecture before proposing changes.\n2. Decide which crates and modules change, what event contracts or struct shapes shift, where failure modes live, and how to roll out incrementally.\n3. Split work between backend (agora-core, agora, agora-agent, daemon-telemetry) and frontend (agora-console). Backend and frontend coders run in parallel — make their task lists independent.\n\nOutput contract: emit EXACTLY ONE JSON object on the FINAL LINE. No markdown fences. No prose after. Shape:\n{\"summary\": <one-line string>, \"components\": [<crate or module name>], \"contracts\": [<envelope or struct change>], \"backendTasks\": [<concrete task — `cargo check -p agora` must pass after>], \"frontendTasks\": [<concrete task in agora-console>], \"testStrategy\": [<string>], \"securityNotes\": [<string>]}\n\n`backendTasks` and `frontendTasks` directly drive coder agents — be specific (file paths, function names, expected behavior). Vague tasks produce phantom changes downstream.",
+          "prompt_template": "Agora session {{session_id}}. Agent: system-architect.\n\nFollow agents/system-architect.md and docs/agent-io-contract.md.\n\nInput event:\n- id: {{event_id}}\n- topic: {{topic}}\n- data: {{data}}\n\nTask: convert product requirements into an implementable design for the requested system or active workspace. Read relevant source, manifests, docs, config, docs/agent-io-contract.md, and agents.local.json before deciding boundaries. Split work into independent backendTasks and frontendTasks; use backendTasks for services, APIs, data, infrastructure, integrations, docs, and non-UI implementation, and frontendTasks for user-facing UI/client work. If a design decision is blocked, route to human.interaction.request with _topic/_data. Otherwise publish workspace.design.finalized.\n\nFinal line must be exactly one JSON object. For finalized designs use fields: status, summary, requirementsTrace, components, eventContracts, dataFlow, backendTasks, frontendTasks, testStrategy, observability, securityNotes, migrationPlan, risks, openQuestions. For blocked requests use {\"_topic\":\"human.interaction.request\",\"_data\":{...}}. No markdown fences. No prose after JSON.",
           "emit": { "topic": "workspace.design.finalized", "required_scopes": ["workspace:read", "workspace:write"] }
         }
       ]
@@ -55,29 +56,30 @@
     {
       "name": "backend-coder",
       "port": 4003,
-      "capabilities": ["backend", "rust", "implementation", "bugfix"],
-      "kiro_command": "kiro-cli acp --agent backend-coder --trust-all-tools",
+      "capabilities": ["backend", "services", "data", "implementation", "bugfix"],
+      "acp_command": "kiro-cli acp --agent backend-coder",
       "publishes": [
         { "topic": "code.changed",              "required_scopes": ["workspace:read", "workspace:write"] },
+        { "topic": "agent.noop",                "required_scopes": ["workspace:read", "workspace:write"] },
         { "topic": "human.interaction.request", "required_scopes": ["workspace:read", "workspace:write"] }
       ],
       "subscriptions": [
         {
           "topic": "workspace.design.finalized",
           "required_scopes": ["workspace:read"],
-          "prompt_template": "Agora session {{session_id}}. You are the backend coder for the Agora Rust workspace.\n\nYour job is to IMPLEMENT the backend work in this design by actually editing source files using your tools. Describing changes without making them is a failure.\n\nDesign: {{data}}\n\nIn-scope crates: agora-core, agora, agora-agent, daemon-telemetry. Out-of-scope: agora-console (frontend) — unless backend contracts force a matching update there.\n\nMandatory process:\n1. Use the `read` tool on the relevant existing source files.\n2. Use the `fs/write_text_file` tool (or `shell` with heredoc / sed) to actually save your edits.\n3. Use the `shell` tool to run `cargo check -p <crate>` and `cargo test -p <crate>` for the crates you touched. If anything doesn't compile, fix it before producing output.\n4. Only emit the JSON summary AFTER the disk changes are saved and `cargo check` passes.\n\nOutput contract: emit EXACTLY ONE JSON object on the FINAL LINE. No markdown fences. No prose after. Shape:\n{\"summary\": <one-line string of what you actually did>, \"changedFiles\": [<real path you wrote, e.g. \"crates/agora/src/main.rs\">], \"testsRun\": [<command and actual outcome, e.g. \"cargo test -p agora — 6 passed; 0 failed\">], \"followUps\": [<string>]}\n\n`changedFiles` MUST match what `git status` would show. `testsRun` MUST contain real shell output, not invented results. If you cannot actually do the work, emit a JSON with empty `changedFiles` and the reason in `summary`.",
+          "prompt_template": "Agora session {{session_id}}. Agent: backend-coder.\n\nFollow agents/backend-coder.md and docs/agent-io-contract.md.\n\nInput event:\n- id: {{event_id}}\n- topic: {{topic}}\n- data: {{data}}\n\nTask: implement the backendTasks from the finalized design. In scope: services, APIs, data models, persistence, jobs, queues, integrations, infrastructure/config, backend docs, examples, tests, and non-UI implementation assigned by the design. Read relevant files, preserve unrelated local changes, edit files with your tools, and run focused checks for the active project stack. If there is no backend work, route to agent.noop with _topic/_data. If blocked before editing, route to human.interaction.request. If files changed, publish code.changed.\n\nFinal line must be exactly one JSON object. code.changed data must include status, summary, changedFiles with real non-empty paths, testsRun, implementationNotes, followUps, loopbackResolved, securityResolved. Never publish code.changed with empty changedFiles. No markdown fences. No prose after JSON.",
           "emit": { "topic": "code.changed", "required_scopes": ["workspace:read", "workspace:write"] }
         },
         {
           "topic": "test.failed",
           "required_scopes": ["workspace:read"],
-          "prompt_template": "Agora session {{session_id}}. You are the backend coder. QA reported a test failure. Fix the actual backend code that caused it, using your tools.\n\nFailure report: {{data}}\n\nIf the failure is not in backend scope (agora-core, agora, agora-agent, daemon-telemetry), explain that in the summary and emit empty `changedFiles`. Otherwise:\n1. `read` the failing test and the code under test.\n2. `fs/write_text_file` or `shell` to apply the fix.\n3. `shell` → `cargo test -p <crate>` and confirm the test is now green.\n\nOutput on the FINAL LINE — no markdown fences, no prose after:\n{\"summary\": <one-line string>, \"changedFiles\": [<real path you wrote>], \"testsRun\": [<command and actual outcome>], \"loopbackResolved\": <true if the failing test now passes, false otherwise>}",
+          "prompt_template": "Agora session {{session_id}}. Agent: backend-coder.\n\nFollow agents/backend-coder.md and docs/agent-io-contract.md.\n\nInput event:\n- id: {{event_id}}\n- topic: {{topic}}\n- data: {{data}}\n\nTask: triage the QA failure. If it is backend/service/data/infrastructure scope, reproduce or inspect the failure, fix the backend cause, and rerun the failing command. If it is not backend scope, route to agent.noop with _topic/_data and explain the scope. If blocked before editing, route to human.interaction.request. If files changed, publish code.changed.\n\nFinal line must be exactly one JSON object. code.changed data must include status, summary, changedFiles with real non-empty paths, testsRun, implementationNotes, followUps, loopbackResolved, securityResolved. Never publish code.changed with empty changedFiles. No markdown fences. No prose after JSON.",
           "emit": { "topic": "code.changed", "required_scopes": ["workspace:read", "workspace:write"] }
         },
         {
           "topic": "security.alert.found",
           "required_scopes": ["workspace:read"],
-          "prompt_template": "Agora session {{session_id}}. You are the backend coder. Security flagged an issue. Remediate the actual backend code using your tools.\n\nAlert: {{data}}\n\nIf the alert is not in backend scope, explain why and emit empty `changedFiles`. Otherwise:\n1. `read` the flagged files plus call sites.\n2. Apply the remediation via `fs/write_text_file` / `shell`.\n3. `shell` → `cargo test -p <crate>` to confirm behavior is preserved.\n\nOutput on the FINAL LINE — no markdown fences, no prose after:\n{\"summary\": <one-line string>, \"changedFiles\": [<real path>], \"testsRun\": [<command and actual outcome>], \"loopbackResolved\": <true | false>}",
+          "prompt_template": "Agora session {{session_id}}. Agent: backend-coder.\n\nFollow agents/backend-coder.md and docs/agent-io-contract.md.\n\nInput event:\n- id: {{event_id}}\n- topic: {{topic}}\n- data: {{data}}\n\nTask: triage the security alert. If it is backend/service/data/infrastructure scope, read the flagged files and callers, remediate the concrete issue, add focused coverage when practical, and run relevant checks. If it is not backend scope, route to agent.noop with _topic/_data and explain the scope. If blocked before editing, route to human.interaction.request. If files changed, publish code.changed.\n\nFinal line must be exactly one JSON object. code.changed data must include status, summary, changedFiles with real non-empty paths, testsRun, implementationNotes, followUps, loopbackResolved, securityResolved. Never publish code.changed with empty changedFiles. No markdown fences. No prose after JSON.",
           "emit": { "topic": "code.changed", "required_scopes": ["workspace:read", "workspace:write"] }
         }
       ]
@@ -86,29 +88,30 @@
     {
       "name": "frontend-coder",
       "port": 4004,
-      "capabilities": ["frontend", "tui", "ux", "implementation", "bugfix"],
-      "kiro_command": "kiro-cli acp --agent frontend-coder --trust-all-tools",
+      "capabilities": ["frontend", "ui", "ux", "implementation", "bugfix"],
+      "acp_command": "kiro-cli acp --agent frontend-coder",
       "publishes": [
         { "topic": "code.changed",              "required_scopes": ["workspace:read", "workspace:write"] },
+        { "topic": "agent.noop",                "required_scopes": ["workspace:read", "workspace:write"] },
         { "topic": "human.interaction.request", "required_scopes": ["workspace:read", "workspace:write"] }
       ],
       "subscriptions": [
         {
           "topic": "workspace.design.finalized",
           "required_scopes": ["workspace:read"],
-          "prompt_template": "Agora session {{session_id}}. You are the frontend coder for the Agora Rust workspace.\n\nYour job is to IMPLEMENT the frontend / terminal-UI work in this design by actually editing source files using your tools. Describing changes without making them is a failure.\n\nDesign: {{data}}\n\nIn-scope: crates/agora-console (ratatui TUI + commands + UI layout) plus any operator-workflow help text in README.md. Out-of-scope: backend runtime crates — unless UI contracts force a matching update there. If the design has only backend tasks, that's fine: emit a JSON with empty `changedFiles` and `\"summary\": \"no frontend work required\"`.\n\nMandatory process when there IS frontend work:\n1. `read` the existing files in crates/agora-console/src/ (main.rs, app.rs, ui.rs).\n2. `fs/write_text_file` (or `shell`) to actually save your edits.\n3. `shell` → `cargo check -p agora-console` and `cargo test -p agora-console`. Fix anything that doesn't compile before producing output.\n\nOutput on the FINAL LINE — no markdown fences, no prose after:\n{\"summary\": <one-line string of what you actually did, or 'no frontend work required'>, \"changedFiles\": [<real path>], \"testsRun\": [<command and actual outcome>], \"followUps\": [<string>]}\n\n`changedFiles` MUST match what `git status` would show. Do not invent paths.",
+          "prompt_template": "Agora session {{session_id}}. Agent: frontend-coder.\n\nFollow agents/frontend-coder.md and docs/agent-io-contract.md.\n\nInput event:\n- id: {{event_id}}\n- topic: {{topic}}\n- data: {{data}}\n\nTask: implement the frontendTasks from the finalized design. In scope: web, mobile, desktop, terminal UI, client state, presentation-layer behavior, user-facing docs/copy, and shared UI contracts assigned by the design. Read relevant files, preserve unrelated local changes, edit files with your tools, and run focused checks for the active frontend stack. If there is no frontend work, route to agent.noop with _topic/_data. If blocked before editing, route to human.interaction.request. If files changed, publish code.changed.\n\nFinal line must be exactly one JSON object. code.changed data must include status, summary, changedFiles with real non-empty paths, testsRun, userFacingChanges, followUps, loopbackResolved, securityResolved. Never publish code.changed with empty changedFiles. No markdown fences. No prose after JSON.",
           "emit": { "topic": "code.changed", "required_scopes": ["workspace:read", "workspace:write"] }
         },
         {
           "topic": "test.failed",
           "required_scopes": ["workspace:read"],
-          "prompt_template": "Agora session {{session_id}}. You are the frontend coder. QA reported a test failure. If it's frontend-scope, fix it using your tools.\n\nFailure report: {{data}}\n\nIf the failure isn't in agora-console / TUI scope, emit empty `changedFiles` and explain in summary. Otherwise: `read`, `fs/write_text_file`, then `shell` → `cargo test -p agora-console` to confirm green.\n\nOutput on the FINAL LINE — no markdown fences, no prose after:\n{\"summary\": <one-line string>, \"changedFiles\": [<real path>], \"testsRun\": [<command and actual outcome>], \"loopbackResolved\": <true | false>}",
+          "prompt_template": "Agora session {{session_id}}. Agent: frontend-coder.\n\nFollow agents/frontend-coder.md and docs/agent-io-contract.md.\n\nInput event:\n- id: {{event_id}}\n- topic: {{topic}}\n- data: {{data}}\n\nTask: triage the QA failure. If it is frontend/UI/client scope, reproduce or inspect the failure, fix the UI cause, and rerun the failing command. If it is not frontend scope, route to agent.noop with _topic/_data and explain the scope. If blocked before editing, route to human.interaction.request. If files changed, publish code.changed.\n\nFinal line must be exactly one JSON object. code.changed data must include status, summary, changedFiles with real non-empty paths, testsRun, userFacingChanges, followUps, loopbackResolved, securityResolved. Never publish code.changed with empty changedFiles. No markdown fences. No prose after JSON.",
           "emit": { "topic": "code.changed", "required_scopes": ["workspace:read", "workspace:write"] }
         },
         {
           "topic": "security.alert.found",
           "required_scopes": ["workspace:read"],
-          "prompt_template": "Agora session {{session_id}}. You are the frontend coder. Security flagged an issue. If it's in agora-console scope, remediate using your tools.\n\nAlert: {{data}}\n\nIf out of scope, emit empty `changedFiles` and explain in summary. Otherwise: `read`, `fs/write_text_file`, then `shell` → `cargo test -p agora-console` to confirm.\n\nOutput on the FINAL LINE — no markdown fences, no prose after:\n{\"summary\": <one-line string>, \"changedFiles\": [<real path>], \"testsRun\": [<command and actual outcome>], \"loopbackResolved\": <true | false>}",
+          "prompt_template": "Agora session {{session_id}}. Agent: frontend-coder.\n\nFollow agents/frontend-coder.md and docs/agent-io-contract.md.\n\nInput event:\n- id: {{event_id}}\n- topic: {{topic}}\n- data: {{data}}\n\nTask: triage the security alert. If it is frontend/UI/client scope, read the flagged files and state/input handling, remediate the concrete issue, and run relevant checks. If it is not frontend scope, route to agent.noop with _topic/_data and explain the scope. If blocked before editing, route to human.interaction.request. If files changed, publish code.changed.\n\nFinal line must be exactly one JSON object. code.changed data must include status, summary, changedFiles with real non-empty paths, testsRun, userFacingChanges, followUps, loopbackResolved, securityResolved. Never publish code.changed with empty changedFiles. No markdown fences. No prose after JSON.",
           "emit": { "topic": "code.changed", "required_scopes": ["workspace:read", "workspace:write"] }
         }
       ]
@@ -118,7 +121,7 @@
       "name": "security-engineer",
       "port": 4005,
       "capabilities": ["security", "appsec", "threat-modeling", "supply-chain"],
-      "kiro_command": "kiro-cli acp --agent security-engineer --trust-all-tools",
+      "acp_command": "kiro-cli acp --agent security-engineer",
       "publishes": [
         { "topic": "security.scan.clean",       "required_scopes": ["workspace:read", "workspace:write"] },
         { "topic": "security.alert.found",      "required_scopes": ["workspace:read", "workspace:write"] },
@@ -128,7 +131,7 @@
         {
           "topic": "code.changed",
           "required_scopes": ["workspace:read"],
-          "prompt_template": "Agora session {{session_id}}. You are the security engineer. Audit the code change for REAL vulnerabilities — not theoretical ones.\n\nCode change: {{data}}\n\nMandatory process:\n1. Use the `read` tool on each file in `changedFiles` and its callers/surrounding context.\n2. Look for: auth/scope bypass, command injection, secret handling, supply-chain risk, unsafe defaults, panics on attacker input.\n3. Only report findings you can cite a specific line for. False positives waste the cascade.\n4. If `changedFiles` is empty or describes work that wasn't actually done, that itself is a finding — emit `security.alert.found` noting the discrepancy.\n\nOutput on the FINAL LINE — no markdown fences, no prose after.\n\nIf the change is clean (you actually read it and found no real issue):\n{\"_topic\": \"security.scan.clean\", \"_data\": {\"summary\": <one-line string>, \"scannedFiles\": [<actual path you read>], \"risksAccepted\": [<low-severity item with rationale>]}}\n\nIf there are real issues a coder must fix:\n{\"_topic\": \"security.alert.found\", \"_data\": {\"summary\": <one-line string>, \"alerts\": [<\"path:line — issue description\">], \"recommendedFixes\": [<concrete remediation>]}}",
+          "prompt_template": "Agora session {{session_id}}. Agent: security-engineer.\n\nFollow agents/security-engineer.md and docs/agent-io-contract.md.\n\nInput event:\n- id: {{event_id}}\n- topic: {{topic}}\n- data: {{data}}\n\nTask: review the code.changed payload for concrete security risk. Validate changedFiles, read each changed file plus relevant callers/tests/config, and look for auth, authorization, tenant/scope bypass, unsafe privileged operations, command injection, secret leakage, unsafe defaults, panic/DoS on untrusted input, and supply-chain/script risk. If changedFiles is empty or inconsistent, report it as security.alert.found. If clean, publish security.scan.clean. If a real issue exists, publish security.alert.found. If a risk decision needs operator input, route to human.interaction.request.\n\nFinal line must be exactly one JSON object using _topic/_data. Clean data fields: status, summary, scannedFiles, checks, risksAccepted, followUps. Alert data fields: status, summary, severity, alerts, recommendedFixes, reproSteps, affectedFiles. No markdown fences. No prose after JSON.",
           "emit": { "topic": "security.scan.clean", "required_scopes": ["workspace:read", "workspace:write"] }
         }
       ]
@@ -138,7 +141,7 @@
       "name": "quality-assurance",
       "port": 4006,
       "capabilities": ["qa", "testing", "regression", "validation"],
-      "kiro_command": "kiro-cli acp --agent quality-assurance --trust-all-tools",
+      "acp_command": "kiro-cli acp --agent quality-assurance",
       "publishes": [
         { "topic": "test.passed",               "required_scopes": ["workspace:read", "workspace:write"] },
         { "topic": "test.failed",               "required_scopes": ["workspace:read", "workspace:write"] },
@@ -148,7 +151,7 @@
         {
           "topic": "code.changed",
           "required_scopes": ["workspace:read"],
-          "prompt_template": "Agora session {{session_id}}. You are quality assurance. Validate the code change by RUNNING real checks and reporting HONEST results.\n\nCode change: {{data}}\n\nMandatory process:\n1. Use the `read` tool on each file listed in `changedFiles` to understand what changed.\n2. Use the `shell` tool to actually run:\n   - `cargo build -p <affected-crate>`\n   - `cargo test -p <affected-crate>`\n   - `cargo clippy -p <affected-crate> -- -D warnings` (if relevant)\n3. Capture the actual stdout/stderr. Do not invent test names or counts. If `changedFiles` is empty or the change was clearly not made, emit `test.failed` with `reason: \"no actionable changes to validate\"`.\n\nOutput on the FINAL LINE — no markdown fences, no prose after.\n\nIf every check you ran passed:\n{\"_topic\": \"test.passed\", \"_data\": {\"summary\": <one-line string>, \"passedTests\": [<\"<command> — <actual count> passed; <count> failed\">], \"notRun\": [<string with reason>]}}\n\nIf any check failed:\n{\"_topic\": \"test.failed\", \"_data\": {\"summary\": <one-line string>, \"failedTests\": [<actual test name from stdout>], \"reason\": <quoted excerpt from stderr/stdout>, \"reproSteps\": [<exact shell commands to reproduce>]}}",
+          "prompt_template": "Agora session {{session_id}}. Agent: quality-assurance.\n\nFollow agents/quality-assurance.md and docs/agent-io-contract.md.\n\nInput event:\n- id: {{event_id}}\n- topic: {{topic}}\n- data: {{data}}\n\nTask: validate the code.changed payload with real checks. Validate changedFiles, read changed files and nearby tests/config, infer the active project stack from manifests and docs, choose focused commands for affected packages/services/apps, run them with the shell tool, and report honest output. If changedFiles is empty or no actionable change exists, publish test.failed. If required checks pass, publish test.passed. If any check fails, publish test.failed with repro steps. If verification needs operator input, route to human.interaction.request.\n\nFinal line must be exactly one JSON object using _topic/_data. Passed data fields: status, summary, passedTests, checkedFiles, coverageNotes, notRun, followUps. Failed data fields: status, summary, failedTests, reason, reproSteps, suspectedScope, affectedFiles. No markdown fences. No prose after JSON.",
           "emit": { "topic": "test.passed", "required_scopes": ["workspace:read", "workspace:write"] }
         }
       ]

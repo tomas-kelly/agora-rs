@@ -1,7 +1,7 @@
 {
   "name": "frontend-coder",
-  "description": "Implements terminal UI and future frontend experience changes for Agora.",
-  "prompt": "You are the frontend-coder agent for the Agora Rust agent-swarm project. Own user-facing interfaces, especially the ratatui console in crates/agora-console and any future web UI. Optimize for clear interaction flows, readable state, useful diagnostics, and low-friction operator workflows. When responding to Agora, prefer compact JSON with summary, filesChanged, userFacingChanges, testsRun, risks, and next.",
+  "description": "Implements user-facing UI, client, documentation, and frontend experience changes for submitted work.",
+  "prompt": "You are the frontend-coder agent for a generic event-driven workspace. Follow .kiro/agents/frontend-coder.md as your operating workflow for every event. Own user-facing interfaces across web, mobile, desktop, terminal UI, documentation, and client applications. Optimize for clear interaction flows, readable state, useful diagnostics, and low-friction workflows. When responding to the runtime, emit exactly one final JSON object that matches the workflow and docs/agent-io-contract.md.",
   "tools": [
     "read",
     "write",
@@ -17,11 +17,16 @@
       "allowedPaths": [
         "Cargo.toml",
         "Cargo.lock",
+        "package.json",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
         "README.md",
-        "crates/agora-console/**",
-        "crates/agora-core/src/envelope.rs",
-        "crates/agora-core/src/manifest.rs",
-        "crates/agora-core/src/topics.rs",
+        "docs/**",
+        "src/**",
+        "apps/**",
+        "packages/**",
+        "crates/**",
         "./*.json"
       ]
     },
@@ -33,9 +38,13 @@
         "git status",
         "git diff .*",
         "cargo fmt --all",
-        "cargo check -p agora-console.*",
-        "cargo test -p agora-console.*",
-        "cargo clippy -p agora-console.*"
+        "cargo check .*",
+        "cargo test .*",
+        "cargo clippy .*",
+        "npm .*",
+        "pnpm .*",
+        "yarn .*",
+        "bun .*"
       ],
       "deniedCommands": [
         "rm .*",
@@ -48,11 +57,15 @@
     }
   },
   "resources": [
+    "file://../../.kiro/agents/frontend-coder.md",
+    "file://../../docs/agent-io-contract.md",
     "file://../../README.md",
-    "file://../../crates/agora-console/src/**/*.rs",
-    "file://../../crates/agora-core/src/envelope.rs",
-    "file://../../crates/agora-core/src/manifest.rs",
-    "file://../../crates/agora-core/src/topics.rs"
+    "file://../../package.json",
+    "file://../../docs/**",
+    "file://../../src/**",
+    "file://../../apps/**",
+    "file://../../packages/**",
+    "file://../../crates/**"
   ],
   "includeMcpJson": true,
   "keyboardShortcut": "ctrl+f",

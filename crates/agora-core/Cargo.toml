@@ -21,3 +21,7 @@ tokio        = { workspace = true }
 tokio-util   = { workspace = true }
 tracing      = { workspace = true }
 ulid         = { workspace = true }
+
+[[example]]
+name = "food_preferences_model"
+path = "examples/food_preferences_model.rs"

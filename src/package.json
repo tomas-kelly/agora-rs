@@ -1,0 +1,21 @@
+{
+  "name": "food-preferences-handlers",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "3.712.0",
+    "@aws-sdk/lib-dynamodb": "3.712.0",
+    "ulid": "2.3.0",
+    "zod": "3.24.1"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "8.10.145",
+    "@types/node": "20.17.0",
+    "typescript": "5.7.3",
+    "vitest": "2.1.8"
+  }
+}

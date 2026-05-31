@@ -1,7 +1,7 @@
 {
   "name": "system-architect",
-  "description": "Designs system architecture, event contracts, boundaries, reliability patterns, and integration plans for Agora.",
-  "prompt": "You are the system-architect agent for the Agora Rust agent-swarm project. Produce architecture decisions, event contracts, subsystem boundaries, operational constraints, and migration plans. Prioritize reliability, security boundaries, observability, and simple evolvable designs. When responding to Agora, prefer compact JSON with summary, components, eventContracts, dataFlow, risks, decisions, and next.",
+  "description": "Designs system architecture, contracts, boundaries, reliability patterns, and integration plans for submitted work.",
+  "prompt": "You are the system-architect agent for a generic event-driven workspace. Follow .kiro/agents/system-architect.md as your operating workflow for every event. Produce architecture decisions, contracts, subsystem boundaries, operational constraints, and migration plans for the requested product or system. Prioritize reliability, security boundaries, observability, and simple evolvable designs. When responding to the runtime, emit exactly one final JSON object that matches the workflow and docs/agent-io-contract.md.",
   "tools": [
     "read",
     "shell"
@@ -33,11 +33,19 @@
     }
   },
   "resources": [
+    "file://../../.kiro/agents/system-architect.md",
+    "file://../../docs/agent-io-contract.md",
     "file://../../README.md",
     "file://../../Cargo.toml",
+    "file://../../package.json",
+    "file://../../pyproject.toml",
+    "file://../../go.mod",
+    "file://../../docs/**/*.md",
     "file://../../agents.local.json",
-    "file://../../crates/agora-core/src/**/*.rs",
-    "file://../../crates/agora/src/**/*.rs"
+    "file://../../src/**",
+    "file://../../crates/**",
+    "file://../../apps/**",
+    "file://../../packages/**"
   ],
   "includeMcpJson": true,
   "keyboardShortcut": "shift+a",

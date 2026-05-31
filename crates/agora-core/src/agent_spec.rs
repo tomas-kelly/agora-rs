@@ -19,7 +19,7 @@ pub struct SubscriptionSpec {
     pub prompt_template: String,
     /// Default topic + scopes for the event this subscription emits.
     /// The actual emit topic may be overridden by a `_topic` key in the
-    /// kiro response.
+    /// ACP response.
     pub emit: Option<EmitSpec>,
 }
 
@@ -36,12 +36,15 @@ pub struct AgentSpec {
     pub port: u16,
     #[serde(default)]
     pub capabilities: Vec<String>,
-    /// Shell command that launches the kiro-cli ACP server for this agent.
-    /// Required when `acp == "kiro"`.
-    pub kiro_command: Option<String>,
+    /// Shell command that launches the configured ACP server for this agent.
+    /// Required when `acp == "stdio"`.
+    pub acp_command: Option<String>,
     /// ACP backend override. If unset, falls back to the topology-level
     /// `default_acp`.
     pub acp: Option<String>,
+    /// Optional per-agent timeout, in seconds, for ACP requests.
+    #[serde(default, alias = "acpTimeoutSecs")]
+    pub acp_timeout_secs: Option<u64>,
     pub subscriptions: Vec<SubscriptionSpec>,
     /// Optional explicit list. The runner also auto-includes every emit
     /// topic from `subscriptions`, so this only needs entries for topics

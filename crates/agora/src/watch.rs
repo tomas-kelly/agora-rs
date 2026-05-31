@@ -8,7 +8,7 @@ use agora_core::{bus::Bus, envelope::Envelope, topics::EVENT_STREAM_SUBJECTS};
 
 #[derive(Debug, Clone, Args)]
 pub struct WatchArgs {
-    #[arg(long)]
+    #[arg(long = "sessionId")]
     pub session_id: Option<String>,
     #[arg(long)]
     pub agent: Option<String>,

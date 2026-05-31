@@ -3,7 +3,11 @@ use async_nats::jetstream::{self, consumer::pull, stream, AckKind};
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use serde::Serialize;
-use std::time::Duration;
+use std::{
+    collections::{HashSet, VecDeque},
+    future::Future,
+    time::Duration,
+};
 use tracing::{debug, warn};
 
 use crate::{
@@ -11,6 +15,56 @@ use crate::{
     manifest::AgentManifest,
     topics::{consumer_name, EVENT_STREAM, EVENT_STREAM_SUBJECTS, KV_AGENT_REGISTRY},
 };
+
+pub const DURABLE_ACK_WAIT: Duration = Duration::from_secs(30);
+pub const DURABLE_ACK_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
+pub const DURABLE_MAX_DELIVER: i64 = 5;
+pub const DURABLE_NAK_DELAY: Duration = Duration::from_secs(1);
+const HANDLED_EVENT_CACHE_LIMIT: usize = 10_000;
+
+#[derive(Debug, Clone, Copy)]
+pub struct DurableConsumerOptions {
+    pub ack_wait: Duration,
+    pub ack_progress_interval: Duration,
+    pub max_deliver: i64,
+    pub nak_delay: Duration,
+}
+
+impl Default for DurableConsumerOptions {
+    fn default() -> Self {
+        Self {
+            ack_wait: DURABLE_ACK_WAIT,
+            ack_progress_interval: DURABLE_ACK_PROGRESS_INTERVAL,
+            max_deliver: DURABLE_MAX_DELIVER,
+            nak_delay: DURABLE_NAK_DELAY,
+        }
+    }
+}
+
+#[derive(Default)]
+struct HandledEventCache {
+    ids: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl HandledEventCache {
+    fn contains(&self, event_id: &str) -> bool {
+        self.ids.contains(event_id)
+    }
+
+    fn insert(&mut self, event_id: String) {
+        if !self.ids.insert(event_id.clone()) {
+            return;
+        }
+
+        self.order.push_back(event_id);
+        while self.order.len() > HANDLED_EVENT_CACHE_LIMIT {
+            if let Some(oldest) = self.order.pop_front() {
+                self.ids.remove(&oldest);
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct AgentRegistryRecord {
@@ -162,17 +216,41 @@ impl Bus {
 
     /// Create (or get existing) durable pull consumer for a topic, then call
     /// `handler` for each message. Messages are acked only after the handler
-    /// succeeds. Handler errors are NAKed so JetStream can redeliver them.
+    /// succeeds, with periodic progress acks while long handlers are running.
+    /// Handler errors are NAKed so JetStream can redeliver them.
     pub async fn subscribe_durable<F, Fut>(
         &self,
         topic: &str,
         agent_name: &str,
+        handler: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Envelope) -> Fut + Send,
+        Fut: std::future::Future<Output = Result<()>> + Send,
+    {
+        self.subscribe_durable_with_options(
+            topic,
+            agent_name,
+            DurableConsumerOptions::default(),
+            handler,
+        )
+        .await
+    }
+
+    pub async fn subscribe_durable_with_options<F, Fut>(
+        &self,
+        topic: &str,
+        agent_name: &str,
+        mut options: DurableConsumerOptions,
         mut handler: F,
     ) -> Result<()>
     where
         F: FnMut(Envelope) -> Fut + Send,
         Fut: std::future::Future<Output = Result<()>> + Send,
     {
+        if options.ack_progress_interval.is_zero() {
+            options.ack_progress_interval = Duration::from_millis(1);
+        }
         let name = consumer_name(agent_name, topic);
         let stream = self.js.get_stream(EVENT_STREAM).await?;
         let consumer: jetstream::consumer::Consumer<pull::Config> = stream
@@ -188,8 +266,8 @@ impl Bus {
                     // initial creation — once acked, the consumer resumes
                     // from its stored position regardless of this setting.
                     deliver_policy: jetstream::consumer::DeliverPolicy::New,
-                    max_deliver: 5,
-                    ack_wait: Duration::from_secs(30),
+                    max_deliver: options.max_deliver,
+                    ack_wait: options.ack_wait,
                     ..Default::default()
                 },
             )
@@ -200,6 +278,7 @@ impl Bus {
             .messages()
             .await
             .with_context(|| format!("Failed to open message stream for {name}"))?;
+        let mut handled_events = HandledEventCache::default();
 
         while let Some(result) = messages.next().await {
             match result {
@@ -207,15 +286,35 @@ impl Bus {
                     Ok(envelope) => {
                         let event_id = envelope.event_id.clone();
                         debug!(topic = %envelope.topic, event_id = %event_id, "received");
-                        match handler(envelope).await {
+                        if handled_events.contains(&event_id) {
+                            debug!(
+                                topic = %envelope.topic,
+                                event_id = %event_id,
+                                "received duplicate delivery for already handled event"
+                            );
+                            if let Err(e) = msg.ack().await {
+                                warn!("Failed to ack duplicate {event_id}: {e}");
+                            }
+                            continue;
+                        }
+
+                        match handle_with_ack_progress(
+                            &msg,
+                            &event_id,
+                            options.ack_progress_interval,
+                            handler(envelope),
+                        )
+                        .await
+                        {
                             Ok(()) => {
+                                handled_events.insert(event_id.clone());
                                 if let Err(e) = msg.ack().await {
                                     warn!("Failed to ack {event_id}: {e}");
                                 }
                             }
                             Err(e) => {
                                 warn!("Handler failed for {event_id}; requesting redelivery: {e}");
-                                msg.ack_with(AckKind::Nak(Some(Duration::from_secs(1))))
+                                msg.ack_with(AckKind::Nak(Some(options.nak_delay)))
                                     .await
                                     .ok();
                             }
@@ -372,5 +471,63 @@ impl Bus {
         kv.purge(key)
             .await
             .with_context(|| format!("Failed to purge agent registry key {key}"))
+    }
+}
+
+async fn handle_with_ack_progress<Fut>(
+    msg: &jetstream::Message,
+    event_id: &str,
+    progress_interval: Duration,
+    handler: Fut,
+) -> Result<()>
+where
+    Fut: Future<Output = Result<()>>,
+{
+    let mut progress = tokio::time::interval(progress_interval);
+    progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    progress.tick().await;
+    tokio::pin!(handler);
+
+    loop {
+        tokio::select! {
+            result = &mut handler => return result,
+            _ = progress.tick() => {
+                if let Err(e) = msg.ack_with(AckKind::Progress).await {
+                    warn!("Failed to send in-progress ack for {event_id}: {e}");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HandledEventCache, HANDLED_EVENT_CACHE_LIMIT};
+
+    #[test]
+    fn handled_event_cache_remembers_seen_events() {
+        let mut cache = HandledEventCache::default();
+
+        cache.insert("event-1".to_string());
+        cache.insert("event-1".to_string());
+
+        assert!(cache.contains("event-1"));
+        assert_eq!(cache.ids.len(), 1);
+        assert_eq!(cache.order.len(), 1);
+    }
+
+    #[test]
+    fn handled_event_cache_evicts_oldest_event() {
+        let mut cache = HandledEventCache::default();
+
+        for i in 0..=HANDLED_EVENT_CACHE_LIMIT {
+            cache.insert(format!("event-{i}"));
+        }
+
+        assert!(!cache.contains("event-0"));
+        assert!(cache.contains("event-1"));
+        assert!(cache.contains(&format!("event-{HANDLED_EVENT_CACHE_LIMIT}")));
+        assert_eq!(cache.ids.len(), HANDLED_EVENT_CACHE_LIMIT);
+        assert_eq!(cache.order.len(), HANDLED_EVENT_CACHE_LIMIT);
     }
 }
