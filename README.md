@@ -81,6 +81,9 @@ cargo run -p agora -- console
 The TUI window onto the running swarm: sessions / events / agents panes
 plus a composer for events and direct messages. Safe to quit and reopen
 anytime — the JetStream replay catches you up on what you missed.
+Composer history is saved to `.agora/console_history.json`; use
+`--history-path <path>` to move it or `--history-path ""` to disable disk
+history for that run.
 
 `cargo run -p agora-console` still works as a compatibility entry point, but
 `agora console` is the canonical CLI command.
@@ -286,8 +289,12 @@ shows only events from the active session and acts like a stream browser:
 `↑` / `↓` select an event without opening details. Press `Enter` with an empty
 composer to open the Event inspector to the right of the Events pane, `Right`
 expands it into the full event-details view, `Left` collapses/closes it, and
-`Esc` hides it. Live-tail mode has no inspector panel. `End` returns to the live
-tail and hides the inspector. Agents sit below Sessions in the left sidebar.
+`Esc` hides it. `End` returns to the live tail and hides the inspector. Agents
+sit below Sessions in the left sidebar.
+`Tab` and `Shift-Tab` move focus between visible panes and the composer. With
+Agents focused, `↑` / `↓` select an agent, `Enter` opens its live tail for the
+active session, `h` opens history, `s` opens status, and `m` starts a direct
+message to that agent. `M` starts a queued message instead.
 
 Pending human input and ACP tool approvals are surfaced as
 `human.interaction.request` events. The status bar shows the pending count,
@@ -298,10 +305,13 @@ session. Config-driven agents resume their same ACP session after the response,
 then continue toward their final output event. `!pending` lists all unresolved
 requests and `!pending next` jumps to the first one.
 
-`!history backend-coder` replaces the Event inspector with a scrollable
-conversation timeline — inbound events the agent received, prompts sent to ACP,
-responses received, and outbound events published — all interleaved by
-timestamp. PgUp/PgDn or mouse-wheel scroll the output, `!page` dumps it into
+`!tail backend-coder` opens a dedicated Agent Output pane for the active
+session. It shows the prompt sent to ACP and streams ACP response chunks as
+they arrive, before the final output event is published. `!history
+backend-coder` shows the same conversation timeline as a static snapshot —
+inbound events the agent received, prompts sent to ACP, responses received, and
+outbound events published — all interleaved by timestamp. PgUp/PgDn scroll the
+focused output pane, `!page` dumps command output or Agent Output into
 `$PAGER`, and `!copy` puts it on the clipboard.
 
 ### Console keys
@@ -317,6 +327,7 @@ timestamp. PgUp/PgDn or mouse-wheel scroll the output, `!page` dumps it into
 | `!agents` | List agents seen in the active session (with status + event counts) |
 | `!status <agent>` | Manifest + per-session activity for that agent |
 | `!history <agent>` | Full conversation timeline for that agent in the active session: events received, prompts sent to ACP, responses received, events published |
+| `!tail <agent>` | Live ACP output for that agent in the active session; updates while the agent is still working |
 | `!pending [next]` | List pending human input/tool approvals, or jump to the first pending request |
 | `!panel <name>` | Toggle `sessions`, `events`, `agents`, `detail`, or `all` panels |
 | `!copy` | Copy command output (or selected event detail) to system clipboard |
@@ -324,6 +335,15 @@ timestamp. PgUp/PgDn or mouse-wheel scroll the output, `!page` dumps it into
 | `!page` | Open the command output panel in `$PAGER` (e.g. `less`) — useful for long `!history` results |
 | `!clear` | Clear local events and telemetry from the console view; keep sessions, session names, active session, and known agents |
 | `!exit` / `!quit` | Quit (same as Esc) |
+
+`Ctrl-K` opens the command palette. While typing a command, topic, session
+name, tag, bookmark label, or agent reference, fuzzy completion suggestions
+appear above the composer. Press `↑` / `↓` to choose a suggestion and `Enter`
+to accept it; `Tab` still accepts a unique match or extends to the longest
+common prefix. When the composer is empty, `Tab` cycles pane focus instead.
+Composer history persists in `.agora/console_history.json` by default; pass
+`--history-path <path>` to move it or `--history-path ""` to keep it in memory
+only.
 
 **Submitting work**
 
@@ -341,23 +361,34 @@ timestamp. PgUp/PgDn or mouse-wheel scroll the output, `!page` dumps it into
 |---|---|
 | `Ctrl-N` / `Ctrl-R` / `Ctrl-X` | Same as `!new` / `!rename` / clear active session |
 | `F1` / `F2` / `F3` / `F4` | Toggle sessions / events / agents / detail panels |
-| `Tab` | If input starts with `@<prefix>`, autocomplete the agent name; otherwise cycle which session is active |
-| `Shift-Tab` | Cycle active session backwards |
+| `Tab` | Complete command/topic/session/agent input; with an empty composer, focus the next visible pane |
+| `Shift-Tab` | Focus the previous visible pane |
+| `Ctrl-K` | Open the command palette |
+| `Ctrl-P` / `Alt+↑` | Previous composer entry |
+| `Alt+↓` | Next composer entry |
 | `Shift+Enter` / `Alt+Enter` / `Ctrl+J` | Insert a newline (the input box grows) |
-| `Enter` with empty composer | Open the Event inspector for the selected event |
+| `↑` / `↓` with completions open | Select previous / next completion |
+| `↑` / `↓` with Sessions focused | Switch the active session |
+| `↑` / `↓` with Events focused | Select the previous / next event in the stream |
+| `↑` / `↓` with Agents focused | Select the previous / next agent |
+| `↑` / `↓` with Agent Output focused | Scroll the live agent output |
+| `Enter` with Events focused and empty composer | Open the Event inspector for the selected event |
+| `Enter` with Agents focused and empty composer | Open live `!tail` for the selected agent |
+| `h` / `s` / `m` / `M` with Agents focused | Open selected-agent history / status / direct-message draft / queued-message draft |
 | `←` / `→` | Collapse or expand the Event inspector into full event details |
-| `↑` / `↓` | Select the previous / next event in the stream |
-| `PgUp` / `PgDn` | Scroll command output, full event details, or a long draft; otherwise select events by 5 lines |
+| `PgUp` / `PgDn` | Scroll Agent Output, command output, full event details, or a long draft; otherwise select events by 5 lines |
 | Mouse wheel | Scrolls the composer when the pointer is over a long draft; otherwise scrolls command output, full details, or selects events |
 | `End` | Snap back to the live tail |
 | `Esc` (in modal) | Cancel naming/renaming |
-| `Esc` (normal mode, with command output/details) | Dismiss the output or Event inspector panel |
+| `Esc` (normal mode, with palette/output/details) | Dismiss completions, command output, Agent Output, or Event inspector |
 | `Esc` / `q` / `Ctrl-C` (otherwise) | Quit |
 
 ### Debugging an agent
 
-`!history <agent>` is the main debugging surface — it produces a scrollable
-chronological timeline of everything that agent did in the active session:
+`!tail <agent>` is the live debugging surface — it produces a scrollable
+chronological timeline of everything that agent is doing in the active session,
+including streaming ACP response chunks before an event is emitted. Use
+`!history <agent>` when you want a frozen snapshot of the same view:
 
 ```
 History: backend-coder in "Build user API"
@@ -369,7 +400,7 @@ History: backend-coder in "Build user API"
 ·····  prompt to ACP  ·····
   You are the backend developer. Implement this design: …
 
-·····  response from ACP  ·····
+·····  response from ACP (streaming)  ·····
   {"summary":"Implemented initial MVP code changes", ...}
 
 10:00:03  → published code.changed  [evt_01J3K...]
@@ -378,9 +409,9 @@ History: backend-coder in "Build user API"
 
 Prompts and responses come from per-agent telemetry the `agora-agent`
 runtime emits on every event it processes (`agent.telemetry.logs` →
-`prompt_sent` / `response_received`). The console subscribes to the
-telemetry channel live; restart the console with the swarm running to
-catch new flows.
+`prompt_sent` / `response_chunk` / `response_received`). The console subscribes
+to the telemetry channel live; restart the console with the swarm running to
+replay prior flows from JetStream.
 
 Session metadata is event sourced. Names are broadcast as `session.named`;
 deletions are broadcast as `session.deleted` tombstones, so any other console

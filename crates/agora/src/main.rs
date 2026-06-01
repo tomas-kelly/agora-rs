@@ -2140,32 +2140,47 @@ async fn show_history(agent_name: &str, session_id: &str, bus_url: &str) -> Resu
     enum Item {
         Received(Envelope),
         Prompt(String),
+        ResponseStream(String),
         Response(String),
         Published(Envelope),
         Other(TelemetryEntry),
     }
 
-    let mut items: Vec<(String, Item)> = Vec::new();
+    struct StreamAccumulator {
+        timestamp: String,
+        sequence: u64,
+        text: String,
+    }
+
+    let mut items: Vec<(String, u64, Item)> = Vec::new();
 
     for event in events {
         if event.context.session_id != session_id {
             continue;
         }
         if event.sender.agent_name == agent_name {
-            items.push((event.timestamp.clone(), Item::Published(event)));
+            items.push((event.timestamp.clone(), 0, Item::Published(event)));
         } else if subscribed
             .iter()
             .any(|pattern| topic_matches(pattern, &event.topic))
         {
-            items.push((event.timestamp.clone(), Item::Received(event)));
+            items.push((event.timestamp.clone(), 0, Item::Received(event)));
         }
     }
+
+    let mut chunked_triggers = HashSet::new();
+    let mut streams: BTreeMap<String, StreamAccumulator> = BTreeMap::new();
 
     for entry in telemetry {
         if entry.session_id != session_id || entry.agent != agent_name {
             continue;
         }
 
+        let trigger = entry
+            .telemetry
+            .get("triggerEventId")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         match entry.action.as_str() {
             "prompt_sent" | "prompt" => {
                 let text = entry
@@ -2174,22 +2189,61 @@ async fn show_history(agent_name: &str, session_id: &str, bus_url: &str) -> Resu
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                items.push((entry.timestamp.clone(), Item::Prompt(text)));
+                items.push((entry.timestamp.clone(), 0, Item::Prompt(text)));
+            }
+            "response_chunk" => {
+                let chunk = entry
+                    .telemetry
+                    .get("chunk")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if chunk.is_empty() {
+                    continue;
+                }
+                let key = trigger
+                    .clone()
+                    .unwrap_or_else(|| format!("{}:{}", entry.timestamp, streams.len()));
+                chunked_triggers.insert(key.clone());
+                let stream = streams.entry(key).or_insert_with(|| StreamAccumulator {
+                    timestamp: entry.timestamp.clone(),
+                    sequence: 0,
+                    text: String::new(),
+                });
+                stream.sequence = entry
+                    .telemetry
+                    .get("sequence")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(stream.sequence.saturating_add(1));
+                stream.text.push_str(chunk);
             }
             "response_received" | "response" => {
+                if trigger
+                    .as_ref()
+                    .is_some_and(|trigger| chunked_triggers.contains(trigger))
+                {
+                    continue;
+                }
                 let text = entry
                     .telemetry
                     .get("response")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                items.push((entry.timestamp.clone(), Item::Response(text)));
+                items.push((entry.timestamp.clone(), 0, Item::Response(text)));
             }
-            _ => items.push((entry.timestamp.clone(), Item::Other(entry))),
+            _ => items.push((entry.timestamp.clone(), 0, Item::Other(entry))),
         }
     }
 
-    items.sort_by(|a, b| a.0.cmp(&b.0));
+    for stream in streams.into_values() {
+        items.push((
+            stream.timestamp,
+            stream.sequence,
+            Item::ResponseStream(stream.text),
+        ));
+    }
+
+    items.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
     println!("History: {agent_name} in \"{label}\"");
     println!("{} item(s)", items.len());
@@ -2199,7 +2253,7 @@ async fn show_history(agent_name: &str, session_id: &str, bus_url: &str) -> Resu
         println!("No activity found.");
     }
 
-    for (_, item) in items {
+    for (_, _, item) in items {
         match item {
             Item::Received(event) => {
                 println!(
@@ -2212,6 +2266,10 @@ async fn show_history(agent_name: &str, session_id: &str, bus_url: &str) -> Resu
             }
             Item::Prompt(text) => {
                 println!(".....  prompt to ACP  .....");
+                push_indented_stdout(&text, "  ");
+            }
+            Item::ResponseStream(text) => {
+                println!(".....  response from ACP (streaming)  .....");
                 push_indented_stdout(&text, "  ");
             }
             Item::Response(text) => {

@@ -1,6 +1,7 @@
 use agora_core::{
     bookmark::validate_bookmark_label,
     bus::Bus,
+    command::split_command_line,
     envelope::Envelope,
     event_data_from_input,
     manifest::AgentManifest,
@@ -14,11 +15,13 @@ use anyhow::Result;
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
 const MAX_EVENTS: usize = 500;
 const MAX_TELEMETRY: usize = 2000;
+const MAX_INPUT_HISTORY: usize = 200;
 
 // Local constants until agora-core exposes these (backend task B3)
 const SESSION_TAGGED: &str = "session.tagged";
@@ -41,6 +44,23 @@ fn validate_tag(input: &str) -> Option<String> {
         Some(tag)
     } else {
         None
+    }
+}
+
+fn command_value(input: &str) -> Result<Option<String>> {
+    let value = input.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+
+    if value.starts_with('"') || value.starts_with('\'') {
+        let parts = split_command_line(value)?;
+        if parts.len() != 1 {
+            anyhow::bail!("expected one quoted argument");
+        }
+        Ok(parts.into_iter().next())
+    } else {
+        Ok(Some(value.to_string()))
     }
 }
 
@@ -78,6 +98,33 @@ pub enum InputMode {
     Normal,
     NamingNew,
     Renaming,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusTarget {
+    Sessions,
+    Events,
+    Agents,
+    AgentOutput,
+    Composer,
+}
+
+impl FocusTarget {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Sessions => "Sessions",
+            Self::Events => "Events",
+            Self::Agents => "Agents",
+            Self::AgentOutput => "Agent Output",
+            Self::Composer => "Composer",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionItem {
+    pub value: String,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone)]
@@ -201,6 +248,8 @@ pub struct App {
     pub session_names: HashMap<String, String>,
     pub active_session: Option<String>,
     pub agents: BTreeMap<String, AgentManifest>,
+    pub selected_agent: Option<String>,
+    pub focus: FocusTarget,
 
     pub bus_url: String,
     pub bus: Arc<Bus>,
@@ -209,7 +258,10 @@ pub struct App {
     pub submit_field: String,
     pub status_msg: Option<String>,
     pub command_output: Option<String>,
+    pub agent_tail: Option<String>,
+    pub agent_tail_output: Option<String>,
     pub output_scroll: u16,
+    pub tail_scroll: u16,
 
     pub input_scroll: u16,
     pub input_view_height: u16,
@@ -232,6 +284,13 @@ pub struct App {
     /// human's actor token must carry to publish each one.
     pub topology: agora_core::TopicCatalog,
     pub pending_action: Option<PendingAction>,
+    pub command_palette_open: bool,
+    pub completion_selected: usize,
+    pub completion_selection_active: bool,
+    history_path: Option<PathBuf>,
+    input_history: Vec<String>,
+    input_history_cursor: Option<usize>,
+    input_history_draft: String,
 }
 
 impl App {
@@ -242,6 +301,7 @@ impl App {
         submit_topic: String,
         submit_field: String,
         topology: agora_core::TopicCatalog,
+        history_path: Option<PathBuf>,
     ) -> Self {
         Self {
             input: String::new(),
@@ -257,6 +317,8 @@ impl App {
             session_names: HashMap::new(),
             active_session: None,
             agents: BTreeMap::new(),
+            selected_agent: None,
+            focus: FocusTarget::Composer,
             bus_url,
             bus,
             signing_key,
@@ -264,7 +326,10 @@ impl App {
             submit_field,
             status_msg: Some("Type !help for commands · Enter to submit · Esc to quit".into()),
             command_output: None,
+            agent_tail: None,
+            agent_tail_output: None,
             output_scroll: 0,
+            tail_scroll: 0,
             input_scroll: 0,
             input_view_height: 1,
             input_view_width: 1,
@@ -279,7 +344,36 @@ impl App {
             bookmarks: HashMap::new(),
             topology,
             pending_action: None,
+            command_palette_open: false,
+            completion_selected: 0,
+            completion_selection_active: false,
+            history_path,
+            input_history: Vec::new(),
+            input_history_cursor: None,
+            input_history_draft: String::new(),
         }
+    }
+
+    pub fn load_input_history(&mut self) -> Result<()> {
+        let Some(path) = self.history_path.as_deref() else {
+            return Ok(());
+        };
+        if !path.exists() {
+            return Ok(());
+        }
+        self.input_history = load_history_entries(path)?;
+        if self.input_history.len() > MAX_INPUT_HISTORY {
+            let excess = self.input_history.len() - MAX_INPUT_HISTORY;
+            self.input_history.drain(0..excess);
+        }
+        Ok(())
+    }
+
+    fn persist_input_history(&self) -> Result<()> {
+        let Some(path) = self.history_path.as_deref() else {
+            return Ok(());
+        };
+        write_history_entries(path, &self.input_history)
     }
 
     /// Maximum scroll offset such that the events pane stays full of content.
@@ -420,6 +514,95 @@ impl App {
             .count()
     }
 
+    pub fn agent_names(&self) -> Vec<String> {
+        self.agents.keys().cloned().collect()
+    }
+
+    pub fn selected_agent_name(&self) -> Option<&str> {
+        self.selected_agent
+            .as_deref()
+            .filter(|agent| self.agents.contains_key(*agent))
+    }
+
+    pub fn ensure_selected_agent(&mut self) {
+        if self
+            .selected_agent
+            .as_deref()
+            .is_some_and(|agent| self.agents.contains_key(agent))
+        {
+            return;
+        }
+        self.selected_agent = self.agents.keys().next().cloned();
+    }
+
+    pub fn move_agent_selection(&mut self, delta: i32) {
+        let names = self.agent_names();
+        if names.is_empty() {
+            self.selected_agent = None;
+            self.status_msg = Some("No agents registered yet.".into());
+            return;
+        }
+        let len = names.len();
+        let current = self
+            .selected_agent_name()
+            .and_then(|agent| names.iter().position(|name| name == agent))
+            .unwrap_or(0);
+        let next = if delta < 0 {
+            current.saturating_sub((-delta) as usize)
+        } else {
+            current.saturating_add(delta as usize).min(len - 1)
+        };
+        self.selected_agent = Some(names[next].clone());
+        self.focus = FocusTarget::Agents;
+        self.status_msg = Some(format!(
+            "Agent {}/{}: {} · Enter tails · h history · m message",
+            next + 1,
+            len,
+            names[next]
+        ));
+    }
+
+    pub fn selected_agent_tail(&mut self) {
+        self.ensure_selected_agent();
+        let Some(agent) = self.selected_agent.clone() else {
+            self.status_msg = Some("No agent selected.".into());
+            return;
+        };
+        self.cmd_tail(&agent);
+    }
+
+    pub fn selected_agent_history(&mut self) {
+        self.ensure_selected_agent();
+        let Some(agent) = self.selected_agent.clone() else {
+            self.status_msg = Some("No agent selected.".into());
+            return;
+        };
+        self.cmd_history(&agent);
+    }
+
+    pub fn selected_agent_status(&mut self) {
+        self.ensure_selected_agent();
+        let Some(agent) = self.selected_agent.clone() else {
+            self.status_msg = Some("No agent selected.".into());
+            return;
+        };
+        self.cmd_status(&agent);
+    }
+
+    pub fn compose_message_to_selected_agent(&mut self, queued: bool) {
+        self.ensure_selected_agent();
+        let Some(agent) = self.selected_agent.clone() else {
+            self.status_msg = Some("No agent selected.".into());
+            return;
+        };
+        let prefix = if queued { "/queue @" } else { "@" };
+        self.replace_input(format!("{prefix}{agent} "));
+        self.status_msg = Some(format!(
+            "Composing {}message to {agent} in current session",
+            if queued { "queued " } else { "" }
+        ));
+    }
+
     pub fn is_pending_interaction(&self, event_id: &str) -> bool {
         self.pending_interactions()
             .iter()
@@ -466,6 +649,10 @@ impl App {
     }
 
     pub fn scroll_output(&mut self, delta: i32) {
+        if self.focus == FocusTarget::AgentOutput && self.agent_tail_output.is_some() {
+            self.scroll_agent_tail(delta);
+            return;
+        }
         if self.command_output.is_none() && !self.full_event_details_open() {
             return;
         }
@@ -474,6 +661,18 @@ impl App {
         } else {
             self.output_scroll = self.output_scroll.saturating_add(delta as u16);
         }
+    }
+
+    pub fn scroll_agent_tail(&mut self, delta: i32) {
+        if self.agent_tail_output.is_none() {
+            return;
+        }
+        if delta < 0 {
+            self.tail_scroll = self.tail_scroll.saturating_sub((-delta) as u16);
+        } else {
+            self.tail_scroll = self.tail_scroll.saturating_add(delta as u16);
+        }
+        self.focus = FocusTarget::AgentOutput;
     }
 
     pub fn set_input_viewport(&mut self, top: u16, height: u16, width: u16, visual_lines: u16) {
@@ -508,27 +707,241 @@ impl App {
 
     pub fn push_input_char(&mut self, ch: char) {
         self.input.push(ch);
+        self.focus = FocusTarget::Composer;
+        self.input_history_cursor = None;
+        self.sync_completion_after_input_change();
         self.reset_input_scroll();
     }
 
     pub fn push_input_newline(&mut self) {
         self.input.push('\n');
+        self.focus = FocusTarget::Composer;
+        self.input_history_cursor = None;
+        self.sync_completion_after_input_change();
         self.reset_input_scroll();
     }
 
     pub fn pop_input_char(&mut self) {
         self.input.pop();
+        self.focus = FocusTarget::Composer;
+        self.input_history_cursor = None;
+        self.sync_completion_after_input_change();
         self.reset_input_scroll();
     }
 
     pub fn replace_input(&mut self, input: String) {
         self.input = input;
+        self.focus = FocusTarget::Composer;
+        self.command_palette_open = false;
+        self.reset_completion_selection();
         self.reset_input_scroll();
     }
 
+    pub fn complete_input(&mut self) -> bool {
+        let Some(completed) = complete_input(
+            &self.input,
+            &self.agents,
+            &self.topology,
+            &self.sessions,
+            &self.session_names,
+            &self.session_tags(),
+            &self.bookmark_labels(),
+        ) else {
+            let suggestions = self.completion_suggestions();
+            if suggestions.is_empty() {
+                self.status_msg = Some("No completion available.".into());
+            } else {
+                self.status_msg = Some(format!("Matches: {}", suggestions.join(", ")));
+            }
+            return false;
+        };
+        self.replace_input(completed);
+        true
+    }
+
+    pub fn completion_suggestions(&self) -> Vec<String> {
+        self.completion_items()
+            .into_iter()
+            .map(|item| item.value)
+            .collect()
+    }
+
+    pub fn completion_items(&self) -> Vec<CompletionItem> {
+        completion_items(
+            &self.input,
+            &self.agents,
+            &self.topology,
+            &self.sessions,
+            &self.session_names,
+            &self.session_tags(),
+            &self.bookmark_labels(),
+        )
+    }
+
+    pub fn open_command_palette(&mut self) {
+        if self.input.trim().is_empty() {
+            self.replace_input("!".into());
+            self.command_palette_open = true;
+            self.status_msg = Some("Command palette · type to filter, Tab completes".into());
+        } else if self.input.trim_start().starts_with('!') {
+            self.focus = FocusTarget::Composer;
+            self.command_palette_open = true;
+            self.reset_completion_selection();
+            self.status_msg = Some("Command palette · type to filter, Tab completes".into());
+        } else {
+            self.status_msg = Some(
+                "Command palette opens from an empty composer; finish or clear draft first.".into(),
+            );
+        }
+    }
+
+    pub fn completion_menu_active(&self) -> bool {
+        self.mode == InputMode::Normal && !self.completion_items().is_empty()
+    }
+
+    pub fn move_completion_selection(&mut self, delta: i32) -> bool {
+        let len = self.completion_items().len();
+        if len == 0 {
+            return false;
+        }
+        let current = self.completion_selected.min(len - 1);
+        let next = if delta < 0 {
+            current.saturating_sub((-delta) as usize)
+        } else {
+            current.saturating_add(delta as usize).min(len - 1)
+        };
+        self.completion_selected = next;
+        self.completion_selection_active = true;
+        self.focus = FocusTarget::Composer;
+        self.status_msg = Some(format!("Completion {}/{}", next + 1, len));
+        true
+    }
+
+    pub fn accept_selected_completion(&mut self) -> bool {
+        let items = self.completion_items();
+        let Some(item) = items.get(self.completion_selected.min(items.len().saturating_sub(1)))
+        else {
+            return false;
+        };
+        let Some(completed) = apply_completion_value(&self.input, &item.value) else {
+            return false;
+        };
+        self.replace_input(completed);
+        self.status_msg = Some(format!("Selected {}", item.value));
+        true
+    }
+
+    pub fn close_command_palette(&mut self) -> bool {
+        if !self.command_palette_open && !self.completion_selection_active {
+            return false;
+        }
+        self.command_palette_open = false;
+        self.reset_completion_selection();
+        self.status_msg = Some("Completion menu closed".into());
+        true
+    }
+
+    fn reset_completion_selection(&mut self) {
+        self.completion_selected = 0;
+        self.completion_selection_active = false;
+    }
+
+    fn sync_completion_after_input_change(&mut self) {
+        self.reset_completion_selection();
+        if !self.input.trim_start().starts_with('!') {
+            self.command_palette_open = false;
+        }
+    }
+
+    pub fn history_previous(&mut self) -> bool {
+        if self.input_history.is_empty() {
+            self.status_msg = Some("No composer history yet.".into());
+            return false;
+        }
+        let next_cursor = match self.input_history_cursor {
+            Some(0) => 0,
+            Some(idx) => idx - 1,
+            None => {
+                self.input_history_draft = self.input.clone();
+                self.input_history.len() - 1
+            }
+        };
+        self.input_history_cursor = Some(next_cursor);
+        self.input = self.input_history[next_cursor].clone();
+        self.focus = FocusTarget::Composer;
+        self.reset_input_scroll();
+        self.status_msg = Some(format!(
+            "History {}/{}",
+            next_cursor + 1,
+            self.input_history.len()
+        ));
+        true
+    }
+
+    pub fn history_next(&mut self) -> bool {
+        let Some(cursor) = self.input_history_cursor else {
+            return false;
+        };
+        if cursor + 1 >= self.input_history.len() {
+            self.input_history_cursor = None;
+            self.input = std::mem::take(&mut self.input_history_draft);
+            self.status_msg = Some("Returned to current draft.".into());
+        } else {
+            let next = cursor + 1;
+            self.input_history_cursor = Some(next);
+            self.input = self.input_history[next].clone();
+            self.status_msg = Some(format!("History {}/{}", next + 1, self.input_history.len()));
+        }
+        self.focus = FocusTarget::Composer;
+        self.reset_input_scroll();
+        true
+    }
+
+    pub fn history_next_or_enter_naming_new(&mut self) {
+        if !self.history_next() {
+            self.enter_naming_new();
+        }
+    }
+
+    fn remember_input_history(&mut self, text: &str) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if self
+            .input_history
+            .last()
+            .is_some_and(|previous| previous == trimmed)
+        {
+            self.input_history_cursor = None;
+            self.input_history_draft.clear();
+            return;
+        }
+        self.input_history.push(trimmed.to_string());
+        if self.input_history.len() > MAX_INPUT_HISTORY {
+            let excess = self.input_history.len() - MAX_INPUT_HISTORY;
+            self.input_history.drain(0..excess);
+        }
+        self.input_history_cursor = None;
+        self.input_history_draft.clear();
+        if let Err(e) = self.persist_input_history() {
+            self.status_msg = Some(format!("History saved in memory only: {e}"));
+        }
+    }
+
     pub fn dismiss_command_output(&mut self) -> bool {
-        if self.command_output.is_some() {
+        if self.close_command_palette() {
+            true
+        } else if self.command_output.is_some() {
             self.command_output = None;
+            true
+        } else if self.agent_tail_output.is_some() {
+            self.agent_tail = None;
+            self.agent_tail_output = None;
+            self.tail_scroll = 0;
+            if self.focus == FocusTarget::AgentOutput {
+                self.cycle_focus(true);
+            }
             true
         } else if self.inspected_event.is_some() {
             self.inspected_event = None;
@@ -617,11 +1030,34 @@ impl App {
             .map(|(session_id, _)| session_id.clone())
     }
 
+    fn session_tags(&self) -> Vec<String> {
+        let mut tags: Vec<String> = self
+            .sessions
+            .values()
+            .flat_map(|session| session.tags.iter().cloned())
+            .collect();
+        tags.sort();
+        tags.dedup();
+        tags
+    }
+
+    fn bookmark_labels(&self) -> Vec<String> {
+        let mut labels: Vec<String> = self
+            .bookmarks
+            .values()
+            .filter_map(|label| label.clone())
+            .collect();
+        labels.sort();
+        labels.dedup();
+        labels
+    }
+
     pub fn handle_app_event(&mut self, ev: AppEvent) {
         match ev {
             AppEvent::Envelope(env) => self.handle_envelope(env),
             AppEvent::Heartbeat(m) => {
                 self.agents.insert(m.agent_name.clone(), m);
+                self.ensure_selected_agent();
             }
             AppEvent::Telemetry(entry) => {
                 self.telemetry.push(entry);
@@ -634,6 +1070,80 @@ impl App {
                 self.status_msg = Some(format!("Disconnected: {reason}"));
             }
         }
+        self.refresh_agent_tail();
+    }
+
+    pub fn visible_focus_targets(&self) -> Vec<FocusTarget> {
+        let mut targets = Vec::new();
+        if self.panels.sessions {
+            targets.push(FocusTarget::Sessions);
+        }
+        if self.panels.events {
+            targets.push(FocusTarget::Events);
+        }
+        if self.panels.agents {
+            targets.push(FocusTarget::Agents);
+        }
+        if self.agent_tail_output.is_some() {
+            targets.push(FocusTarget::AgentOutput);
+        }
+        targets.push(FocusTarget::Composer);
+        targets
+    }
+
+    pub fn cycle_focus(&mut self, forward: bool) {
+        let targets = self.visible_focus_targets();
+        if targets.is_empty() {
+            self.focus = FocusTarget::Composer;
+            return;
+        }
+        let pos = targets
+            .iter()
+            .position(|target| *target == self.focus)
+            .unwrap_or(targets.len() - 1);
+        let next = if forward {
+            targets[(pos + 1) % targets.len()]
+        } else {
+            targets[(pos + targets.len() - 1) % targets.len()]
+        };
+        self.focus = next;
+        if next == FocusTarget::Agents {
+            self.ensure_selected_agent();
+        }
+        self.status_msg = Some(format!("Focus: {}", next.label()));
+    }
+
+    pub fn focus_hint(&self) -> String {
+        match self.focus {
+            FocusTarget::Sessions => "Sessions · Up/Down switch · Ctrl-N new · Ctrl-R rename · Tab focus".into(),
+            FocusTarget::Events => {
+                "Events · Up/Down select · Enter inspect · Right details · End live · Tab focus"
+                    .into()
+            }
+            FocusTarget::Agents => {
+                "Agents · Up/Down select · Enter tail · h history · m/M message/queue · s status · Tab focus"
+                    .into()
+            }
+            FocusTarget::AgentOutput => {
+                "Agent Output · PgUp/PgDn scroll · Esc closes tail · Tab focus".into()
+            }
+            FocusTarget::Composer => {
+                "Composer · Tab complete · Ctrl-K commands · Alt-Up/Down history · Enter send"
+                    .into()
+            }
+        }
+    }
+
+    pub fn focus_panel(&mut self, panel: Panel) {
+        self.focus = match panel {
+            Panel::Sessions => FocusTarget::Sessions,
+            Panel::Events => FocusTarget::Events,
+            Panel::Agents => {
+                self.ensure_selected_agent();
+                FocusTarget::Agents
+            }
+            Panel::Detail => FocusTarget::Events,
+        };
     }
 
     pub fn handle_envelope(&mut self, env: Envelope) {
@@ -976,6 +1486,7 @@ impl App {
             }
         };
         self.active_session = Some(next.clone());
+        self.focus = FocusTarget::Sessions;
         self.selected_event = None;
         self.inspected_event = None;
         self.full_event_details = false;
@@ -1020,18 +1531,22 @@ impl App {
     }
 
     pub fn scroll_up(&mut self) {
+        self.focus = FocusTarget::Events;
         self.select_event_delta(-1);
     }
 
     pub fn scroll_down(&mut self) {
+        self.focus = FocusTarget::Events;
         self.select_event_delta(1);
     }
 
     pub fn page_events_up(&mut self) {
+        self.focus = FocusTarget::Events;
         self.select_event_delta(-5);
     }
 
     pub fn page_events_down(&mut self) {
+        self.focus = FocusTarget::Events;
         self.select_event_delta(5);
     }
 
@@ -1076,6 +1591,7 @@ impl App {
         self.selected_event = None;
         self.inspected_event = None;
         self.full_event_details = false;
+        self.focus = FocusTarget::Events;
         self.output_scroll = 0;
         self.events_scroll = 0;
         self.auto_scroll = true;
@@ -1096,6 +1612,7 @@ impl App {
         let count = self.active_session_event_count();
         self.command_output = None;
         self.output_scroll = 0;
+        self.focus = FocusTarget::Events;
         self.inspected_event = Some(idx);
         self.full_event_details = false;
         self.panels.detail = true;
@@ -1143,11 +1660,25 @@ impl App {
     pub fn toggle_panel(&mut self, panel: Panel) {
         let visible = !self.panels.is_visible(panel);
         self.panels.set(panel, visible);
+        if visible {
+            self.focus_panel(panel);
+        } else if self.focus_matches_panel(panel) {
+            self.cycle_focus(true);
+        }
         self.status_msg = Some(format!(
             "{} panel {}",
             panel.label(),
             if visible { "shown" } else { "hidden" }
         ));
+    }
+
+    fn focus_matches_panel(&self, panel: Panel) -> bool {
+        matches!(
+            (self.focus, panel),
+            (FocusTarget::Sessions, Panel::Sessions)
+                | (FocusTarget::Events, Panel::Events)
+                | (FocusTarget::Agents, Panel::Agents)
+        )
     }
 
     // -------------------------------------------- publishing
@@ -1157,6 +1688,7 @@ impl App {
         if text.is_empty() {
             return Ok(());
         }
+        self.remember_input_history(&text);
 
         if let Some(rest) = text.strip_prefix('!') {
             return self.run_command(rest).await;
@@ -1211,6 +1743,7 @@ impl App {
             "agents" => self.cmd_agents(),
             "status" => self.cmd_status(rest),
             "history" => self.cmd_history(rest),
+            "tail" | "follow" => self.cmd_tail(rest),
             "pending" => self.cmd_pending(rest),
             "panel" | "panels" | "toggle" => self.cmd_panel(rest),
             "submit" => self.cmd_submit(rest).await,
@@ -1240,18 +1773,25 @@ impl App {
         self.events_scroll = 0;
         self.auto_scroll = true;
         self.command_output = None;
+        self.agent_tail = None;
+        self.agent_tail_output = None;
         self.output_scroll = 0;
+        self.tail_scroll = 0;
         self.status_msg = Some(format!(
             "Cleared view ({n_events} events, {n_tel} telemetry cleared; sessions kept)"
         ));
     }
 
     fn cmd_copy(&mut self) {
-        let text = self.command_output.clone().or_else(|| {
-            self.inspected_event_with_index()
-                .or_else(|| self.selected_event_with_index())
-                .map(|(_, event)| format_event_for_clipboard(event))
-        });
+        let text = self
+            .command_output
+            .clone()
+            .or_else(|| self.agent_tail_output.clone())
+            .or_else(|| {
+                self.inspected_event_with_index()
+                    .or_else(|| self.selected_event_with_index())
+                    .map(|(_, event)| format_event_for_clipboard(event))
+            });
         let Some(text) = text else {
             self.status_msg = Some("Nothing to copy.".into());
             return;
@@ -1269,8 +1809,13 @@ impl App {
     }
 
     fn cmd_page(&mut self) {
-        let Some(content) = self.command_output.clone() else {
-            self.status_msg = Some("Nothing to page. Run !help or !history <agent> first.".into());
+        let Some(content) = self
+            .command_output
+            .clone()
+            .or_else(|| self.agent_tail_output.clone())
+        else {
+            self.status_msg =
+                Some("Nothing to page. Run !help, !history, or !tail <agent> first.".into());
             return;
         };
         self.pending_action = Some(PendingAction::OpenPager { content });
@@ -1282,6 +1827,23 @@ impl App {
         self.full_event_details = false;
         self.command_output = Some(text);
         self.output_scroll = 0;
+    }
+
+    fn set_tail_output(&mut self, agent: &str, text: String) {
+        self.agent_tail = Some(agent.to_string());
+        self.agent_tail_output = Some(text);
+        self.tail_scroll = u16::MAX;
+        self.focus = FocusTarget::AgentOutput;
+    }
+
+    fn refresh_agent_tail(&mut self) {
+        let Some(agent) = self.agent_tail.clone() else {
+            return;
+        };
+        if let Ok(text) = self.agent_timeline_output(&agent, true) {
+            self.agent_tail_output = Some(text);
+            self.tail_scroll = u16::MAX;
+        }
     }
 
     fn cmd_help(&mut self) {
@@ -1296,6 +1858,7 @@ impl App {
              \x20\x20!agents                Agents seen in active session\n\
              \x20\x20!status <agent>        Agent's manifest + activity in active session\n\
              \x20\x20!history <agent>       Full conversation: received · prompts · responses · published\n\
+             \x20\x20!tail <agent>          Live ACP output for an agent in the active session\n\
              \x20\x20!pending [next]        Show pending input/tool approvals, or jump to the next one\n\
              \x20\x20!panel <name>          Toggle sessions, events, agents, detail, or all\n\
              \x20\x20!submit <topic> <data> Publish an arbitrary event (JSON or text)\n\
@@ -1307,14 +1870,17 @@ impl App {
              \n\
              DIRECT MESSAGES:\n\
              \x20\x20@agent <msg>           Steering message in the active session\n\
-             \x20\x20/steer @agent <msg>    Same as @ (Tab completes the agent name)\n\
+             \x20\x20/steer @agent <msg>    Same as @ (completion includes agent names)\n\
              \x20\x20/queue @agent <msg>    Queue in the active session\n\
              \n\
              Plain text is published as the configured submit topic.\n\
              \n\
-             KEYS:  Ctrl-N/R/X · F1/F2/F3/F4 panels · Tab/Shift-Tab · ↑/↓ select events · empty Enter inspects · ←/→ collapse/expand details\n\
-             \x20\x20\x20\x20\x20\x20Shift+Enter or Alt+Enter inserts a newline\n\
-             \x20\x20\x20\x20\x20\x20PgUp/PgDn scroll long drafts or this panel · wheel over the composer scrolls it · Esc to dismiss"
+             KEYS:  Ctrl-N/R/X · Ctrl-K commands · F1/F2/F3/F4 panels · Tab/Shift-Tab focus or complete\n\
+             \x20\x20\x20\x20\x20\x20Agents focus: ↑/↓ select · Enter tail · h history · m/M message/queue · s status\n\
+             \x20\x20\x20\x20\x20\x20Events focus: ↑/↓ select · empty Enter inspects · ←/→ collapse/expand details\n\
+             \x20\x20\x20\x20\x20\x20Completions: ↑/↓ select · Enter accepts · Tab common-prefix completes\n\
+             \x20\x20\x20\x20\x20\x20Shift+Enter or Alt+Enter inserts a newline · Alt-↑/↓ walks persistent composer history\n\
+             \x20\x20\x20\x20\x20\x20PgUp/PgDn scroll long drafts, output, or tail · wheel over the composer scrolls it · Esc dismisses"
             .to_string();
         self.set_output(text);
     }
@@ -1360,11 +1926,22 @@ impl App {
     }
 
     async fn cmd_new(&mut self, name: &str) {
+        let name = match command_value(name) {
+            Ok(Some(name)) => name,
+            Ok(None) => {
+                self.enter_naming_new();
+                return;
+            }
+            Err(e) => {
+                self.status_msg = Some(format!("Invalid session name: {e}"));
+                return;
+            }
+        };
         if name.is_empty() {
             self.enter_naming_new();
             return;
         }
-        self.create_session(name).await;
+        self.create_session(&name).await;
     }
 
     async fn cmd_rename(&mut self, name: &str) {
@@ -1372,28 +1949,47 @@ impl App {
             self.status_msg = Some("No active session. Use !new <name> first.".into());
             return;
         };
+        let name = match command_value(name) {
+            Ok(Some(name)) => name,
+            Ok(None) => {
+                self.enter_renaming();
+                return;
+            }
+            Err(e) => {
+                self.status_msg = Some(format!("Invalid session name: {e}"));
+                return;
+            }
+        };
         if name.is_empty() {
             self.enter_renaming();
             return;
         }
-        self.rename_session(&sid, name).await;
+        self.rename_session(&sid, &name).await;
     }
 
     async fn cmd_delete(&mut self, session: &str) {
-        let sid = if session.is_empty() {
+        let session = match command_value(session) {
+            Ok(value) => value,
+            Err(e) => {
+                self.status_msg = Some(format!("Invalid session: {e}"));
+                return;
+            }
+        };
+
+        let sid = if let Some(session) = session {
+            match self.resolve_session(&session) {
+                Some(sid) => sid,
+                None => {
+                    self.status_msg = Some(format!("Session not found: {session}"));
+                    return;
+                }
+            }
+        } else {
             match self.active_session.clone() {
                 Some(sid) => sid,
                 None => {
                     self.status_msg =
                         Some("No active session. Use !delete <session-id-or-name>.".into());
-                    return;
-                }
-            }
-        } else {
-            match self.resolve_session(session) {
-                Some(sid) => sid,
-                None => {
-                    self.status_msg = Some(format!("Session not found: {session}"));
                     return;
                 }
             }
@@ -1660,12 +2256,37 @@ impl App {
             self.status_msg = Some("Usage: !history <agent-name>".into());
             return;
         }
-        let Some(sid) = self.active_session.clone() else {
-            self.status_msg = Some("No active session.".into());
+        match self.agent_timeline_output(agent, false) {
+            Ok(out) => self.set_output(out),
+            Err(msg) => self.status_msg = Some(msg),
+        }
+    }
+
+    fn cmd_tail(&mut self, agent: &str) {
+        if agent.is_empty() {
+            self.status_msg = Some("Usage: !tail <agent-name>".into());
             return;
+        }
+        match self.agent_timeline_output(agent, true) {
+            Ok(out) => {
+                self.set_tail_output(agent, out);
+                self.status_msg = Some(format!(
+                    "Tailing {agent} in the active session · PgUp/PgDn scroll · !history freezes"
+                ));
+            }
+            Err(msg) => self.status_msg = Some(msg),
+        }
+    }
+
+    fn agent_timeline_output(
+        &self,
+        agent: &str,
+        live: bool,
+    ) -> std::result::Result<String, String> {
+        let Some(sid) = self.active_session.clone() else {
+            return Err("No active session.".into());
         };
 
-        // Topics this agent subscribes to — used to flag inbound events
         let subscribed: Vec<String> = self
             .agents
             .get(agent)
@@ -1675,24 +2296,34 @@ impl App {
         #[derive(Clone)]
         enum Item {
             Received(Envelope),
-            Prompt(String, Option<String>),   // text, trigger_event_id
-            Response(String, Option<String>), // text, trigger_event_id
+            Prompt(String),
+            ResponseStream(String),
+            Response(String),
             Published(Envelope),
             Other(TelemetryEntry),
         }
 
-        let mut items: Vec<(String, Item)> = Vec::new();
+        struct StreamAccumulator {
+            timestamp: String,
+            sequence: u64,
+            text: String,
+        }
+
+        let mut items: Vec<(String, u64, Item)> = Vec::new();
 
         for e in &self.events {
             if e.context.session_id != sid {
                 continue;
             }
             if e.sender.agent_name == agent {
-                items.push((e.timestamp.clone(), Item::Published(e.clone())));
+                items.push((e.timestamp.clone(), 0, Item::Published(e.clone())));
             } else if subscribed.iter().any(|pat| topic_matches(pat, &e.topic)) {
-                items.push((e.timestamp.clone(), Item::Received(e.clone())));
+                items.push((e.timestamp.clone(), 0, Item::Received(e.clone())));
             }
         }
+
+        let mut chunked_triggers = HashSet::new();
+        let mut streams: BTreeMap<String, StreamAccumulator> = BTreeMap::new();
 
         for t in &self.telemetry {
             if t.session_id != sid || t.agent != agent {
@@ -1711,27 +2342,75 @@ impl App {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    items.push((t.timestamp.clone(), Item::Prompt(text, trigger)));
+                    items.push((t.timestamp.clone(), 0, Item::Prompt(text)));
+                }
+                "response_chunk" => {
+                    let chunk = t
+                        .telemetry
+                        .get("chunk")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    let key = trigger
+                        .clone()
+                        .unwrap_or_else(|| format!("{}:{}", t.timestamp, streams.len()));
+                    chunked_triggers.insert(key.clone());
+                    let entry = streams.entry(key).or_insert_with(|| StreamAccumulator {
+                        timestamp: t.timestamp.clone(),
+                        sequence: 0,
+                        text: String::new(),
+                    });
+                    entry.sequence = t
+                        .telemetry
+                        .get("sequence")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(entry.sequence.saturating_add(1));
+                    entry.text.push_str(chunk);
                 }
                 "response_received" | "response" => {
+                    if trigger
+                        .as_ref()
+                        .is_some_and(|trigger| chunked_triggers.contains(trigger))
+                    {
+                        continue;
+                    }
                     let text = t
                         .telemetry
                         .get("response")
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    items.push((t.timestamp.clone(), Item::Response(text, trigger)));
+                    items.push((t.timestamp.clone(), 0, Item::Response(text)));
                 }
-                _ => items.push((t.timestamp.clone(), Item::Other(t.clone()))),
+                _ => items.push((t.timestamp.clone(), 0, Item::Other(t.clone()))),
             }
         }
 
-        items.sort_by(|a, b| a.0.cmp(&b.0));
+        for stream in streams.into_values() {
+            items.push((
+                stream.timestamp,
+                stream.sequence,
+                Item::ResponseStream(stream.text),
+            ));
+        }
+
+        items.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
         let label = self.display_name(&sid);
-        let mut out = format!("History: {agent} in \"{label}\"\n");
+        let mut out = if live {
+            format!("Tail: {agent} in \"{label}\"\n")
+        } else {
+            format!("History: {agent} in \"{label}\"\n")
+        };
+        let mode = if live {
+            "live ACP output · updates as chunks arrive"
+        } else {
+            "conversation timeline"
+        };
         out.push_str(&format!(
-            "  {} item(s) · PgUp/PgDn or mouse wheel to scroll\n\n",
+            "  {} item(s) · {mode} · PgUp/PgDn or mouse wheel to scroll\n\n",
             items.len()
         ));
 
@@ -1739,7 +2418,7 @@ impl App {
             out.push_str("  (no activity yet — submit an event, or wait for the agent to react)\n");
         }
 
-        for (_, item) in items {
+        for (_, _, item) in items {
             match item {
                 Item::Received(e) => {
                     let t = time_only(&e.timestamp);
@@ -1755,12 +2434,17 @@ impl App {
                     );
                     out.push('\n');
                 }
-                Item::Prompt(text, _trigger) => {
+                Item::Prompt(text) => {
                     out.push_str("·····  prompt to ACP  ·····\n");
                     push_indented(&mut out, &text, "  ");
                     out.push('\n');
                 }
-                Item::Response(text, _trigger) => {
+                Item::ResponseStream(text) => {
+                    out.push_str("·····  response from ACP (streaming)  ·····\n");
+                    push_indented(&mut out, &text, "  ");
+                    out.push('\n');
+                }
+                Item::Response(text) => {
                     out.push_str("·····  response from ACP  ·····\n");
                     push_indented(&mut out, &text, "  ");
                     out.push('\n');
@@ -1788,7 +2472,7 @@ impl App {
             }
         }
 
-        self.set_output(out);
+        Ok(out)
     }
 
     fn cmd_pending(&mut self, rest: &str) {
@@ -2142,24 +2826,429 @@ fn format_event_for_clipboard(e: &Envelope) -> String {
     )
 }
 
-/// Longest common prefix among matching agent names; returns the completed
-/// `@name` form (with trailing space if it's a unique match) or `None` if
-/// nothing matches.
-pub fn autocomplete_agent(input: &str, agents: &BTreeMap<String, AgentManifest>) -> Option<String> {
-    let stripped = input.strip_prefix('@')?;
-    if stripped.contains(char::is_whitespace) {
+fn load_history_entries(path: &Path) -> Result<Vec<String>> {
+    let content = std::fs::read_to_string(path)?;
+    let entries: Vec<String> = serde_json::from_str(&content)?;
+    Ok(entries
+        .into_iter()
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect())
+}
+
+fn write_history_entries(path: &Path, entries: &[String]) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let payload = serde_json::to_string_pretty(entries)?;
+    std::fs::write(path, payload)?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CommandSpec {
+    name: &'static str,
+    detail: &'static str,
+}
+
+const COMMANDS: &[CommandSpec] = &[
+    CommandSpec {
+        name: "help",
+        detail: "show command reference",
+    },
+    CommandSpec {
+        name: "new",
+        detail: "create a session",
+    },
+    CommandSpec {
+        name: "rename",
+        detail: "rename active session",
+    },
+    CommandSpec {
+        name: "delete",
+        detail: "hide a session",
+    },
+    CommandSpec {
+        name: "tag",
+        detail: "tag active session",
+    },
+    CommandSpec {
+        name: "untag",
+        detail: "remove a session tag",
+    },
+    CommandSpec {
+        name: "filter",
+        detail: "filter sessions by tag",
+    },
+    CommandSpec {
+        name: "bookmark",
+        detail: "bookmark selected event",
+    },
+    CommandSpec {
+        name: "unbookmark",
+        detail: "remove selected event bookmark",
+    },
+    CommandSpec {
+        name: "bookmarks",
+        detail: "list bookmarks",
+    },
+    CommandSpec {
+        name: "agents",
+        detail: "list agents in active session",
+    },
+    CommandSpec {
+        name: "status",
+        detail: "show agent status",
+    },
+    CommandSpec {
+        name: "history",
+        detail: "agent timeline snapshot",
+    },
+    CommandSpec {
+        name: "tail",
+        detail: "open live agent output",
+    },
+    CommandSpec {
+        name: "follow",
+        detail: "alias for tail",
+    },
+    CommandSpec {
+        name: "pending",
+        detail: "show pending human requests",
+    },
+    CommandSpec {
+        name: "panel",
+        detail: "toggle panels",
+    },
+    CommandSpec {
+        name: "submit",
+        detail: "publish explicit event topic",
+    },
+    CommandSpec {
+        name: "clear",
+        detail: "clear local view",
+    },
+    CommandSpec {
+        name: "copy",
+        detail: "copy visible output",
+    },
+    CommandSpec {
+        name: "editor",
+        detail: "edit composer in $EDITOR",
+    },
+    CommandSpec {
+        name: "page",
+        detail: "open output in $PAGER",
+    },
+    CommandSpec {
+        name: "exit",
+        detail: "quit console",
+    },
+    CommandSpec {
+        name: "quit",
+        detail: "quit console",
+    },
+];
+
+#[cfg(test)]
+fn completion_suggestions(
+    input: &str,
+    agents: &BTreeMap<String, AgentManifest>,
+    topology: &agora_core::TopicCatalog,
+    sessions: &BTreeMap<String, SessionInfo>,
+    session_names: &HashMap<String, String>,
+    tags: &[String],
+    bookmark_labels: &[String],
+) -> Vec<String> {
+    completion_items(
+        input,
+        agents,
+        topology,
+        sessions,
+        session_names,
+        tags,
+        bookmark_labels,
+    )
+    .into_iter()
+    .map(|item| item.value)
+    .take(6)
+    .collect()
+}
+
+fn complete_input(
+    input: &str,
+    agents: &BTreeMap<String, AgentManifest>,
+    topology: &agora_core::TopicCatalog,
+    sessions: &BTreeMap<String, SessionInfo>,
+    session_names: &HashMap<String, String>,
+    tags: &[String],
+    bookmark_labels: &[String],
+) -> Option<String> {
+    let trimmed = input.trim_start();
+    let candidates = completion_items(
+        trimmed,
+        agents,
+        topology,
+        sessions,
+        session_names,
+        tags,
+        bookmark_labels,
+    )
+    .into_iter()
+    .map(|item| item.value)
+    .collect::<Vec<_>>();
+    if candidates.is_empty() {
         return None;
     }
-    let matches: Vec<&String> = agents.keys().filter(|n| n.starts_with(stripped)).collect();
-    match matches.len() {
-        0 => None,
-        1 => Some(format!("@{} ", matches[0])),
-        _ => {
-            let lcp = longest_common_prefix(&matches);
-            if lcp.len() > stripped.len() {
-                Some(format!("@{lcp}"))
+
+    if let Some(stripped) = trimmed.strip_prefix('@') {
+        if stripped.contains(char::is_whitespace) {
+            return None;
+        }
+        return complete_token("@", stripped, candidates, true);
+    }
+
+    for prefix in ["/steer @", "/queue @"] {
+        if let Some(partial) = trimmed.strip_prefix(prefix) {
+            if partial.contains(char::is_whitespace) {
+                return None;
+            }
+            return complete_token(prefix, partial, candidates, true);
+        }
+    }
+
+    let command = trimmed.strip_prefix('!')?;
+    if !command.contains(char::is_whitespace) {
+        return complete_token("!", command, candidates, true);
+    }
+
+    let (cmd, rest) = command.split_once(char::is_whitespace)?;
+    let rest = rest.trim_start();
+    match cmd {
+        "tail" | "follow" | "history" | "status" => {
+            complete_token(&format!("!{cmd} "), rest, candidates, true)
+        }
+        "submit" => {
+            if rest.contains(char::is_whitespace) {
+                None
             } else {
-                None // ambiguous; keep input as-is (caller may show a list)
+                complete_token("!submit ", rest, candidates, true)
+            }
+        }
+        "panel" | "panels" | "toggle" => {
+            complete_token(&format!("!{cmd} "), rest, candidates, false)
+        }
+        "delete" | "del" => complete_token(&format!("!{cmd} "), rest, candidates, false),
+        "tag" | "untag" | "filter" | "bookmark" => {
+            complete_token(&format!("!{cmd} "), rest, candidates, false)
+        }
+        _ => None,
+    }
+}
+
+fn completion_items(
+    input: &str,
+    agents: &BTreeMap<String, AgentManifest>,
+    topology: &agora_core::TopicCatalog,
+    sessions: &BTreeMap<String, SessionInfo>,
+    session_names: &HashMap<String, String>,
+    tags: &[String],
+    bookmark_labels: &[String],
+) -> Vec<CompletionItem> {
+    let trimmed = input.trim_start();
+    if let Some(stripped) = trimmed.strip_prefix('@') {
+        if stripped.contains(char::is_whitespace) {
+            return Vec::new();
+        }
+        return ranked_items(
+            stripped,
+            agents.keys().map(|name| CompletionItem::new(name, "agent")),
+        );
+    }
+
+    for prefix in ["/steer @", "/queue @"] {
+        if let Some(partial) = trimmed.strip_prefix(prefix) {
+            if partial.contains(char::is_whitespace) {
+                return Vec::new();
+            }
+            return ranked_items(
+                partial,
+                agents.keys().map(|name| CompletionItem::new(name, "agent")),
+            );
+        }
+    }
+
+    let Some(command) = trimmed.strip_prefix('!') else {
+        return Vec::new();
+    };
+    if !command.contains(char::is_whitespace) {
+        return ranked_items(
+            command,
+            COMMANDS
+                .iter()
+                .map(|spec| CompletionItem::new(spec.name, spec.detail)),
+        );
+    }
+
+    let Some((cmd, rest)) = command.split_once(char::is_whitespace) else {
+        return Vec::new();
+    };
+    let rest = rest.trim_start();
+    match cmd {
+        "tail" | "follow" | "history" | "status" => ranked_items(
+            rest,
+            agents.keys().map(|name| CompletionItem::new(name, "agent")),
+        ),
+        "submit" if !rest.contains(char::is_whitespace) => ranked_items(
+            rest,
+            topology
+                .known
+                .iter()
+                .map(|topic| CompletionItem::new(topic, "topic")),
+        ),
+        "panel" | "panels" | "toggle" => ranked_items(
+            rest,
+            ["sessions", "events", "agents", "detail", "all"]
+                .into_iter()
+                .map(|panel| CompletionItem::new(panel, "panel")),
+        ),
+        "delete" | "del" => {
+            let mut values: Vec<CompletionItem> = Vec::new();
+            for session in sessions.values().filter(|session| !session.deleted) {
+                values.push(CompletionItem::new(&session.session_id, "session id"));
+                if let Some(name) = session_names.get(&session.session_id) {
+                    values.push(CompletionItem::new(name, "session name"));
+                }
+            }
+            ranked_items(rest, values.into_iter())
+        }
+        "tag" | "untag" | "filter" => {
+            ranked_items(rest, tags.iter().map(|tag| CompletionItem::new(tag, "tag")))
+        }
+        "bookmark" => ranked_items(
+            rest,
+            bookmark_labels
+                .iter()
+                .map(|label| CompletionItem::new(label, "bookmark label")),
+        ),
+        _ => Vec::new(),
+    }
+}
+
+impl CompletionItem {
+    fn new(value: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            detail: detail.into(),
+        }
+    }
+}
+
+fn ranked_items(query: &str, values: impl Iterator<Item = CompletionItem>) -> Vec<CompletionItem> {
+    let query_empty = query.is_empty();
+    let mut ranked: Vec<(u8, usize, CompletionItem)> = values
+        .enumerate()
+        .filter_map(|(idx, item)| {
+            completion_score(query, &item.value).map(|score| (score, idx, item))
+        })
+        .collect();
+    ranked.sort_by(|(a_score, a_idx, a), (b_score, b_idx, b)| {
+        let base = a_score.cmp(b_score);
+        if query_empty {
+            base.then_with(|| a_idx.cmp(b_idx))
+        } else {
+            base.then_with(|| a.value.to_lowercase().cmp(&b.value.to_lowercase()))
+        }
+    });
+    ranked.dedup_by(|(_, _, a), (_, _, b)| a.value == b.value);
+    ranked
+        .into_iter()
+        .map(|(_, _, item)| item)
+        .take(8)
+        .collect()
+}
+
+fn completion_score(query: &str, value: &str) -> Option<u8> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let query = query.to_lowercase();
+    let value = value.to_lowercase();
+    if value == query {
+        Some(0)
+    } else if value.starts_with(&query) {
+        Some(1)
+    } else if value.contains(&query) {
+        Some(2)
+    } else if fuzzy_subsequence(&query, &value) {
+        Some(3)
+    } else {
+        None
+    }
+}
+
+fn fuzzy_subsequence(query: &str, value: &str) -> bool {
+    let mut chars = value.chars();
+    query.chars().all(|needle| chars.any(|c| c == needle))
+}
+
+fn apply_completion_value(input: &str, value: &str) -> Option<String> {
+    let trimmed = input.trim_start();
+    let leading = &input[..input.len() - trimmed.len()];
+    if let Some(stripped) = trimmed.strip_prefix('@') {
+        if stripped.contains(char::is_whitespace) {
+            return None;
+        }
+        return Some(format!("{leading}@{value} "));
+    }
+
+    for prefix in ["/steer @", "/queue @"] {
+        if let Some(partial) = trimmed.strip_prefix(prefix) {
+            if partial.contains(char::is_whitespace) {
+                return None;
+            }
+            return Some(format!("{leading}{prefix}{value} "));
+        }
+    }
+
+    let command = trimmed.strip_prefix('!')?;
+    if !command.contains(char::is_whitespace) {
+        return Some(format!("{leading}!{value} "));
+    }
+
+    let (cmd, rest) = command.split_once(char::is_whitespace)?;
+    let rest = rest.trim_start();
+    if rest.contains(char::is_whitespace) {
+        return None;
+    }
+    let suffix = match cmd {
+        "submit" | "tail" | "follow" | "history" | "status" => " ",
+        _ => "",
+    };
+    Some(format!("{leading}!{cmd} {value}{suffix}"))
+}
+
+fn complete_token(
+    before_token: &str,
+    partial: &str,
+    candidates: Vec<String>,
+    trailing_space_on_unique: bool,
+) -> Option<String> {
+    match candidates.len() {
+        0 => None,
+        1 => {
+            let suffix = if trailing_space_on_unique { " " } else { "" };
+            Some(format!("{}{}{}", before_token, candidates[0], suffix))
+        }
+        _ => {
+            let lcp = longest_common_prefix_strings(&candidates);
+            if lcp.len() > partial.len() {
+                Some(format!("{before_token}{lcp}"))
+            } else {
+                None
             }
         }
     }
@@ -2182,6 +3271,14 @@ fn longest_common_prefix(strs: &[&String]) -> String {
         }
     }
     String::from_utf8_lossy(&first[..len]).into_owned()
+}
+
+fn longest_common_prefix_strings(strs: &[String]) -> String {
+    if strs.is_empty() {
+        return String::new();
+    }
+    let refs: Vec<&String> = strs.iter().collect();
+    longest_common_prefix(&refs)
 }
 
 fn short(s: &str, n: usize) -> String {
@@ -2233,9 +3330,21 @@ fn topic_matches(pattern: &str, topic: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{pending_interactions_from_events, topic_matches, SessionInfo};
-    use agora_core::{topics::*, Envelope};
-    use std::collections::BTreeMap;
+    use super::{
+        command_value, complete_input, completion_suggestions, load_history_entries,
+        pending_interactions_from_events, topic_matches, write_history_entries, SessionInfo,
+    };
+    use agora_core::{topics::*, AgentManifest, Envelope, TopicCatalog};
+    use std::collections::{BTreeMap, HashMap};
+
+    struct CompletionFixture {
+        agents: BTreeMap<String, AgentManifest>,
+        topology: TopicCatalog,
+        sessions: BTreeMap<String, SessionInfo>,
+        session_names: HashMap<String, String>,
+        tags: Vec<String>,
+        bookmark_labels: Vec<String>,
+    }
 
     #[test]
     fn nats_wildcard_matching() {
@@ -2249,6 +3358,206 @@ mod tests {
         assert!(!topic_matches("*.changed", "code.changed.again"));
         assert!(!topic_matches("workspace.event.submitted", "code.changed"));
         assert!(topic_matches(">", "anything.goes.here"));
+    }
+
+    #[test]
+    fn command_value_accepts_quoted_session_names() {
+        assert_eq!(
+            command_value(r#""AWS redelivery fix smoke""#)
+                .unwrap()
+                .as_deref(),
+            Some("AWS redelivery fix smoke")
+        );
+        assert_eq!(
+            command_value("AWS redelivery fix smoke")
+                .unwrap()
+                .as_deref(),
+            Some("AWS redelivery fix smoke")
+        );
+        assert!(command_value(r#""AWS redelivery fix smoke" extra"#).is_err());
+        assert!(command_value("").unwrap().is_none());
+    }
+
+    #[test]
+    fn completion_suggestions_cover_commands_agents_topics_and_sessions() {
+        let fixture = completion_fixture();
+
+        assert_eq!(
+            completion_suggestions(
+                "!tai",
+                &fixture.agents,
+                &fixture.topology,
+                &fixture.sessions,
+                &fixture.session_names,
+                &fixture.tags,
+                &fixture.bookmark_labels
+            ),
+            vec!["tail"]
+        );
+        assert_eq!(
+            completion_suggestions(
+                "!submit workspace.e",
+                &fixture.agents,
+                &fixture.topology,
+                &fixture.sessions,
+                &fixture.session_names,
+                &fixture.tags,
+                &fixture.bookmark_labels
+            ),
+            vec!["workspace.event.submitted"]
+        );
+        assert_eq!(
+            completion_suggestions(
+                "!delete AWS",
+                &fixture.agents,
+                &fixture.topology,
+                &fixture.sessions,
+                &fixture.session_names,
+                &fixture.tags,
+                &fixture.bookmark_labels
+            ),
+            vec!["AWS redelivery fix smoke", "sess_aws"]
+        );
+        assert_eq!(
+            completion_suggestions(
+                "!delete sess",
+                &fixture.agents,
+                &fixture.topology,
+                &fixture.sessions,
+                &fixture.session_names,
+                &fixture.tags,
+                &fixture.bookmark_labels
+            ),
+            vec!["sess_aws"]
+        );
+        assert_eq!(
+            completion_suggestions(
+                "/steer @back",
+                &fixture.agents,
+                &fixture.topology,
+                &fixture.sessions,
+                &fixture.session_names,
+                &fixture.tags,
+                &fixture.bookmark_labels
+            ),
+            vec!["backend-coder"]
+        );
+        assert_eq!(
+            completion_suggestions(
+                "!filter prod",
+                &fixture.agents,
+                &fixture.topology,
+                &fixture.sessions,
+                &fixture.session_names,
+                &fixture.tags,
+                &fixture.bookmark_labels
+            ),
+            vec!["production"]
+        );
+        assert_eq!(
+            completion_suggestions(
+                "!bookmark smoke",
+                &fixture.agents,
+                &fixture.topology,
+                &fixture.sessions,
+                &fixture.session_names,
+                &fixture.tags,
+                &fixture.bookmark_labels
+            ),
+            vec!["smoke-test"]
+        );
+    }
+
+    #[test]
+    fn complete_input_expands_unique_matches_and_common_prefixes() {
+        let fixture = completion_fixture();
+
+        assert_eq!(
+            complete_input(
+                "!tai",
+                &fixture.agents,
+                &fixture.topology,
+                &fixture.sessions,
+                &fixture.session_names,
+                &fixture.tags,
+                &fixture.bookmark_labels
+            ),
+            Some("!tail ".into())
+        );
+        assert_eq!(
+            complete_input(
+                "@back",
+                &fixture.agents,
+                &fixture.topology,
+                &fixture.sessions,
+                &fixture.session_names,
+                &fixture.tags,
+                &fixture.bookmark_labels
+            ),
+            Some("@backend-coder ".into())
+        );
+        assert_eq!(
+            complete_input(
+                "!panel ag",
+                &fixture.agents,
+                &fixture.topology,
+                &fixture.sessions,
+                &fixture.session_names,
+                &fixture.tags,
+                &fixture.bookmark_labels
+            ),
+            Some("!panel agents".into())
+        );
+
+        let mut ambiguous_agents = fixture.agents.clone();
+        ambiguous_agents.insert(
+            "backend-reviewer".into(),
+            AgentManifest::new("backend-reviewer", 4010, vec![], vec![], vec![]),
+        );
+        assert_eq!(
+            complete_input(
+                "@back",
+                &ambiguous_agents,
+                &fixture.topology,
+                &fixture.sessions,
+                &fixture.session_names,
+                &fixture.tags,
+                &fixture.bookmark_labels
+            ),
+            Some("@backend-".into())
+        );
+    }
+
+    #[test]
+    fn apply_completion_value_accepts_selected_items() {
+        assert_eq!(
+            super::apply_completion_value("!delete AWS", "AWS redelivery fix smoke"),
+            Some("!delete AWS redelivery fix smoke".into())
+        );
+        assert_eq!(
+            super::apply_completion_value("/queue @back", "backend-coder"),
+            Some("/queue @backend-coder ".into())
+        );
+    }
+
+    #[test]
+    fn history_entries_round_trip_trimmed_non_empty_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("history.json");
+        write_history_entries(
+            &path,
+            &[
+                "  !help  ".to_string(),
+                String::new(),
+                "workspace event".to_string(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            load_history_entries(&path).unwrap(),
+            vec!["!help", "workspace event"]
+        );
     }
 
     #[test]
@@ -2313,5 +3622,46 @@ mod tests {
 
     fn envelope(topic: &str, sender: &str, session_id: &str, data: serde_json::Value) -> Envelope {
         Envelope::build(topic, sender, 0, "tok", session_id, data, None, vec![])
+    }
+
+    fn completion_fixture() -> CompletionFixture {
+        let mut agents = BTreeMap::new();
+        agents.insert(
+            "backend-coder".into(),
+            AgentManifest::new("backend-coder", 4001, vec![], vec![], vec![]),
+        );
+        agents.insert(
+            "quality-assurance".into(),
+            AgentManifest::new("quality-assurance", 4002, vec![], vec![], vec![]),
+        );
+
+        let mut topology = TopicCatalog::default();
+        topology.known.insert(WORKSPACE_EVENT_SUBMITTED.into());
+
+        let mut sessions = BTreeMap::new();
+        sessions.insert(
+            "sess_aws".into(),
+            SessionInfo {
+                session_id: "sess_aws".into(),
+                started_at: "2026-05-30T00:00:00Z".into(),
+                last_topic: WORKSPACE_EVENT_SUBMITTED.into(),
+                event_count: 1,
+                deleted: false,
+                deleted_at: None,
+                tags: vec!["production".into()],
+            },
+        );
+
+        let mut session_names = HashMap::new();
+        session_names.insert("sess_aws".into(), "AWS redelivery fix smoke".into());
+
+        CompletionFixture {
+            agents,
+            topology,
+            sessions,
+            session_names,
+            tags: vec!["production".into()],
+            bookmark_labels: vec!["smoke-test".into()],
+        }
     }
 }

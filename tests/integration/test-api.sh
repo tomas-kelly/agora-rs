@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Integration test for Food Preferences API
+# Integration test for Food Preferences API (with Cognito auth)
 # Requires: API_URL, USER_POOL_ID, CLIENT_ID, USERNAME, PASSWORD env vars
 
 : "${API_URL:?Set API_URL to the deployed API Gateway endpoint}"
@@ -20,66 +20,51 @@ TOKEN="$AUTH_RESULT"
 USER_ID=$(echo "$TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin)['sub'])")
 
 echo "User ID: $USER_ID"
-BASE="${API_URL}users/${USER_ID}/preferences"
+BASE="${API_URL}users/${USER_ID}/preferences/favorite-meal"
 
-echo "=== POST: Create preference ==="
-CREATE_RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE" \
+echo "=== PUT: Set favorite meal ==="
+PUT_RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE" \
   -H "Authorization: $TOKEN" -H "Content-Type: application/json" \
-  -d '{"food_name":"sushi","category":"japanese","rating":5,"tags":["seafood"],"notes":"love it"}')
-CREATE_CODE=$(echo "$CREATE_RESP" | tail -1)
-CREATE_BODY=$(echo "$CREATE_RESP" | sed '$d')
-echo "Status: $CREATE_CODE"
-[ "$CREATE_CODE" = "201" ] || { echo "FAIL: expected 201"; exit 1; }
-echo "$CREATE_BODY" | python3 -c "import sys,json;d=json.load(sys.stdin);assert d['schemaVersion']=='1.0','missing schemaVersion'"
-PREF_ID=$(echo "$CREATE_BODY" | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['preferenceId'])")
-echo "Created preferenceId: $PREF_ID"
-
-echo "=== GET: Single preference ==="
-GET_SINGLE_RESP=$(curl -s -w "\n%{http_code}" "$BASE/$PREF_ID" -H "Authorization: $TOKEN")
-GET_SINGLE_CODE=$(echo "$GET_SINGLE_RESP" | tail -1)
-GET_SINGLE_BODY=$(echo "$GET_SINGLE_RESP" | sed '$d')
-echo "Status: $GET_SINGLE_CODE"
-[ "$GET_SINGLE_CODE" = "200" ] || { echo "FAIL: expected 200"; exit 1; }
-echo "$GET_SINGLE_BODY" | python3 -c "import sys,json;d=json.load(sys.stdin);assert d['schemaVersion']=='1.0';assert d['data']['food_name']=='sushi'"
-
-echo "=== GET: List preferences ==="
-GET_LIST_RESP=$(curl -s -w "\n%{http_code}" "$BASE" -H "Authorization: $TOKEN")
-GET_LIST_CODE=$(echo "$GET_LIST_RESP" | tail -1)
-GET_LIST_BODY=$(echo "$GET_LIST_RESP" | sed '$d')
-echo "Status: $GET_LIST_CODE"
-[ "$GET_LIST_CODE" = "200" ] || { echo "FAIL: expected 200"; exit 1; }
-echo "$GET_LIST_BODY" | python3 -c "import sys,json;d=json.load(sys.stdin);assert d['schemaVersion']=='1.0'"
-
-echo "=== PUT: Update preference ==="
-PUT_RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE/$PREF_ID" \
-  -H "Authorization: $TOKEN" -H "Content-Type: application/json" \
-  -d '{"food_name":"sushi deluxe","rating":4}')
+  -d '{"value":"sushi"}')
 PUT_CODE=$(echo "$PUT_RESP" | tail -1)
 PUT_BODY=$(echo "$PUT_RESP" | sed '$d')
 echo "Status: $PUT_CODE"
-[ "$PUT_CODE" = "200" ] || { echo "FAIL: expected 200"; exit 1; }
-echo "$PUT_BODY" | python3 -c "import sys,json;d=json.load(sys.stdin);assert d['schemaVersion']=='1.0'"
+[ "$PUT_CODE" = "200" ] || { echo "FAIL: expected 200, got $PUT_CODE"; exit 1; }
+echo "$PUT_BODY" | python3 -c "import sys,json;d=json.load(sys.stdin);assert d['data']['value']=='sushi','wrong value'"
 
-echo "=== DELETE: Remove preference ==="
-DEL_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE "$BASE/$PREF_ID" \
-  -H "Authorization: $TOKEN")
-echo "Status: $DEL_CODE"
-[ "$DEL_CODE" = "204" ] || { echo "FAIL: expected 204"; exit 1; }
+echo "=== GET: Retrieve favorite meal ==="
+GET_RESP=$(curl -s -w "\n%{http_code}" "$BASE" -H "Authorization: $TOKEN")
+GET_CODE=$(echo "$GET_RESP" | tail -1)
+GET_BODY=$(echo "$GET_RESP" | sed '$d')
+echo "Status: $GET_CODE"
+[ "$GET_CODE" = "200" ] || { echo "FAIL: expected 200, got $GET_CODE"; exit 1; }
+echo "$GET_BODY" | python3 -c "import sys,json;d=json.load(sys.stdin);assert d['data']['value']=='sushi','wrong value'"
 
-echo "=== GET after DELETE: Verify 404 ==="
-GET_AFTER_DEL_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/$PREF_ID" -H "Authorization: $TOKEN")
-echo "Status: $GET_AFTER_DEL_CODE"
-[ "$GET_AFTER_DEL_CODE" = "404" ] || { echo "FAIL: expected 404 after delete"; exit 1; }
-
-echo "=== Verify 401 without token ==="
+echo "=== GET: 401 without token ==="
 NO_AUTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BASE")
 echo "Status: $NO_AUTH_CODE"
-[ "$NO_AUTH_CODE" = "401" ] || { echo "FAIL: expected 401"; exit 1; }
+[ "$NO_AUTH_CODE" = "401" ] || { echo "FAIL: expected 401, got $NO_AUTH_CODE"; exit 1; }
 
-echo "=== Verify 403 with wrong userId ==="
-WRONG_BASE="${API_URL}users/wrong-user-id/preferences"
-WRONG_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$WRONG_BASE" -H "Authorization: $TOKEN")
+echo "=== PUT: Overwrite favorite meal ==="
+PUT2_RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE" \
+  -H "Authorization: $TOKEN" -H "Content-Type: application/json" \
+  -d '{"value":"ramen"}')
+PUT2_CODE=$(echo "$PUT2_RESP" | tail -1)
+echo "Status: $PUT2_CODE"
+[ "$PUT2_CODE" = "200" ] || { echo "FAIL: expected 200, got $PUT2_CODE"; exit 1; }
+
+echo "=== GET: Verify overwrite ==="
+GET2_RESP=$(curl -s -w "\n%{http_code}" "$BASE" -H "Authorization: $TOKEN")
+GET2_CODE=$(echo "$GET2_RESP" | tail -1)
+GET2_BODY=$(echo "$GET2_RESP" | sed '$d')
+echo "Status: $GET2_CODE"
+[ "$GET2_CODE" = "200" ] || { echo "FAIL: expected 200, got $GET2_CODE"; exit 1; }
+echo "$GET2_BODY" | python3 -c "import sys,json;d=json.load(sys.stdin);assert d['data']['value']=='ramen','overwrite failed'"
+
+echo "=== GET: 403 for wrong userId ==="
+WRONG_BASE="${API_URL}users/wrong-user-id/preferences/favorite-meal"
+WRONG_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: $TOKEN" "$WRONG_BASE")
 echo "Status: $WRONG_CODE"
-[ "$WRONG_CODE" = "403" ] || { echo "FAIL: expected 403"; exit 1; }
+[ "$WRONG_CODE" = "403" ] || { echo "FAIL: expected 403, got $WRONG_CODE"; exit 1; }
 
 echo "=== ALL TESTS PASSED ==="

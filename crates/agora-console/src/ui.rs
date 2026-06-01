@@ -4,7 +4,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
 };
 
-use crate::app::{App, InputMode};
+use crate::app::{App, CompletionItem, FocusTarget, InputMode};
 
 const COMPOSER_MIN_HEIGHT: u16 = 7;
 const COMPOSER_MAX_HEIGHT: u16 = 18;
@@ -16,6 +16,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
     let main_visible = app.panels.sessions || app.panels.events || app.panels.agents;
+    let completions = app.completion_items();
+    let suggestions_height = if app.mode == InputMode::Normal && !completions.is_empty() {
+        (completions.len() as u16 + 1).min(9)
+    } else {
+        0
+    };
     let output_height = if app.panels.detail && app.command_output.is_some() {
         (area.height / 3).clamp(10, 16)
     } else {
@@ -37,6 +43,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 Constraint::Length(0)
             },
             Constraint::Length(output_height), // command output
+            Constraint::Length(suggestions_height), // completion suggestions
             Constraint::Length(input_height),  // input (grows for multi-line)
         ])
         .split(area);
@@ -48,7 +55,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if app.panels.detail && app.command_output.is_some() {
         render_command_output(f, app, outer[2]);
     }
-    render_input(f, app, outer[3]);
+    if suggestions_height > 0 {
+        render_completion_suggestions(f, app, &completions, outer[3]);
+    }
+    render_input(f, app, outer[4]);
 }
 
 fn render_status(f: &mut Frame, app: &App, area: Rect) {
@@ -66,14 +76,15 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         .status_msg
         .clone()
         .unwrap_or_else(|| "Esc to quit".into());
+    let context = app.focus_hint();
     let right = match app.first_pending_interaction() {
         Some(item) => format!(
-            "{} needed: {} in {} · {base_status}",
+            "{} needed: {} in {} · {base_status} · {context}",
             item.kind_label(),
             item.agent_name,
             app.display_name(&item.session_id)
         ),
-        None => base_status,
+        None => format!("{base_status} · {context}"),
     };
 
     let line = Line::from(vec![
@@ -99,6 +110,29 @@ fn render_main_panels(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    if app.agent_tail_output.is_some() && area.width >= 90 {
+        let tail_width = agent_tail_width(area.width);
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(40), Constraint::Length(tail_width)])
+            .split(area);
+        render_context_panels(f, app, cols[0]);
+        render_agent_tail(f, app, cols[1]);
+        return;
+    } else if app.agent_tail_output.is_some() && area.height >= 12 {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Ratio(2, 3), Constraint::Ratio(1, 3)])
+            .split(area);
+        render_context_panels(f, app, rows[0]);
+        render_agent_tail(f, app, rows[1]);
+        return;
+    }
+
+    render_context_panels(f, app, area);
+}
+
+fn render_context_panels(f: &mut Frame, app: &mut App, area: Rect) {
     let sidebar_visible = app.panels.sessions || app.panels.agents;
     let events_visible = app.panels.events;
     let details_visible = app.panels.detail && app.event_details_open();
@@ -142,6 +176,11 @@ fn render_main_panels(f: &mut Frame, app: &mut App, area: Rect) {
             render_events(f, app, cols[1]);
         }
     }
+}
+
+fn agent_tail_width(width: u16) -> u16 {
+    let candidate = width / 3;
+    candidate.clamp(42, 72).min(width.saturating_sub(40))
 }
 
 fn render_events_and_detail(f: &mut Frame, app: &mut App, area: Rect) {
@@ -201,9 +240,19 @@ fn render_sessions(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .title(match app.tag_filter.as_deref() {
             Some(tag) => format!(" Sessions ({}) · tag:{tag} ", sessions.len()),
-            None => format!(" Sessions ({}) ", sessions.len()),
+            None => {
+                if app.focus == FocusTarget::Sessions {
+                    format!(" Sessions ({}) · ↑/↓ switch ", sessions.len())
+                } else {
+                    format!(" Sessions ({}) ", sessions.len())
+                }
+            }
         })
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(if app.focus == FocusTarget::Sessions {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        }));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -290,7 +339,11 @@ fn render_events(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(if app.focus == FocusTarget::Events {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        }));
     f.render_widget(block, area);
 
     let height = inner.height as usize;
@@ -312,7 +365,7 @@ fn render_events(f: &mut Frame, app: &mut App, area: Rect) {
         let message = if app.active_session.is_some() {
             " No events in selected session "
         } else {
-            " Select a session with Tab or create one with Ctrl-N "
+            " Focus Sessions with Tab, then Up/Down, or create one with Ctrl-N "
         };
         let para = Paragraph::new(message).style(Style::default().fg(Color::DarkGray));
         f.render_widget(para, inner);
@@ -404,6 +457,7 @@ fn render_agents(f: &mut Frame, app: &App, area: Rect) {
         .agents
         .values()
         .map(|a| {
+            let selected = app.selected_agent_name() == Some(a.agent_name.as_str());
             let pending = app.pending_count_for_agent(&a.agent_name);
             let (icon, color) = match a.observed_status() {
                 AgentStatus::Ready => ("●", Color::Green),
@@ -413,8 +467,10 @@ fn render_agents(f: &mut Frame, app: &App, area: Rect) {
                 AgentStatus::Draining => ("◑", Color::Yellow),
                 AgentStatus::Down => ("○", Color::Red),
             };
-            ListItem::new(vec![
+            let marker = if selected { "› " } else { "  " };
+            let item = ListItem::new(vec![
                 Line::from(vec![
+                    Span::styled(marker, Style::default().fg(Color::Yellow)),
                     Span::styled(format!("{icon} "), Style::default().fg(color)),
                     Span::styled(
                         a.agent_name.clone(),
@@ -440,15 +496,31 @@ fn render_agents(f: &mut Frame, app: &App, area: Rect) {
                 } else {
                     format!("   :{} · {}", a.port, a.capabilities.join(","))
                 }),
-            ])
+            ]);
+            if selected && app.focus == FocusTarget::Agents {
+                item.style(Style::default().add_modifier(Modifier::REVERSED))
+            } else {
+                item
+            }
         })
         .collect();
 
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(format!(" Agents ({}) ", app.agents.len()))
-            .border_style(Style::default().fg(Color::DarkGray)),
+            .title(if app.focus == FocusTarget::Agents {
+                format!(
+                    " Agents ({}) · Enter tail · h history · m msg ",
+                    app.agents.len()
+                )
+            } else {
+                format!(" Agents ({}) ", app.agents.len())
+            })
+            .border_style(Style::default().fg(if app.focus == FocusTarget::Agents {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            })),
     );
     f.render_widget(list, area);
 }
@@ -459,14 +531,15 @@ fn render_command_output(f: &mut Frame, app: &App, area: Rect) {
         let visible = area.height.saturating_sub(2);
         let max_scroll = total_lines.saturating_sub(visible);
         let scroll = app.output_scroll.min(max_scroll);
+        let label = " Command output ".to_string();
         let title = if total_lines > visible {
             format!(
-                " Command output  [line {}/{}, PgUp/PgDn or wheel · Esc to dismiss] ",
+                "{label} [line {}/{}, PgUp/PgDn or wheel · Esc to dismiss] ",
                 scroll + 1,
                 total_lines
             )
         } else {
-            " Command output (Esc to dismiss) ".to_string()
+            format!("{label}(Esc to dismiss) ")
         };
         let block = Block::default()
             .borders(Borders::ALL)
@@ -478,6 +551,41 @@ fn render_command_output(f: &mut Frame, app: &App, area: Rect) {
             .scroll((scroll, 0));
         f.render_widget(para, area);
     }
+}
+
+fn render_agent_tail(f: &mut Frame, app: &App, area: Rect) {
+    let Some(out) = &app.agent_tail_output else {
+        return;
+    };
+    let total_lines = out.lines().count() as u16;
+    let visible = area.height.saturating_sub(2);
+    let max_scroll = total_lines.saturating_sub(visible);
+    let scroll = app.tail_scroll.min(max_scroll);
+    let agent = app.agent_tail.as_deref().unwrap_or("agent");
+    let title = if total_lines > visible {
+        format!(
+            " Agent output: {agent} [line {}/{}, PgUp/PgDn · Esc closes] ",
+            scroll + 1,
+            total_lines
+        )
+    } else {
+        format!(" Agent output: {agent} · Esc closes ")
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(
+            Style::default().fg(if app.focus == FocusTarget::AgentOutput {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            }),
+        );
+    let para = Paragraph::new(out.clone())
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+    f.render_widget(para, area);
 }
 
 fn render_event_detail(f: &mut Frame, app: &App, area: Rect) {
@@ -552,6 +660,55 @@ fn render_event_detail(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(para, area);
 }
 
+fn render_completion_suggestions(
+    f: &mut Frame,
+    app: &App,
+    suggestions: &[CompletionItem],
+    area: Rect,
+) {
+    if area.height == 0 || suggestions.is_empty() {
+        return;
+    }
+    let visible = area.height.saturating_sub(1) as usize;
+    let items: Vec<ListItem> = suggestions
+        .iter()
+        .enumerate()
+        .take(visible.max(1))
+        .map(|(idx, suggestion)| {
+            let selected = idx == app.completion_selected.min(suggestions.len() - 1);
+            let marker = if selected { "› " } else { "  " };
+            let item = ListItem::new(Line::from(vec![
+                Span::styled(marker, Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    suggestion.value.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {}", suggestion.detail),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+            if selected {
+                item.style(Style::default().add_modifier(Modifier::REVERSED))
+            } else {
+                item
+            }
+        })
+        .collect();
+    let title = if app.command_palette_open {
+        " Command Palette · type to filter · ↑/↓ select · Enter accepts · Tab completes "
+    } else {
+        " Completions · ↑/↓ select · Enter accepts · Tab completes "
+    };
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::TOP)
+            .title(title)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
+    f.render_widget(list, area);
+}
+
 fn redacted_event_json(e: &agora_core::envelope::Envelope) -> String {
     let mut value = serde_json::to_value(e).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(token) = value
@@ -566,7 +723,13 @@ fn redacted_event_json(e: &agora_core::envelope::Envelope) -> String {
 fn render_input(f: &mut Frame, app: &mut App, area: Rect) {
     let (base_title, prompt_char, border) = match app.mode {
         InputMode::Normal => {
-            if let Some((_, _, question)) = app.active_interaction_request() {
+            if app.command_palette_open {
+                (
+                    " Command palette · type to filter · ↑/↓ select · Enter accepts ".into(),
+                    "›",
+                    Color::Cyan,
+                )
+            } else if let Some((_, _, question)) = app.active_interaction_request() {
                 let preview = if question.len() > 60 {
                     format!("{}…", &question[..60])
                 } else {
@@ -625,6 +788,11 @@ fn render_input(f: &mut Frame, app: &mut App, area: Rect) {
         base_title
     };
 
+    let border = if app.mode == InputMode::Normal && app.focus == FocusTarget::Composer {
+        Color::Cyan
+    } else {
+        border
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
@@ -701,7 +869,7 @@ fn input_end_position(input: &str, content_width: u16) -> (u16, u16) {
 
 #[cfg(test)]
 mod tests {
-    use super::{event_list_width_with_detail, session_item_limit};
+    use super::{agent_tail_width, event_list_width_with_detail, session_item_limit};
 
     #[test]
     fn session_item_limit_uses_one_row_per_session() {
@@ -717,5 +885,12 @@ mod tests {
         assert_eq!(event_list_width_with_detail(160), 46);
         assert_eq!(event_list_width_with_detail(94), 46);
         assert_eq!(event_list_width_with_detail(80), 32);
+    }
+
+    #[test]
+    fn agent_tail_width_keeps_context_visible() {
+        assert_eq!(agent_tail_width(120), 42);
+        assert_eq!(agent_tail_width(180), 60);
+        assert_eq!(agent_tail_width(260), 72);
     }
 }

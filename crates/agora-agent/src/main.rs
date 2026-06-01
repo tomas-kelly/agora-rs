@@ -19,8 +19,9 @@
 
 use agora_core::{
     acp::{
-        AcpClient, AcpPermissionDecision, AcpPermissionHandler, AcpPermissionOption,
-        AcpPermissionRequest, MockAcpClient, StdioAcpClient, DEFAULT_ACP_CALL_TIMEOUT,
+        AcpClient, AcpOutputHandler, AcpPermissionDecision, AcpPermissionHandler,
+        AcpPermissionOption, AcpPermissionRequest, MockAcpClient, StdioAcpClient,
+        DEFAULT_ACP_CALL_TIMEOUT,
     },
     agent_spec::{AgentSpec, SubscriptionSpec},
     daemon::{Agent, DaemonConfig, DaemonRunner, Publisher},
@@ -359,6 +360,48 @@ impl AcpPermissionHandler for PublisherPermissionHandler {
     }
 }
 
+struct PublisherOutputHandler {
+    publisher: Publisher,
+    trigger_event_id: String,
+    sequence: u64,
+    after_human_input: bool,
+}
+
+impl PublisherOutputHandler {
+    fn new(publisher: Publisher, trigger_event_id: String) -> Self {
+        Self {
+            publisher,
+            trigger_event_id,
+            sequence: 0,
+            after_human_input: false,
+        }
+    }
+}
+
+#[async_trait]
+impl AcpOutputHandler for PublisherOutputHandler {
+    async fn output_chunk(&mut self, chunk: &str) -> Result<()> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        self.sequence += 1;
+        let _ = self
+            .publisher
+            .emit_telemetry(
+                "INFO",
+                "response_chunk",
+                serde_json::json!({
+                    "triggerEventId": self.trigger_event_id,
+                    "sequence": self.sequence,
+                    "chunk": chunk,
+                    "afterHumanInput": self.after_human_input,
+                }),
+            )
+            .await;
+        Ok(())
+    }
+}
+
 fn tool_call_title(tool_call: &serde_json::Value) -> String {
     tool_call
         .get("title")
@@ -579,11 +622,14 @@ impl Agent for ConfigAgent {
         let mut permission_handler = PublisherPermissionHandler {
             publisher: publisher.clone(),
         };
+        let mut output_handler =
+            PublisherOutputHandler::new(publisher.clone(), envelope.event_id.clone());
         let mut result = self
             .acp
-            .session_prompt(
+            .session_prompt_with_output(
                 &session_id,
                 &[serde_json::json!({ "type": "text", "text": rendered })],
+                Some(&mut output_handler),
                 Some(&mut permission_handler),
             )
             .await?;
@@ -633,11 +679,13 @@ impl Agent for ConfigAgent {
                     )
                     .await;
 
+                output_handler.after_human_input = true;
                 result = self
                     .acp
-                    .session_prompt(
+                    .session_prompt_with_output(
                         &session_id,
                         &[serde_json::json!({ "type": "text", "text": followup })],
+                        Some(&mut output_handler),
                         Some(&mut permission_handler),
                     )
                     .await?;

@@ -16,7 +16,7 @@ use agora_core::{
     topics::{AGENT_REGISTRY_HEARTBEAT, AGENT_TELEMETRY_LOGS, EVENT_STREAM_SUBJECTS},
 };
 use anyhow::{Context, Result};
-use app::{App, AppEvent, InputMode, Panel, PendingAction, TelemetryEntry};
+use app::{App, AppEvent, FocusTarget, InputMode, Panel, PendingAction, TelemetryEntry};
 use clap::Args;
 use crossterm::{
     event::{
@@ -54,9 +54,16 @@ pub struct ConsoleArgs {
     /// Field used to wrap plain composer text into JSON
     #[arg(long, default_value = "text")]
     submit_field: String,
+    /// Composer history file. Use --history-path "" to keep history in memory only.
+    #[arg(long, default_value = ".agora/console_history.json")]
+    history_path: std::path::PathBuf,
     /// Skip the JetStream replay on startup (start with an empty event list)
     #[arg(long)]
     no_replay: bool,
+}
+
+fn history_path_arg(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    (!path.as_os_str().is_empty()).then(|| path.to_path_buf())
 }
 
 pub async fn run(args: ConsoleArgs) -> Result<()> {
@@ -89,7 +96,11 @@ pub async fn run(args: ConsoleArgs) -> Result<()> {
         args.submit_topic.clone(),
         args.submit_field.clone(),
         topology,
+        history_path_arg(&args.history_path),
     );
+    if let Err(e) = app.load_input_history() {
+        app.status_msg = Some(format!("Composer history load failed: {e}"));
+    }
 
     let (tx, mut rx) = mpsc::channel::<AppEvent>(256);
     spawn_subscribers(bus.clone(), tx.clone());
@@ -266,6 +277,7 @@ fn run_pager(content: &str) -> Result<()> {
 
 async fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
 
     // Modal modes have their own key handling. Esc cancels; Enter confirms.
     if app.mode != InputMode::Normal {
@@ -293,21 +305,27 @@ async fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool> {
         }
         KeyCode::Char('c') if ctrl => return Ok(true),
         KeyCode::Char('q') if app.input.is_empty() => return Ok(true),
-        KeyCode::Char('n') if ctrl => app.enter_naming_new(),
+        KeyCode::Char('n') if ctrl => app.history_next_or_enter_naming_new(),
         KeyCode::Char('r') if ctrl => app.enter_renaming(),
         KeyCode::Char('x') if ctrl => app.clear_active(),
+        KeyCode::Char('k') if ctrl => app.open_command_palette(),
+        KeyCode::Char('p') if ctrl => {
+            app.history_previous();
+        }
         KeyCode::F(1) => app.toggle_panel(Panel::Sessions),
         KeyCode::F(2) => app.toggle_panel(Panel::Events),
         KeyCode::F(3) => app.toggle_panel(Panel::Agents),
-        KeyCode::F(4) => app.toggle_panel(Panel::Detail),
+        KeyCode::F(4) => {
+            app.toggle_panel(Panel::Detail);
+        }
         KeyCode::Tab => {
-            if let Some(completion) = app::autocomplete_agent(&app.input, &app.agents) {
-                app.replace_input(completion);
+            if !app.input.trim().is_empty() {
+                app.complete_input();
             } else {
-                app.cycle_session(true);
+                app.cycle_focus(true);
             }
         }
-        KeyCode::BackTab => app.cycle_session(false),
+        KeyCode::BackTab => app.cycle_focus(false),
         // Shift+Enter, Alt+Enter, and Ctrl-J insert a newline.
         // (Terminals that don't distinguish Shift+Enter from Enter need Alt+Enter.)
         KeyCode::Enter
@@ -317,9 +335,27 @@ async fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool> {
             app.push_input_newline();
         }
         KeyCode::Char('j') if ctrl => app.push_input_newline(),
+        KeyCode::Char('h') if app.input.is_empty() && app.focus == FocusTarget::Agents => {
+            app.selected_agent_history();
+        }
+        KeyCode::Char('s') if app.input.is_empty() && app.focus == FocusTarget::Agents => {
+            app.selected_agent_status();
+        }
+        KeyCode::Char('m') if app.input.is_empty() && app.focus == FocusTarget::Agents => {
+            app.compose_message_to_selected_agent(false);
+        }
+        KeyCode::Char('M') if app.input.is_empty() && app.focus == FocusTarget::Agents => {
+            app.compose_message_to_selected_agent(true);
+        }
         KeyCode::Enter => {
-            if app.input.trim().is_empty() && app.command_output.is_none() {
-                app.open_selected_event();
+            if app.command_palette_open || app.completion_selection_active {
+                app.accept_selected_completion();
+            } else if app.input.trim().is_empty() && app.command_output.is_none() {
+                if app.focus == FocusTarget::Agents {
+                    app.selected_agent_tail();
+                } else {
+                    app.open_selected_event();
+                }
             } else {
                 let text = std::mem::take(&mut app.input);
                 app.reset_input_scroll();
@@ -353,8 +389,36 @@ async fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool> {
         KeyCode::Right if app.input.trim().is_empty() => {
             app.expand_event_details();
         }
-        KeyCode::Up => app.scroll_up(),
-        KeyCode::Down => app.scroll_down(),
+        KeyCode::Up if alt => {
+            app.history_previous();
+        }
+        KeyCode::Down if alt => {
+            app.history_next();
+        }
+        KeyCode::Up if app.completion_menu_active() => {
+            app.move_completion_selection(-1);
+        }
+        KeyCode::Down if app.completion_menu_active() => {
+            app.move_completion_selection(1);
+        }
+        KeyCode::Up if app.focus == FocusTarget::Composer && !app.input.is_empty() => {
+            app.history_previous();
+        }
+        KeyCode::Down if app.focus == FocusTarget::Composer && !app.input.is_empty() => {
+            app.history_next();
+        }
+        KeyCode::Up => match app.focus {
+            FocusTarget::Sessions => app.cycle_session(false),
+            FocusTarget::Agents => app.move_agent_selection(-1),
+            FocusTarget::AgentOutput => app.scroll_agent_tail(-1),
+            FocusTarget::Events | FocusTarget::Composer => app.scroll_up(),
+        },
+        KeyCode::Down => match app.focus {
+            FocusTarget::Sessions => app.cycle_session(true),
+            FocusTarget::Agents => app.move_agent_selection(1),
+            FocusTarget::AgentOutput => app.scroll_agent_tail(1),
+            FocusTarget::Events | FocusTarget::Composer => app.scroll_down(),
+        },
         KeyCode::End => {
             if app.input_scroll > 0 {
                 app.reset_input_scroll();
@@ -375,6 +439,8 @@ fn handle_mouse(m: MouseEvent, app: &mut App) {
                 app.scroll_input(-2);
             } else if app.command_output.is_some() || app.full_event_details_open() {
                 app.scroll_output(-2);
+            } else if app.focus == FocusTarget::AgentOutput {
+                app.scroll_agent_tail(-2);
             } else {
                 app.scroll_up();
                 app.scroll_up();
@@ -385,6 +451,8 @@ fn handle_mouse(m: MouseEvent, app: &mut App) {
                 app.scroll_input(2);
             } else if app.command_output.is_some() || app.full_event_details_open() {
                 app.scroll_output(2);
+            } else if app.focus == FocusTarget::AgentOutput {
+                app.scroll_agent_tail(2);
             } else {
                 app.scroll_down();
                 app.scroll_down();
@@ -411,6 +479,9 @@ fn spawn_subscribers(bus: Arc<Bus>, tx: mpsc::Sender<AppEvent>) {
             };
             while let Some(msg) = sub.next().await {
                 if let Ok(env) = Envelope::from_bytes(&msg.payload) {
+                    if env.topic == AGENT_TELEMETRY_LOGS {
+                        continue;
+                    }
                     if tx.send(AppEvent::Envelope(env)).await.is_err() {
                         break;
                     }

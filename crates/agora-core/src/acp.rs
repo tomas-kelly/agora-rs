@@ -45,15 +45,30 @@ pub trait AcpPermissionHandler: Send {
 }
 
 #[async_trait]
+pub trait AcpOutputHandler: Send {
+    async fn output_chunk(&mut self, chunk: &str) -> Result<()>;
+}
+
+#[async_trait]
 pub trait AcpClient: Send + 'static {
     async fn session_new(&mut self, session_id: &str) -> Result<()>;
     async fn session_load(&mut self, session_id: &str) -> Result<()>;
+    async fn session_prompt_with_output(
+        &mut self,
+        session_id: &str,
+        messages: &[serde_json::Value],
+        output_handler: Option<&mut dyn AcpOutputHandler>,
+        permission_handler: Option<&mut dyn AcpPermissionHandler>,
+    ) -> Result<AcpResult>;
     async fn session_prompt(
         &mut self,
         session_id: &str,
         messages: &[serde_json::Value],
         permission_handler: Option<&mut dyn AcpPermissionHandler>,
-    ) -> Result<AcpResult>;
+    ) -> Result<AcpResult> {
+        self.session_prompt_with_output(session_id, messages, None, permission_handler)
+            .await
+    }
     async fn session_close(&mut self, session_id: &str) -> Result<()>;
 }
 
@@ -81,10 +96,11 @@ impl AcpClient for MockAcpClient {
         Ok(())
     }
 
-    async fn session_prompt(
+    async fn session_prompt_with_output(
         &mut self,
         _session_id: &str,
         messages: &[serde_json::Value],
+        output_handler: Option<&mut dyn AcpOutputHandler>,
         _permission_handler: Option<&mut dyn AcpPermissionHandler>,
     ) -> Result<AcpResult> {
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -98,6 +114,9 @@ impl AcpClient for MockAcpClient {
             "summary": format!("[mock/{}] {}", self.agent_name, trimmed),
         })
         .to_string();
+        if let Some(handler) = output_handler {
+            handler.output_chunk(&text).await?;
+        }
         Ok(AcpResult { text })
     }
 
@@ -328,6 +347,7 @@ impl StdioAcpClient {
         &mut self,
         acp_session_id: &str,
         messages: &[serde_json::Value],
+        mut output_handler: Option<&mut dyn AcpOutputHandler>,
         mut permission_handler: Option<&mut dyn AcpPermissionHandler>,
     ) -> Result<String> {
         self.ensure_initialized().await?;
@@ -379,6 +399,9 @@ impl StdioAcpClient {
                 // Some agents put the text in the result rather than streaming.
                 if accumulated.is_empty() {
                     if let Some(text) = msg.get("result").and_then(extract_result_text) {
+                        if let Some(handler) = output_handler.as_mut() {
+                            (*handler).output_chunk(&text).await?;
+                        }
                         accumulated = text;
                     }
                 }
@@ -392,14 +415,17 @@ impl StdioAcpClient {
                 if same_session {
                     if let Some(chunk) = extract_update_chunk(&msg) {
                         accumulated.push_str(&chunk);
+                        if let Some(handler) = output_handler.as_mut() {
+                            (*handler).output_chunk(&chunk).await?;
+                        }
                     }
                 }
                 continue;
             }
 
             if let Some((request_id, request)) = parse_permission_request(&msg) {
-                let decision = match permission_handler.as_deref_mut() {
-                    Some(handler) => handler.request_permission(request).await?,
+                let decision = match permission_handler.as_mut() {
+                    Some(handler) => (*handler).request_permission(request).await?,
                     None => AcpPermissionDecision::Cancelled,
                 };
                 self.write_json_rpc_result(request_id, permission_result(decision))
@@ -594,10 +620,11 @@ impl AcpClient for StdioAcpClient {
         }
     }
 
-    async fn session_prompt(
+    async fn session_prompt_with_output(
         &mut self,
         session_id: &str,
         messages: &[serde_json::Value],
+        output_handler: Option<&mut dyn AcpOutputHandler>,
         permission_handler: Option<&mut dyn AcpPermissionHandler>,
     ) -> Result<AcpResult> {
         let acp_sid = self
@@ -612,7 +639,7 @@ impl AcpClient for StdioAcpClient {
 
         let text = match tokio::time::timeout(
             self.call_timeout,
-            self.prompt_streaming(&acp_sid, messages, permission_handler),
+            self.prompt_streaming(&acp_sid, messages, output_handler, permission_handler),
         )
         .await
         {
@@ -644,8 +671,8 @@ impl AcpClient for StdioAcpClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_permission_request, permission_result, AcpClient, AcpPermissionDecision,
-        AcpPermissionHandler, AcpPermissionRequest, StdioAcpClient,
+        parse_permission_request, permission_result, AcpClient, AcpOutputHandler,
+        AcpPermissionDecision, AcpPermissionHandler, AcpPermissionRequest, StdioAcpClient,
     };
     use anyhow::Result;
     use async_trait::async_trait;
@@ -732,18 +759,24 @@ mod tests {
         let mut client = StdioAcpClient::new("test-agent", &command);
         let seen = Arc::new(Mutex::new(None));
         let mut handler = RecordingPermissionHandler { seen: seen.clone() };
+        let chunks = Arc::new(Mutex::new(String::new()));
+        let mut output = RecordingOutputHandler {
+            chunks: chunks.clone(),
+        };
 
         client.session_new("sess_runtime").await.unwrap();
         let result = client
-            .session_prompt(
+            .session_prompt_with_output(
                 "sess_runtime",
                 &[serde_json::json!({ "type": "text", "text": "please use the tool" })],
+                Some(&mut output),
                 Some(&mut handler),
             )
             .await
             .unwrap();
 
         assert_eq!(result.text, "approved: allow-once");
+        assert_eq!(*chunks.lock().unwrap(), "approved: allow-once");
         let request = seen.lock().unwrap().clone().unwrap();
         assert_eq!(request.acp_session_id, "fake-acp-session");
         assert_eq!(request.tool_call["title"], "Run cargo test");
@@ -766,6 +799,18 @@ mod tests {
             Ok(AcpPermissionDecision::Selected {
                 option_id: "allow-once".into(),
             })
+        }
+    }
+
+    struct RecordingOutputHandler {
+        chunks: Arc<Mutex<String>>,
+    }
+
+    #[async_trait]
+    impl AcpOutputHandler for RecordingOutputHandler {
+        async fn output_chunk(&mut self, chunk: &str) -> Result<()> {
+            self.chunks.lock().unwrap().push_str(chunk);
+            Ok(())
         }
     }
 

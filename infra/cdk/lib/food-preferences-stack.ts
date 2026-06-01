@@ -4,7 +4,6 @@ import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as apigateway from 'aws-cdk-lib/aws-apigateway';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
-import * as sns from 'aws-cdk-lib/aws-sns';
 import { Construct } from 'constructs';
 
 export class FoodPreferencesStack extends cdk.Stack {
@@ -14,7 +13,7 @@ export class FoodPreferencesStack extends cdk.Stack {
     // DynamoDB Table
     const table = new dynamodb.Table(this, 'FoodPreferences', {
       partitionKey: { name: 'userId', type: dynamodb.AttributeType.STRING },
-      sortKey: { name: 'preferenceId', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'preferenceKey', type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
       pointInTimeRecovery: true,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
@@ -25,12 +24,7 @@ export class FoodPreferencesStack extends cdk.Stack {
       selfSignUpEnabled: true,
       signInAliases: { email: true },
       autoVerify: { email: true },
-      passwordPolicy: {
-        minLength: 8,
-        requireUppercase: true,
-        requireDigits: true,
-        requireSymbols: true,
-      },
+      passwordPolicy: { minLength: 8, requireUppercase: true, requireDigits: true, requireSymbols: true },
     });
 
     const userPoolClient = new cognito.UserPoolClient(this, 'UserPoolClient', {
@@ -54,8 +48,8 @@ export class FoodPreferencesStack extends cdk.Stack {
       tracing: lambda.Tracing.ACTIVE,
     });
 
-    // Least-privilege DynamoDB access (no Scan)
-    table.grant(handler, 'dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:UpdateItem', 'dynamodb:DeleteItem', 'dynamodb:Query');
+    // Least-privilege DynamoDB access
+    table.grant(handler, 'dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:Query');
 
     // API Gateway
     const api = new apigateway.RestApi(this, 'FoodPreferencesApi', {
@@ -77,17 +71,12 @@ export class FoodPreferencesStack extends cdk.Stack {
     const users = api.root.addResource('users');
     const userId = users.addResource('{userId}');
     const preferences = userId.addResource('preferences');
-    const preferenceId = preferences.addResource('{preferenceId}');
+    const favoriteMeal = preferences.addResource('favorite-meal');
 
-    preferences.addMethod('POST', integration, authOptions);
-    preferences.addMethod('GET', integration, authOptions);
-    preferenceId.addMethod('GET', integration, authOptions);
-    preferenceId.addMethod('PUT', integration, authOptions);
-    preferenceId.addMethod('DELETE', integration, authOptions);
+    favoriteMeal.addMethod('PUT', integration, authOptions);
+    favoriteMeal.addMethod('GET', integration, authOptions);
 
     // Alarms
-    const alarmTopic = new sns.Topic(this, 'AlarmTopic');
-
     new cloudwatch.Alarm(this, 'LambdaErrorAlarm', {
       metric: handler.metricErrors({ period: cdk.Duration.minutes(5) }),
       threshold: 1,
