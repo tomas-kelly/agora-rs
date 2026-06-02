@@ -256,15 +256,15 @@ cargo run -p agora -- system stats
 
 ```
  agora console │ nats://127.0.0.1:4222 │ events:24 sessions:2 agents:6 │ Submitted event to "Task manager"
-┌─ Sessions (2) ─────────────┬─ Events: Task manager (8/8) ───────┬─ Event inspector (8/8) ──────────────────┐
-│ ▶ Task manager             │ 10:00:01  workspace.event.submitted│ topic: test.passed                       │
-│   Chess engine             │ 10:00:04  product.requirements...  │ event: evt_01J5ZT9VYC9X7...              │
-│                            │ 10:00:09  workspace.design...      │ time:  2026-05-24T10:00:24Z              │
-│                            │ 10:00:13  code.changed             │ from:  quality-assurance                 │
-├─ Agents (6) ───────────────┤ 10:00:14  code.changed             │ data:  {                                 │
-│ ● product-manager          │ 10:00:17  test.failed              │   "summary": "All tests..."              │
-│    :4001 · product         │ 10:00:18  security.scan.clean      │ }                                        │
-│ ● system-architect         │›10:00:24  test.passed              │ Right expands · Esc closes               │
+┌─ Sessions (2) ─────────────┬─ Events: Task manager (8/8) ───────┬─ Event details (8/8) ────────────────────┐
+│ ▶ Task manager             │ 10:00:01  workspace.event.submitted│ {                                        │
+│   Chess engine             │ 10:00:04  product.requirements...  │   "topic": "test.passed",               │
+│                            │ 10:00:09  workspace.design...      │   "eventId": "evt_01J5ZT9VYC9X7...",    │
+│                            │ 10:00:13  code.changed             │   "timestamp": "2026-05-24T10:00:24Z",  │
+├─ Agents (6) ───────────────┤ 10:00:14  code.changed             │   "sender": {                           │
+│ ● product-manager          │ 10:00:17  test.failed              │     "agentName": "quality-assurance"    │
+│    :4001 · product         │ 10:00:18  security.scan.clean      │   },                                    │
+│ ● system-architect         │›10:00:24  test.passed              │   "data": { "summary": "All tests..." } │
 │    :4002 · architecture    │                                    │                                          │
 │ ◐ backend-coder            │                                    │                                          │
 │    :4003 · backend, rust   │                                    │                                          │
@@ -287,10 +287,9 @@ The composer is intentionally large enough for multi-line prompts. Long drafts
 scroll with PgUp/PgDn or with the mouse wheel over the composer. The Events pane
 shows only events from the active session and acts like a stream browser:
 `↑` / `↓` select an event without opening details. Press `Enter` with an empty
-composer to open the Event inspector to the right of the Events pane, `Right`
-expands it into the full event-details view, `Left` collapses/closes it, and
-`Esc` hides it. `End` returns to the live tail and hides the inspector. Agents
-sit below Sessions in the left sidebar.
+composer to open the full Event Details JSON to the right of the Events pane,
+and press `Esc` to close it. `End` returns to the live tail and closes Event
+Details. Agents sit below Sessions in the left sidebar.
 `Tab` and `Shift-Tab` move focus between visible panes and the composer. With
 Agents focused, `↑` / `↓` select an agent, `Enter` opens its live tail for the
 active session, `h` opens history, `s` opens status, and `m` starts a direct
@@ -364,23 +363,23 @@ only.
 | `Tab` | Complete command/topic/session/agent input; with an empty composer, focus the next visible pane |
 | `Shift-Tab` | Focus the previous visible pane |
 | `Ctrl-K` | Open the command palette |
-| `Ctrl-P` / `Alt+↑` | Previous composer entry |
-| `Alt+↓` | Next composer entry |
+| `Ctrl-P` / `Alt+↑` | Previous composer entry from anywhere |
+| `Alt+↓` | Next composer entry from anywhere |
 | `Shift+Enter` / `Alt+Enter` / `Ctrl+J` | Insert a newline (the input box grows) |
 | `↑` / `↓` with completions open | Select previous / next completion |
+| `↑` / `↓` with Composer focused | Previous / next composer history entry |
 | `↑` / `↓` with Sessions focused | Switch the active session |
 | `↑` / `↓` with Events focused | Select the previous / next event in the stream |
 | `↑` / `↓` with Agents focused | Select the previous / next agent |
 | `↑` / `↓` with Agent Output focused | Scroll the live agent output |
-| `Enter` with Events focused and empty composer | Open the Event inspector for the selected event |
+| `Enter` with Events focused and empty composer | Open full Event Details for the selected event |
 | `Enter` with Agents focused and empty composer | Open live `!tail` for the selected agent |
 | `h` / `s` / `m` / `M` with Agents focused | Open selected-agent history / status / direct-message draft / queued-message draft |
-| `←` / `→` | Collapse or expand the Event inspector into full event details |
 | `PgUp` / `PgDn` | Scroll Agent Output, command output, full event details, or a long draft; otherwise select events by 5 lines |
-| Mouse wheel | Scrolls the composer when the pointer is over a long draft; otherwise scrolls command output, full details, or selects events |
+| Mouse wheel | Scrolls the composer when the pointer is over a long draft; otherwise scrolls command output, Event Details, or selects events |
 | `End` | Snap back to the live tail |
 | `Esc` (in modal) | Cancel naming/renaming |
-| `Esc` (normal mode, with palette/output/details) | Dismiss completions, command output, Agent Output, or Event inspector |
+| `Esc` (normal mode, with palette/output/details) | Dismiss completions, command output, Agent Output, or Event Details |
 | `Esc` / `q` / `Ctrl-C` (otherwise) | Quit |
 
 ### Debugging an agent

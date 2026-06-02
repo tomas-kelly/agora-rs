@@ -242,7 +242,6 @@ pub struct App {
     pub events: Vec<Envelope>,
     pub selected_event: Option<usize>,
     pub inspected_event: Option<usize>,
-    pub full_event_details: bool,
     pub telemetry: Vec<TelemetryEntry>,
     pub sessions: BTreeMap<String, SessionInfo>,
     pub session_names: HashMap<String, String>,
@@ -311,7 +310,6 @@ impl App {
             events: Vec::new(),
             selected_event: None,
             inspected_event: None,
-            full_event_details: false,
             telemetry: Vec::new(),
             sessions: BTreeMap::new(),
             session_names: HashMap::new(),
@@ -442,8 +440,8 @@ impl App {
         self.inspected_event_index().is_some()
     }
 
-    pub fn full_event_details_open(&self) -> bool {
-        self.full_event_details && self.event_details_open() && self.command_output.is_none()
+    pub fn event_details_visible(&self) -> bool {
+        self.event_details_open() && self.command_output.is_none()
     }
 
     fn event_belongs_to_active_session(&self, idx: usize) -> bool {
@@ -627,7 +625,6 @@ impl App {
         self.active_session = Some(target.session_id.clone());
         self.selected_event = Some(idx);
         self.inspected_event = Some(idx);
-        self.full_event_details = false;
         self.command_output = None;
         self.output_scroll = 0;
         self.auto_scroll = false;
@@ -653,7 +650,7 @@ impl App {
             self.scroll_agent_tail(delta);
             return;
         }
-        if self.command_output.is_none() && !self.full_event_details_open() {
+        if self.command_output.is_none() && !self.event_details_visible() {
             return;
         }
         if delta < 0 {
@@ -880,6 +877,7 @@ impl App {
 
     pub fn history_next(&mut self) -> bool {
         let Some(cursor) = self.input_history_cursor else {
+            self.status_msg = Some("Already at newest composer entry.".into());
             return false;
         };
         if cursor + 1 >= self.input_history.len() {
@@ -945,7 +943,6 @@ impl App {
             true
         } else if self.inspected_event.is_some() {
             self.inspected_event = None;
-            self.full_event_details = false;
             self.output_scroll = 0;
             true
         } else {
@@ -964,7 +961,6 @@ impl App {
         if self.active_session_event_count() == 0 {
             self.selected_event = None;
             self.inspected_event = None;
-            self.full_event_details = false;
             self.events_scroll = 0;
             self.auto_scroll = true;
             return;
@@ -981,9 +977,6 @@ impl App {
             .is_some_and(|idx| !self.event_belongs_to_active_session(idx))
         {
             self.inspected_event = None;
-        }
-        if self.inspected_event.is_none() {
-            self.full_event_details = false;
         }
         self.events_scroll = self.events_scroll.min(self.max_events_scroll());
     }
@@ -1117,7 +1110,7 @@ impl App {
         match self.focus {
             FocusTarget::Sessions => "Sessions · Up/Down switch · Ctrl-N new · Ctrl-R rename · Tab focus".into(),
             FocusTarget::Events => {
-                "Events · Up/Down select · Enter inspect · Right details · End live · Tab focus"
+                "Events · Up/Down select · Enter details · Esc closes · End live · Tab focus"
                     .into()
             }
             FocusTarget::Agents => {
@@ -1128,7 +1121,7 @@ impl App {
                 "Agent Output · PgUp/PgDn scroll · Esc closes tail · Tab focus".into()
             }
             FocusTarget::Composer => {
-                "Composer · Tab complete · Ctrl-K commands · Alt-Up/Down history · Enter send"
+                "Composer · Up/Down history · Tab complete · Ctrl-K commands · Enter send"
                     .into()
             }
         }
@@ -1203,7 +1196,6 @@ impl App {
                 self.active_session = None;
                 self.selected_event = None;
                 self.inspected_event = None;
-                self.full_event_details = false;
                 self.events_scroll = 0;
                 self.auto_scroll = true;
             }
@@ -1297,9 +1289,6 @@ impl App {
             }
             if let Some(idx) = self.inspected_event {
                 self.inspected_event = idx.checked_sub(excess);
-            }
-            if self.inspected_event.is_none() {
-                self.full_event_details = false;
             }
         }
 
@@ -1397,7 +1386,6 @@ impl App {
         self.active_session = Some(session_id.clone());
         self.selected_event = None;
         self.inspected_event = None;
-        self.full_event_details = false;
         self.events_scroll = 0;
         self.auto_scroll = true;
 
@@ -1434,7 +1422,6 @@ impl App {
             self.active_session = None;
             self.selected_event = None;
             self.inspected_event = None;
-            self.full_event_details = false;
             self.events_scroll = 0;
             self.auto_scroll = true;
         }
@@ -1489,7 +1476,6 @@ impl App {
         self.focus = FocusTarget::Sessions;
         self.selected_event = None;
         self.inspected_event = None;
-        self.full_event_details = false;
         self.events_scroll = 0;
         self.auto_scroll = true;
         self.status_msg = Some(format!("Active: {}", self.display_name(&next)));
@@ -1499,7 +1485,6 @@ impl App {
         if self.active_session.take().is_some() {
             self.selected_event = None;
             self.inspected_event = None;
-            self.full_event_details = false;
             self.events_scroll = 0;
             self.auto_scroll = true;
             self.status_msg = Some("Cleared active session".into());
@@ -1525,7 +1510,6 @@ impl App {
         self.active_session = Some(sid.clone());
         self.selected_event = None;
         self.inspected_event = None;
-        self.full_event_details = false;
         self.events_scroll = 0;
         self.auto_scroll = true;
     }
@@ -1581,7 +1565,7 @@ impl App {
         self.auto_scroll = false;
         self.ensure_selected_event_visible();
         self.status_msg = Some(format!(
-            "Selected event {}/{} · empty Enter opens inspector",
+            "Selected event {}/{} · empty Enter opens details",
             next_pos + 1,
             len
         ));
@@ -1590,7 +1574,6 @@ impl App {
     pub fn end_scroll(&mut self) {
         self.selected_event = None;
         self.inspected_event = None;
-        self.full_event_details = false;
         self.focus = FocusTarget::Events;
         self.output_scroll = 0;
         self.events_scroll = 0;
@@ -1614,47 +1597,12 @@ impl App {
         self.output_scroll = 0;
         self.focus = FocusTarget::Events;
         self.inspected_event = Some(idx);
-        self.full_event_details = false;
         self.panels.detail = true;
         self.status_msg = Some(format!(
-            "Inspecting event {}/{} · Right expands · Esc hides inspector",
+            "Viewing event details {}/{} · Esc closes",
             pos + 1,
             count,
         ));
-    }
-
-    pub fn expand_event_details(&mut self) {
-        if self.command_output.is_some() {
-            return;
-        }
-        if self.inspected_event.is_none() {
-            self.open_selected_event();
-        }
-        if self.inspected_event.is_some() {
-            self.full_event_details = true;
-            self.output_scroll = 0;
-            self.panels.detail = true;
-            self.status_msg = Some("Full event details · Left collapses · Esc closes".into());
-        }
-    }
-
-    pub fn collapse_event_details(&mut self) -> bool {
-        if self.command_output.is_some() {
-            return false;
-        }
-        if self.full_event_details {
-            self.full_event_details = false;
-            self.output_scroll = 0;
-            self.status_msg = Some("Compact event inspector".into());
-            return true;
-        }
-        if self.inspected_event.is_some() {
-            self.inspected_event = None;
-            self.output_scroll = 0;
-            self.status_msg = Some("Closed event inspector".into());
-            return true;
-        }
-        false
     }
 
     pub fn toggle_panel(&mut self, panel: Panel) {
@@ -1766,7 +1714,6 @@ impl App {
         self.events.clear();
         self.selected_event = None;
         self.inspected_event = None;
-        self.full_event_details = false;
         self.telemetry.clear();
         // Keep sessions, session_names, active session, and agents. Clear is a
         // local event/telemetry clear, not a metadata wipe.
@@ -1824,7 +1771,6 @@ impl App {
     fn set_output(&mut self, text: String) {
         self.panels.detail = true;
         self.inspected_event = None;
-        self.full_event_details = false;
         self.command_output = Some(text);
         self.output_scroll = 0;
     }
@@ -1877,9 +1823,9 @@ impl App {
              \n\
              KEYS:  Ctrl-N/R/X · Ctrl-K commands · F1/F2/F3/F4 panels · Tab/Shift-Tab focus or complete\n\
              \x20\x20\x20\x20\x20\x20Agents focus: ↑/↓ select · Enter tail · h history · m/M message/queue · s status\n\
-             \x20\x20\x20\x20\x20\x20Events focus: ↑/↓ select · empty Enter inspects · ←/→ collapse/expand details\n\
+             \x20\x20\x20\x20\x20\x20Events focus: ↑/↓ select · empty Enter opens details · Esc closes\n\
              \x20\x20\x20\x20\x20\x20Completions: ↑/↓ select · Enter accepts · Tab common-prefix completes\n\
-             \x20\x20\x20\x20\x20\x20Shift+Enter or Alt+Enter inserts a newline · Alt-↑/↓ walks persistent composer history\n\
+             \x20\x20\x20\x20\x20\x20Composer focus: ↑/↓ history · Shift+Enter or Alt+Enter inserts a newline\n\
              \x20\x20\x20\x20\x20\x20PgUp/PgDn scroll long drafts, output, or tail · wheel over the composer scrolls it · Esc dismisses"
             .to_string();
         self.set_output(text);

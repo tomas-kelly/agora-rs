@@ -366,7 +366,7 @@ async fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool> {
             app.pop_input_char();
         }
         KeyCode::PageUp => {
-            if app.command_output.is_some() || app.full_event_details_open() {
+            if app.command_output.is_some() || app.event_details_visible() {
                 app.scroll_output(-5);
             } else if app.input_overflows() || app.input_scroll > 0 {
                 app.scroll_input(-5);
@@ -375,19 +375,13 @@ async fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool> {
             }
         }
         KeyCode::PageDown => {
-            if app.command_output.is_some() || app.full_event_details_open() {
+            if app.command_output.is_some() || app.event_details_visible() {
                 app.scroll_output(5);
             } else if app.input_overflows() || app.input_scroll > 0 {
                 app.scroll_input(5);
             } else {
                 app.page_events_down();
             }
-        }
-        KeyCode::Left => {
-            app.collapse_event_details();
-        }
-        KeyCode::Right if app.input.trim().is_empty() => {
-            app.expand_event_details();
         }
         KeyCode::Up if alt => {
             app.history_previous();
@@ -401,23 +395,29 @@ async fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool> {
         KeyCode::Down if app.completion_menu_active() => {
             app.move_completion_selection(1);
         }
-        KeyCode::Up if app.focus == FocusTarget::Composer && !app.input.is_empty() => {
+        KeyCode::Up if app.focus == FocusTarget::Composer => {
             app.history_previous();
         }
-        KeyCode::Down if app.focus == FocusTarget::Composer && !app.input.is_empty() => {
+        KeyCode::Down if app.focus == FocusTarget::Composer => {
             app.history_next();
         }
         KeyCode::Up => match app.focus {
             FocusTarget::Sessions => app.cycle_session(false),
             FocusTarget::Agents => app.move_agent_selection(-1),
             FocusTarget::AgentOutput => app.scroll_agent_tail(-1),
-            FocusTarget::Events | FocusTarget::Composer => app.scroll_up(),
+            FocusTarget::Events => app.scroll_up(),
+            FocusTarget::Composer => {
+                app.history_previous();
+            }
         },
         KeyCode::Down => match app.focus {
             FocusTarget::Sessions => app.cycle_session(true),
             FocusTarget::Agents => app.move_agent_selection(1),
             FocusTarget::AgentOutput => app.scroll_agent_tail(1),
-            FocusTarget::Events | FocusTarget::Composer => app.scroll_down(),
+            FocusTarget::Events => app.scroll_down(),
+            FocusTarget::Composer => {
+                app.history_next();
+            }
         },
         KeyCode::End => {
             if app.input_scroll > 0 {
@@ -437,7 +437,7 @@ fn handle_mouse(m: MouseEvent, app: &mut App) {
         MouseEventKind::ScrollUp => {
             if app.mouse_over_input(m.row) && (app.input_overflows() || app.input_scroll > 0) {
                 app.scroll_input(-2);
-            } else if app.command_output.is_some() || app.full_event_details_open() {
+            } else if app.command_output.is_some() || app.event_details_visible() {
                 app.scroll_output(-2);
             } else if app.focus == FocusTarget::AgentOutput {
                 app.scroll_agent_tail(-2);
@@ -449,7 +449,7 @@ fn handle_mouse(m: MouseEvent, app: &mut App) {
         MouseEventKind::ScrollDown => {
             if app.mouse_over_input(m.row) && (app.input_overflows() || app.input_scroll > 0) {
                 app.scroll_input(2);
-            } else if app.command_output.is_some() || app.full_event_details_open() {
+            } else if app.command_output.is_some() || app.event_details_visible() {
                 app.scroll_output(2);
             } else if app.focus == FocusTarget::AgentOutput {
                 app.scroll_agent_tail(2);

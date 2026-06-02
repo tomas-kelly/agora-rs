@@ -596,67 +596,30 @@ fn render_event_detail(f: &mut Frame, app: &App, area: Rect) {
     let pos = app.inspected_event_position().unwrap_or(0);
     let total = app.active_session_event_count();
 
-    if app.full_event_details_open() {
-        let text = redacted_event_json(event);
-        let total_lines = text.lines().count() as u16;
-        let visible = area.height.saturating_sub(2);
-        let max_scroll = total_lines.saturating_sub(visible);
-        let scroll = app.output_scroll.min(max_scroll);
-        let title = if total_lines > visible {
-            format!(
-                " Full event details ({}/{})  [line {}/{}, PgUp/PgDn or wheel · Left collapses · Esc closes] ",
-                pos + 1,
-                total,
-                scroll + 1,
-                total_lines
-            )
-        } else {
-            format!(
-                " Full event details ({}/{}) · Left collapses · Esc closes ",
-                pos + 1,
-                total
-            )
-        };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(title)
-            .border_style(Style::default().fg(Color::Cyan));
-        let para = Paragraph::new(text)
-            .block(block)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0));
-        f.render_widget(para, area);
-        return;
-    }
-
-    let (title, text) = {
-        let e = event;
-        let data_pretty =
-            serde_json::to_string_pretty(&e.data).unwrap_or_else(|_| e.data.to_string());
-        let session_label = app.display_name(&e.context.session_id);
-        (
-            format!(
-                " Event inspector ({}/{}) · Right expands · Esc closes ",
-                pos + 1,
-                total
-            ),
-            format!(
-                "topic:   {}\nevent:   {}\ntime:    {}\nsession: {}  ({})\nfrom:    {}\ndata:    {}",
-                e.topic,
-                e.event_id,
-                e.timestamp,
-                session_label,
-                e.context.session_id,
-                e.sender.agent_name,
-                data_pretty
-            ),
+    let text = redacted_event_json(event);
+    let total_lines = text.lines().count() as u16;
+    let visible = area.height.saturating_sub(2);
+    let max_scroll = total_lines.saturating_sub(visible);
+    let scroll = app.output_scroll.min(max_scroll);
+    let title = if total_lines > visible {
+        format!(
+            " Event details ({}/{}) [line {}/{}, PgUp/PgDn or wheel · Esc closes] ",
+            pos + 1,
+            total,
+            scroll + 1,
+            total_lines
         )
+    } else {
+        format!(" Event details ({}/{}) · Esc closes ", pos + 1, total)
     };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .border_style(Style::default().fg(Color::DarkGray));
-    let para = Paragraph::new(text).block(block).wrap(Wrap { trim: false });
+        .border_style(Style::default().fg(Color::Cyan));
+    let para = Paragraph::new(text)
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
     f.render_widget(para, area);
 }
 
